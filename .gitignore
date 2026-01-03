@@ -1,0 +1,23 @@
+# Build outputs
+target/
+ancillary/dist/
+ancillary/node_modules/
+
+node_modules/
+.svelte-kit/
+web/build/
+
+# Config and secrets
+.toren/config.toml
+.env
+CLAUDE.md
+
+# Test outputs
+examples/*/
+!examples/calculator/README.md
+
+# Logs
+*.log
+
+# OS
+.DS_Store

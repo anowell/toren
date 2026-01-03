@@ -1,0 +1,103 @@
+id: "jj-basic"
+name: "Jujutsu Basic Commands"
+vcs: "jj"
+commands:
+  - id: "jj-status"
+    label: "Status"
+    command: "jj status"
+    params: []
+    category: "info"
+    icon: "info"
+    auto_approve: true
+    requires_vcs: true
+
+  - id: "jj-diff"
+    label: "Diff"
+    command: "jj diff"
+    params: []
+    category: "info"
+    icon: "diff"
+    auto_approve: true
+    requires_vcs: true
+
+  - id: "jj-log"
+    label: "Log"
+    command: "jj log -r {revset}"
+    params:
+      - name: "revset"
+        type: "string"
+        prompt: "Revset expression?"
+        default: "@ | @-"
+    category: "info"
+    icon: "history"
+    auto_approve: true
+    requires_vcs: true
+
+  - id: "jj-describe"
+    label: "Describe Change"
+    command: "jj describe -m \"{message}\""
+    params:
+      - name: "message"
+        type: "string"
+        prompt: "Change description?"
+    category: "commit"
+    icon: "edit"
+    auto_approve: false
+    requires_vcs: true
+
+  - id: "jj-new"
+    label: "New Change"
+    command: "jj new"
+    params: []
+    category: "commit"
+    icon: "plus"
+    auto_approve: false
+    requires_vcs: true
+
+  - id: "jj-squash"
+    label: "Squash Into Parent"
+    command: "jj squash"
+    params: []
+    category: "commit"
+    icon: "compress"
+    auto_approve: false
+    requires_vcs: true
+
+  - id: "jj-git-push"
+    label: "Push to Git Remote"
+    command: "jj git push"
+    params: []
+    category: "remote"
+    icon: "upload"
+    auto_approve: false
+    requires_vcs: true
+
+  - id: "jj-git-fetch"
+    label: "Fetch from Git Remote"
+    command: "jj git fetch"
+    params: []
+    category: "remote"
+    icon: "download"
+    auto_approve: false
+    requires_vcs: true
+
+  - id: "jj-bookmark-list"
+    label: "List Bookmarks"
+    command: "jj bookmark list"
+    params: []
+    category: "branch"
+    icon: "bookmark"
+    auto_approve: true
+    requires_vcs: true
+
+  - id: "jj-bookmark-create"
+    label: "Create Bookmark"
+    command: "jj bookmark create {name}"
+    params:
+      - name: "name"
+        type: "string"
+        prompt: "Bookmark name?"
+    category: "branch"
+    icon: "bookmark"
+    auto_approve: false
+    requires_vcs: true

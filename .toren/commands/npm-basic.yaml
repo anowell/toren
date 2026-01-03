@@ -1,0 +1,59 @@
+id: "npm-basic"
+name: "NPM Commands"
+commands:
+  - id: "npm-install"
+    label: "Install Dependencies"
+    command: "npm install"
+    params: []
+    category: "deps"
+    icon: "download"
+    auto_approve: false
+    requires_vcs: false
+
+  - id: "npm-start"
+    label: "Start Dev Server"
+    command: "npm start"
+    params: []
+    category: "run"
+    icon: "play"
+    auto_approve: false
+    requires_vcs: false
+
+  - id: "npm-build"
+    label: "Build"
+    command: "npm run build"
+    params: []
+    category: "build"
+    icon: "package"
+    auto_approve: false
+    requires_vcs: false
+
+  - id: "npm-test"
+    label: "Run Tests"
+    command: "npm test"
+    params: []
+    category: "test"
+    icon: "check"
+    auto_approve: false
+    requires_vcs: false
+
+  - id: "npm-lint"
+    label: "Lint Code"
+    command: "npm run lint"
+    params: []
+    category: "test"
+    icon: "check"
+    auto_approve: true
+    requires_vcs: false
+
+  - id: "npm-script"
+    label: "Run Script"
+    command: "npm run {script}"
+    params:
+      - name: "script"
+        type: "string"
+        prompt: "Script name?"
+    category: "run"
+    icon: "play"
+    auto_approve: false
+    requires_vcs: false

@@ -1,0 +1,94 @@
+id: "git-basic"
+name: "Git Basic Commands"
+vcs: "git"
+commands:
+  - id: "git-status"
+    label: "Git Status"
+    command: "git status"
+    params: []
+    category: "info"
+    icon: "info"
+    auto_approve: true
+    requires_vcs: true
+
+  - id: "git-diff"
+    label: "Git Diff"
+    command: "git diff"
+    params: []
+    category: "info"
+    icon: "diff"
+    auto_approve: true
+    requires_vcs: true
+
+  - id: "git-log"
+    label: "Git Log"
+    command: "git log --oneline -n {count}"
+    params:
+      - name: "count"
+        type: "number"
+        prompt: "Number of commits?"
+        default: "10"
+    category: "info"
+    icon: "history"
+    auto_approve: true
+    requires_vcs: true
+
+  - id: "git-add"
+    label: "Stage All Changes"
+    command: "git add ."
+    params: []
+    category: "staging"
+    icon: "plus"
+    auto_approve: false
+    requires_vcs: true
+
+  - id: "git-commit"
+    label: "Commit"
+    command: "git commit -m \"{message}\""
+    params:
+      - name: "message"
+        type: "string"
+        prompt: "Commit message?"
+    category: "commit"
+    icon: "git-commit"
+    auto_approve: false
+    requires_vcs: true
+
+  - id: "git-push"
+    label: "Push"
+    command: "git push"
+    params: []
+    category: "remote"
+    icon: "upload"
+    auto_approve: false
+    requires_vcs: true
+
+  - id: "git-pull"
+    label: "Pull"
+    command: "git pull"
+    params: []
+    category: "remote"
+    icon: "download"
+    auto_approve: false
+    requires_vcs: true
+
+  - id: "git-branch"
+    label: "List Branches"
+    command: "git branch -a"
+    params: []
+    category: "branch"
+    icon: "git-branch"
+    auto_approve: true
+    requires_vcs: true
+
+  - id: "git-checkout"
+    label: "Checkout Branch"
+    command: "git checkout {branch}"
+    params:
+      - name: "branch"
+        type: "string"
+        prompt: "Branch name?"
+    category: "branch"
+    icon: "git-branch"
+    auto_approve: false
+    requires_vcs: true

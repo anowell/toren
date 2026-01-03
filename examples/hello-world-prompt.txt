@@ -1,0 +1,7 @@
+You are working in the examples/hello-world directory.
+
+Create a simple "Hello World" program in Node.js:
+- File name: hello.js  
+- Prints "Hello, Toren!" to the console
+- Include a comment explaining the Toren project
+- Keep it to 5 lines max
