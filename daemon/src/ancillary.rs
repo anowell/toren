@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -23,6 +23,11 @@ pub struct Ancillary {
     pub last_activity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_instruction: Option<String>,
+    /// The workspace name if this ancillary is using a jj workspace
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The actual working directory (segment path or workspace path)
+    pub working_dir: PathBuf,
 }
 
 pub struct AncillaryManager {
@@ -36,7 +41,14 @@ impl AncillaryManager {
         }
     }
 
-    pub fn register(&self, id: String, segment: String, session_token: String) {
+    pub fn register(
+        &self,
+        id: String,
+        segment: String,
+        session_token: String,
+        workspace: Option<String>,
+        working_dir: PathBuf,
+    ) {
         let ancillary = Ancillary {
             id: id.clone(),
             segment,
@@ -45,11 +57,30 @@ impl AncillaryManager {
             connected_at: chrono::Utc::now().to_rfc3339(),
             last_activity: None,
             current_instruction: None,
+            workspace,
+            working_dir,
         };
 
         let mut ancillaries = self.ancillaries.write().unwrap();
         ancillaries.insert(id.clone(), ancillary);
         tracing::info!("Ancillary {} registered", id);
+    }
+
+    /// Check if a workspace is already in use by another ancillary
+    pub fn is_workspace_in_use(&self, working_dir: &PathBuf) -> Option<String> {
+        let ancillaries = self.ancillaries.read().unwrap();
+        ancillaries
+            .values()
+            .find(|a| &a.working_dir == working_dir)
+            .map(|a| a.id.clone())
+    }
+
+    /// Release an ancillary from its workspace (but don't delete the workspace)
+    pub fn release_workspace(&self, id: &str) -> Option<(String, PathBuf)> {
+        let ancillaries = self.ancillaries.read().unwrap();
+        ancillaries.get(id).and_then(|a| {
+            a.workspace.clone().map(|ws| (ws, a.working_dir.clone()))
+        })
     }
 
     pub fn unregister(&self, id: &str) {

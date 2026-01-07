@@ -1,0 +1,43 @@
+# Toren Configuration
+# Copy this to toren.toml and customize for your setup
+
+[server]
+# Host and port for the daemon
+host = "127.0.0.1"
+port = 8787
+
+[segments]
+# Segment globs: Discover all subdirectories as segments
+# Each subdirectory becomes an available project
+globs = [
+    "examples/*",    # All directories in examples/
+    # "~/projects/*",  # Uncomment to add your projects
+]
+
+# Segment roots: Directories where new segments can be created
+# When creating a new segment, it will be placed in one of these roots
+roots = [
+    "examples",      # Can create new projects in examples/
+    # "~/projects",    # Uncomment to allow creating in ~/projects
+]
+
+# Individual segments: Explicitly list specific directories
+# Use this for segments outside your globs
+paths = [
+    # "~/special-project",
+    # "/path/to/another/project",
+]
+
+[ancillary]
+# Maximum number of concurrent ancillaries
+max_concurrent = 5
+
+# Default model for new ancillaries
+default_model = "claude-sonnet-4-5-20250929"
+
+[security]
+# Whether to require authentication
+require_auth = true
+
+# Session timeout in seconds (0 = no timeout)
+session_timeout = 0

@@ -1,13 +1,14 @@
 use anyhow::Result;
 use tracing::{info, Level};
-use tracing_subscriber;
 
 mod ancillary;
 mod api;
 mod config;
 mod plugins;
 mod security;
+mod segments;
 mod services;
+mod workspace;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,11 +50,21 @@ async fn main() -> Result<()> {
     let ancillary_manager = ancillary::AncillaryManager::new();
     info!("Ancillary manager initialized");
 
+    // Initialize segment manager
+    let segment_manager = segments::SegmentManager::new(&config)?;
+    info!("Segment manager initialized");
+
+    // Initialize workspace manager (if workspace_root is configured)
+    let workspace_manager = config.ancillary.workspace_root.clone().map(|root| {
+        info!("Workspace manager initialized with root: {}", root.display());
+        workspace::WorkspaceManager::new(root)
+    });
+
     // Start API server
-    let addr = format!("{}:{}", config.host, config.port);
+    let addr = format!("{}:{}", config.host(), config.port());
     info!("Starting API server on {}", addr);
 
-    api::serve(&addr, services, security_ctx, plugin_manager, ancillary_manager).await?;
+    api::serve(&addr, services, security_ctx, plugin_manager, ancillary_manager, segment_manager, workspace_manager).await?;
 
     Ok(())
 }

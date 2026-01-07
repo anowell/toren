@@ -7,13 +7,67 @@ pub struct Config {
     #[serde(skip)]
     pub config_path: String,
 
-    pub host: String,
-    pub port: u16,
+    #[serde(default = "default_server")]
+    pub server: ServerConfig,
 
+    #[serde(default)]
+    pub segments: SegmentsConfig,
+
+    #[serde(default = "default_approved_directories")]
     pub approved_directories: Vec<PathBuf>,
 
     #[serde(default)]
     pub auto_approve: AutoApproveConfig,
+
+    #[serde(default)]
+    pub ancillary: AncillaryConfig,
+}
+
+fn default_server() -> ServerConfig {
+    ServerConfig {
+        host: "127.0.0.1".to_string(),
+        port: 8787,
+    }
+}
+
+fn default_approved_directories() -> Vec<PathBuf> {
+    vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SegmentsConfig {
+    #[serde(default)]
+    pub globs: Vec<String>,
+
+    #[serde(default)]
+    pub roots: Vec<PathBuf>,
+
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AncillaryConfig {
+    pub max_concurrent: usize,
+    pub default_model: String,
+    #[serde(default)]
+    pub workspace_root: Option<PathBuf>,
+}
+
+impl Default for AncillaryConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 5,
+            default_model: "claude-sonnet-4-5-20250929".to_string(),
+            workspace_root: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,10 +122,16 @@ impl Config {
     }
 
     fn find_config_file() -> Result<PathBuf> {
-        // Try current directory first
-        let local_config = PathBuf::from(".toren/config.toml");
+        // Try toren.toml in current directory first
+        let local_config = PathBuf::from("toren.toml");
         if local_config.exists() {
             return Ok(local_config);
+        }
+
+        // Try .toren/config.toml (legacy)
+        let legacy_config = PathBuf::from(".toren/config.toml");
+        if legacy_config.exists() {
+            return Ok(legacy_config);
         }
 
         // Try home directory
@@ -84,7 +144,7 @@ impl Config {
             return Ok(home_config);
         }
 
-        // Fallback to local
+        // Fallback to local toren.toml
         Ok(local_config)
     }
 }
@@ -96,10 +156,22 @@ impl Default for Config {
 
         Self {
             config_path: String::new(),
-            host: "127.0.0.1".to_string(),
-            port: 8787,
+            server: default_server(),
+            segments: SegmentsConfig::default(),
             approved_directories: vec![current_dir],
             auto_approve: AutoApproveConfig::default(),
+            ancillary: AncillaryConfig::default(),
         }
+    }
+}
+
+// Backward compatibility getters
+impl Config {
+    pub fn host(&self) -> &str {
+        &self.server.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.server.port
     }
 }

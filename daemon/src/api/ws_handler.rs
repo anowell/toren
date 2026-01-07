@@ -17,6 +17,9 @@ enum WsRequest {
         ancillary_id: Option<String>,
         #[serde(default)]
         segment: Option<String>,
+        /// Optional workspace name - if provided, a jj workspace will be created/used
+        #[serde(default)]
+        workspace: Option<String>,
     },
     Command { request: CommandRequest },
     FileRead { path: String },
@@ -26,7 +29,11 @@ enum WsRequest {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum WsResponse {
-    AuthSuccess { session_id: String },
+    AuthSuccess {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
+    },
     AuthFailure { reason: String },
     CommandOutput { output: crate::services::command::CommandOutput },
     FileContent { content: String },
@@ -54,19 +61,98 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
             let request: Result<WsRequest, _> = serde_json::from_str(&text);
 
             match request {
-                Ok(WsRequest::Auth { token, ancillary_id: aid, segment }) => {
+                Ok(WsRequest::Auth { token, ancillary_id: aid, segment, workspace }) => {
                     if state.security.validate_session(&token) {
                         authenticated = true;
+                        let mut working_dir_response: Option<String> = None;
 
                         // Register ancillary if ID provided
                         if let (Some(id), Some(seg)) = (aid.clone(), segment.clone()) {
-                            state.ancillaries.register(id.clone(), seg, token.clone());
+                            // Get segment path
+                            let segment_path = {
+                                let segments = state.segments.read().unwrap();
+                                segments.get(&seg).map(|s| s.path.clone())
+                            };
+
+                            let (ws_name, working_dir) = match (&workspace, &segment_path) {
+                                (Some(ws), Some(seg_path)) => {
+                                    // Workspace requested - try to create/use it
+                                    if let Some(ref ws_mgr) = state.workspaces {
+                                        match ws_mgr.create_workspace(seg_path, &seg, ws) {
+                                            Ok(ws_path) => {
+                                                // Check if workspace is already in use
+                                                if let Some(other_id) = state.ancillaries.is_workspace_in_use(&ws_path) {
+                                                    let response = WsResponse::AuthFailure {
+                                                        reason: format!("Workspace {} is already in use by ancillary {}", ws, other_id),
+                                                    };
+                                                    if let Ok(json) = serde_json::to_string(&response) {
+                                                        let _ = sender.send(Message::Text(json)).await;
+                                                    }
+                                                    break;
+                                                }
+                                                working_dir_response = Some(ws_path.display().to_string());
+                                                (Some(ws.clone()), ws_path)
+                                            }
+                                            Err(e) => {
+                                                let response = WsResponse::AuthFailure {
+                                                    reason: format!("Failed to create workspace: {}", e),
+                                                };
+                                                if let Ok(json) = serde_json::to_string(&response) {
+                                                    let _ = sender.send(Message::Text(json)).await;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        let response = WsResponse::AuthFailure {
+                                            reason: "Workspace requested but workspace_root not configured".to_string(),
+                                        };
+                                        if let Ok(json) = serde_json::to_string(&response) {
+                                            let _ = sender.send(Message::Text(json)).await;
+                                        }
+                                        break;
+                                    }
+                                }
+                                (None, Some(seg_path)) => {
+                                    // No workspace - use segment path directly
+                                    // Check if segment is already in use
+                                    if let Some(other_id) = state.ancillaries.is_workspace_in_use(seg_path) {
+                                        let response = WsResponse::AuthFailure {
+                                            reason: format!("Segment {} is already in use by ancillary {}", seg, other_id),
+                                        };
+                                        if let Ok(json) = serde_json::to_string(&response) {
+                                            let _ = sender.send(Message::Text(json)).await;
+                                        }
+                                        break;
+                                    }
+                                    working_dir_response = Some(seg_path.display().to_string());
+                                    (None, seg_path.clone())
+                                }
+                                (_, None) => {
+                                    let response = WsResponse::AuthFailure {
+                                        reason: format!("Segment not found: {}", seg),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&response) {
+                                        let _ = sender.send(Message::Text(json)).await;
+                                    }
+                                    break;
+                                }
+                            };
+
+                            state.ancillaries.register(
+                                id.clone(),
+                                seg,
+                                token.clone(),
+                                ws_name,
+                                working_dir,
+                            );
                             ancillary_id = Some(id.clone());
                             info!("Ancillary {} registered", id);
                         }
 
                         let response = WsResponse::AuthSuccess {
                             session_id: token.clone(),
+                            working_dir: working_dir_response,
                         };
 
                         if let Ok(json) = serde_json::to_string(&response) {

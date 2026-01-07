@@ -15,9 +15,12 @@ CLAUDE.md
 # Test outputs
 examples/*/
 !examples/calculator/README.md
+workspaces/
 
 # Logs
 *.log
 
 # OS
 .DS_Store
+
+CLAUDE.md

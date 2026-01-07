@@ -1,0 +1,29 @@
+# Toren Configuration
+
+[server]
+host = "127.0.0.1"
+port = 8787
+
+[segments]
+# Discover all subdirectories in examples/ as segments
+globs = ["examples/*"]
+
+# Allow creating new segments in examples/
+roots = ["examples"]
+
+# No individual paths for now
+paths = []
+
+[ancillary]
+max_concurrent = 5
+default_model = "claude-sonnet-4-5-20250929"
+workspace_root = "workspaces"
+
+# Auto-approve settings
+[auto_approve]
+non_vcs_commands = true
+vcs_commands = false
+file_operations = false
+
+# Approved directories (for file system access)
+approved_directories = ["."]

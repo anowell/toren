@@ -18,8 +18,12 @@ build-ancillary:
 # Build everything
 build-all: build build-ancillary
 
-# Start the Toren daemon
+# Start the Toren daemon (dev mode - runs from source, uses local toren.toml)
 daemon:
+    cargo run --bin toren-daemon
+
+# Start the Toren daemon (production - runs release binary, uses ~/.config/toren/config.toml)
+daemon-prod: build
     ./target/release/toren-daemon
 
 # Send a prompt to Claude through Toren (auto-pairs if needed)
