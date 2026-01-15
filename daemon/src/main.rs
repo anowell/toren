@@ -8,6 +8,7 @@ mod plugins;
 mod security;
 mod segments;
 mod services;
+mod tasks;
 mod workspace;
 
 #[tokio::main]
@@ -64,7 +65,7 @@ async fn main() -> Result<()> {
     let addr = format!("{}:{}", config.host(), config.port());
     info!("Starting API server on {}", addr);
 
-    api::serve(&addr, services, security_ctx, plugin_manager, ancillary_manager, segment_manager, workspace_manager).await?;
+    api::serve(&addr, config, services, security_ctx, plugin_manager, ancillary_manager, segment_manager, workspace_manager).await?;
 
     Ok(())
 }

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
 use crate::ancillary::AncillaryManager;
+use crate::config::Config;
 use crate::plugins::PluginManager;
 use crate::security::SecurityContext;
 use crate::segments::SegmentManager;
@@ -26,6 +27,7 @@ mod ws_handler;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub config: Arc<Config>,
     pub services: Services,
     pub security: Arc<SecurityContext>,
     pub plugins: Arc<PluginManager>,
@@ -36,6 +38,7 @@ pub struct AppState {
 
 pub async fn serve(
     addr: &str,
+    config: Config,
     services: Services,
     security_ctx: SecurityContext,
     plugin_manager: PluginManager,
@@ -44,6 +47,7 @@ pub async fn serve(
     workspace_manager: Option<WorkspaceManager>,
 ) -> Result<()> {
     let state = AppState {
+        config: Arc::new(config),
         services,
         security: Arc::new(security_ctx),
         plugins: Arc::new(plugin_manager),

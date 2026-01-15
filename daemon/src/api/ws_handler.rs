@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 use super::AppState;
 use crate::ancillary::AncillaryStatus;
 use crate::services::command::CommandRequest;
+use crate::tasks;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -20,6 +21,9 @@ enum WsRequest {
         /// Optional workspace name - if provided, a jj workspace will be created/used
         #[serde(default)]
         workspace: Option<String>,
+        /// Optional task ID - if provided, fetches task from beads and sets as instruction
+        #[serde(default)]
+        task_id: Option<String>,
     },
     Command { request: CommandRequest },
     FileRead { path: String },
@@ -33,6 +37,8 @@ enum WsResponse {
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         working_dir: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        instruction: Option<String>,
     },
     AuthFailure { reason: String },
     CommandOutput { output: crate::services::command::CommandOutput },
@@ -61,7 +67,7 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
             let request: Result<WsRequest, _> = serde_json::from_str(&text);
 
             match request {
-                Ok(WsRequest::Auth { token, ancillary_id: aid, segment, workspace }) => {
+                Ok(WsRequest::Auth { token, ancillary_id: aid, segment, workspace, task_id }) => {
                     if state.security.validate_session(&token) {
                         authenticated = true;
                         let mut working_dir_response: Option<String> = None;
@@ -144,15 +150,38 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 seg,
                                 token.clone(),
                                 ws_name,
-                                working_dir,
+                                working_dir.clone(),
                             );
                             ancillary_id = Some(id.clone());
                             info!("Ancillary {} registered", id);
+
+                            // If task_id provided, fetch task and set instruction
+                            if let Some(ref tid) = task_id {
+                                match tasks::fetch_task(tid, &working_dir) {
+                                    Ok(task) => {
+                                        let prompt = tasks::generate_prompt(
+                                            &task,
+                                            &state.config.ancillary.task_prompt_template,
+                                        );
+                                        state.ancillaries.set_instruction(&id, Some(prompt.clone()));
+                                        info!("Ancillary {} instruction set from task {}", id, tid);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to fetch task {}: {}", tid, e);
+                                    }
+                                }
+                            }
                         }
+
+                        // Get the instruction if it was set (from task_id)
+                        let instruction = ancillary_id.as_ref().and_then(|id| {
+                            state.ancillaries.get(id).and_then(|a| a.current_instruction.clone())
+                        });
 
                         let response = WsResponse::AuthSuccess {
                             session_id: token.clone(),
                             working_dir: working_dir_response,
+                            instruction,
                         };
 
                         if let Ok(json) = serde_json::to_string(&response) {

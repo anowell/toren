@@ -58,6 +58,14 @@ pub struct AncillaryConfig {
     pub default_model: String,
     #[serde(default)]
     pub workspace_root: Option<PathBuf>,
+    /// Template for generating prompts from task IDs.
+    /// Available placeholders: {{task_id}}, {{task_provider}}
+    #[serde(default = "default_task_prompt_template")]
+    pub task_prompt_template: String,
+}
+
+fn default_task_prompt_template() -> String {
+    "implement bead {{task_id}}".to_string()
 }
 
 impl Default for AncillaryConfig {
@@ -66,6 +74,7 @@ impl Default for AncillaryConfig {
             max_concurrent: 5,
             default_model: "claude-sonnet-4-5-20250929".to_string(),
             workspace_root: None,
+            task_prompt_template: default_task_prompt_template(),
         }
     }
 }
