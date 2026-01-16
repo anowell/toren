@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::config::Config;
+use toren_lib::Config;
 use crate::security::SecurityContext;
 
 pub mod filesystem;

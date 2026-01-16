@@ -1,4 +1,4 @@
-mod beads;
+pub mod beads;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

@@ -1,0 +1,22 @@
+[package]
+name = "breq"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "breq"
+path = "src/main.rs"
+
+[dependencies]
+toren-lib = { path = "../lib" }
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+clap = { version = "4.5", features = ["derive"] }

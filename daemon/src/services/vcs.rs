@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::Config;
+use toren_lib::Config;
 
 pub struct VcsService {
     approved_directories: Vec<PathBuf>,

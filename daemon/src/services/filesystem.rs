@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
+use toren_lib::Config;
 
 pub struct FilesystemService {
     approved_directories: Vec<PathBuf>,

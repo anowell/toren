@@ -3,13 +3,12 @@ use tracing::{info, Level};
 
 mod ancillary;
 mod api;
-mod config;
 mod plugins;
 mod security;
-mod segments;
 mod services;
-mod tasks;
-mod workspace;
+
+// Re-export from toren-lib for internal use
+use toren_lib::{Config, SegmentManager, WorkspaceManager};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,7 +20,7 @@ async fn main() -> Result<()> {
     info!("Toren initializing, version {}", env!("CARGO_PKG_VERSION"));
 
     // Load configuration
-    let config = config::Config::load()?;
+    let config = Config::load()?;
     info!("Loaded configuration from: {}", config.config_path);
 
     // Initialize security context
@@ -52,13 +51,13 @@ async fn main() -> Result<()> {
     info!("Ancillary manager initialized");
 
     // Initialize segment manager
-    let segment_manager = segments::SegmentManager::new(&config)?;
+    let segment_manager = SegmentManager::new(&config)?;
     info!("Segment manager initialized");
 
     // Initialize workspace manager (if workspace_root is configured)
     let workspace_manager = config.ancillary.workspace_root.clone().map(|root| {
         info!("Workspace manager initialized with root: {}", root.display());
-        workspace::WorkspaceManager::new(root)
+        WorkspaceManager::new(root)
     });
 
     // Start API server

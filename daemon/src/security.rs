@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use crate::config::Config;
+use toren_lib::Config;
 
 const SESSION_FILE: &str = ".toren/sessions.json";
 

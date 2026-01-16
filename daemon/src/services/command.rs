@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use crate::config::Config;
+use toren_lib::Config;
 
 pub struct CommandService {
     approved_directories: Vec<PathBuf>,

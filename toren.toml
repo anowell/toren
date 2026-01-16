@@ -11,8 +11,8 @@ globs = ["examples/*"]
 # Allow creating new segments in examples/
 roots = ["examples"]
 
-# No individual paths for now
-paths = []
+# Explicit segment paths
+paths = ["."]
 
 [ancillary]
 max_concurrent = 5

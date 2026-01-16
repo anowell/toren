@@ -21,6 +21,11 @@ impl WorkspaceManager {
         Self { workspace_root }
     }
 
+    /// Get the workspace root directory
+    pub fn root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     /// Get the workspace directory path for a given segment and workspace name
     /// Pattern: $workspace_root/$segment_name/$workspace_name
     pub fn workspace_path(&self, segment_name: &str, workspace_name: &str) -> PathBuf {
@@ -148,5 +153,11 @@ impl WorkspaceManager {
             .collect();
 
         Ok(workspaces)
+    }
+
+    /// Check if a workspace exists for a segment
+    pub fn workspace_exists(&self, segment_name: &str, workspace_name: &str) -> bool {
+        let ws_path = self.workspace_path(segment_name, workspace_name);
+        ws_path.exists() && ws_path.join(".jj").exists()
     }
 }

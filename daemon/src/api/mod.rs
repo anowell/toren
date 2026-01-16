@@ -15,12 +15,10 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
 use crate::ancillary::AncillaryManager;
-use crate::config::Config;
 use crate::plugins::PluginManager;
 use crate::security::SecurityContext;
-use crate::segments::SegmentManager;
 use crate::services::Services;
-use crate::workspace::WorkspaceManager;
+use toren_lib::{Config, SegmentManager, WorkspaceManager};
 
 mod handlers;
 mod ws_handler;
