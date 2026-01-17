@@ -27,6 +27,10 @@ enum Commands {
         /// Segment to use (defaults to current directory's segment)
         #[arg(short, long)]
         segment: Option<String>,
+
+        /// Skip permission prompts (passes --dangerously-skip-permissions to claude)
+        #[arg(long)]
+        danger: bool,
     },
 
     /// List all assignments
@@ -107,7 +111,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Assign { bead, intent, segment } => cmd_assign(&bead, intent, segment.as_deref()),
+        Commands::Assign { bead, intent, segment, danger } => cmd_assign(&bead, intent, segment.as_deref(), danger),
         Commands::List => cmd_list(),
         Commands::Show { bead } => cmd_show(&bead),
         Commands::Extend { bead, instruction } => cmd_extend(&bead, instruction.as_deref()),
@@ -116,7 +120,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_assign(bead_id: &str, intent: Intent, segment_name: Option<&str>) -> Result<()> {
+fn cmd_assign(bead_id: &str, intent: Intent, segment_name: Option<&str>, danger: bool) -> Result<()> {
     let config = Config::load()?;
 
     // Get workspace root from config
@@ -160,10 +164,13 @@ fn cmd_assign(bead_id: &str, intent: Intent, segment_name: Option<&str>) -> Resu
     // Exec into claude (replaces this process)
     println!("Starting Claude session in {}\n", ws_path.display());
 
-    let err = Command::new("claude")
-        .arg(&prompt)
-        .current_dir(&ws_path)
-        .exec();
+    let mut cmd = Command::new("claude");
+    if danger {
+        cmd.arg("--dangerously-skip-permissions");
+    }
+    cmd.arg(&prompt).current_dir(&ws_path);
+
+    let err = cmd.exec();
 
     // exec() only returns on error
     Err(err).context("Failed to exec claude")
