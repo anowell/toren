@@ -1,14 +1,38 @@
+pub mod runtime;
+pub mod work_log;
+
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use tokio::sync::RwLock as TokioRwLock;
+use tracing::info;
+
+pub use runtime::{AncillaryWork, ClientInput, WorkStatus};
+pub use work_log::WorkEvent;
+use toren_lib::Assignment;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum AncillaryStatus {
-    Connected,
-    Executing,
+    /// Idle, no active assignment
     Idle,
+    /// Starting work on an assignment
+    Starting,
+    /// Actively working on an assignment
+    Working,
+    /// Awaiting user input
+    AwaitingInput,
+    /// Completed work (will transition to Idle)
+    Completed,
+    /// Failed (will transition to Idle)
+    Failed,
+    /// Legacy: connected via external process
+    Connected,
+    /// Legacy: executing via external process
+    Executing,
+    /// Legacy: disconnected external process
     Disconnected,
 }
 
@@ -126,6 +150,80 @@ impl AncillaryManager {
 }
 
 impl Default for AncillaryManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Manages active work for ancillaries (embedded runtime).
+/// This is separate from AncillaryManager which tracks connection state.
+pub struct WorkManager {
+    /// Active work keyed by ancillary ID
+    active_work: TokioRwLock<HashMap<String, Arc<AncillaryWork>>>,
+}
+
+impl WorkManager {
+    pub fn new() -> Self {
+        Self {
+            active_work: TokioRwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Start work for an ancillary on an assignment
+    pub async fn start_work(&self, ancillary_id: String, assignment: Assignment) -> Result<Arc<AncillaryWork>> {
+        info!("Starting work for {} on {}", ancillary_id, assignment.bead_id);
+
+        let work = AncillaryWork::start(ancillary_id.clone(), assignment).await?;
+        let work = Arc::new(work);
+
+        let mut active = self.active_work.write().await;
+        active.insert(ancillary_id, work.clone());
+
+        Ok(work)
+    }
+
+    /// Get active work for an ancillary
+    pub async fn get_work(&self, ancillary_id: &str) -> Option<Arc<AncillaryWork>> {
+        let active = self.active_work.read().await;
+        active.get(ancillary_id).cloned()
+    }
+
+    /// Stop work for an ancillary
+    pub async fn stop_work(&self, ancillary_id: &str) -> Option<Arc<AncillaryWork>> {
+        let mut active = self.active_work.write().await;
+        if let Some(work) = active.remove(ancillary_id) {
+            // Interrupt the work
+            let _ = work.interrupt().await;
+            Some(work)
+        } else {
+            None
+        }
+    }
+
+    /// List all active work
+    pub async fn list_active(&self) -> Vec<(String, WorkStatus)> {
+        let active = self.active_work.read().await;
+        let mut result = Vec::new();
+        for (id, work) in active.iter() {
+            let status = work.status().await;
+            result.push((id.clone(), status));
+        }
+        result
+    }
+
+    /// Check if ancillary has active work
+    pub async fn has_active_work(&self, ancillary_id: &str) -> bool {
+        let active = self.active_work.read().await;
+        if let Some(work) = active.get(ancillary_id) {
+            let status = work.status().await;
+            !matches!(status, WorkStatus::Completed | WorkStatus::Failed { .. })
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for WorkManager {
     fn default() -> Self {
         Self::new()
     }

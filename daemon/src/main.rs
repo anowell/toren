@@ -64,11 +64,15 @@ async fn main() -> Result<()> {
         WorkspaceManager::new(root)
     });
 
+    // Initialize work manager (for embedded ancillary runtime)
+    let work_manager = ancillary::WorkManager::new();
+    info!("Work manager initialized");
+
     // Start API server
     let addr = format!("{}:{}", config.host(), config.port());
     info!("Starting API server on {}", addr);
 
-    api::serve(&addr, config, services, security_ctx, plugin_manager, ancillary_manager, assignment_manager, segment_manager, workspace_manager).await?;
+    api::serve(&addr, config, services, security_ctx, plugin_manager, ancillary_manager, assignment_manager, segment_manager, workspace_manager, work_manager).await?;
 
     Ok(())
 }

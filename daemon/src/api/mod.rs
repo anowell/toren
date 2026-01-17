@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::WebSocketUpgrade,
-        Path, State,
+        Path, Query, State,
     },
     http::StatusCode,
     response::IntoResponse,
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::ancillary::AncillaryManager;
+use crate::ancillary::{AncillaryManager, WorkManager};
 use crate::plugins::PluginManager;
 use crate::security::SecurityContext;
 use crate::services::Services;
@@ -23,6 +23,7 @@ use toren_lib::{
     Assignment, AssignmentManager, AssignmentStatus, Config, SegmentManager, WorkspaceManager,
 };
 
+mod ancillary_ws;
 mod handlers;
 mod ws_handler;
 
@@ -36,6 +37,7 @@ pub struct AppState {
     pub assignments: Arc<RwLock<AssignmentManager>>,
     pub segments: Arc<std::sync::RwLock<SegmentManager>>,
     pub workspaces: Option<Arc<WorkspaceManager>>,
+    pub work_manager: Arc<WorkManager>,
 }
 
 pub async fn serve(
@@ -48,6 +50,7 @@ pub async fn serve(
     assignment_manager: AssignmentManager,
     segment_manager: SegmentManager,
     workspace_manager: Option<WorkspaceManager>,
+    work_manager: WorkManager,
 ) -> Result<()> {
     let state = AppState {
         config: Arc::new(config),
@@ -58,12 +61,14 @@ pub async fn serve(
         assignments: Arc::new(RwLock::new(assignment_manager)),
         segments: Arc::new(std::sync::RwLock::new(segment_manager)),
         workspaces: workspace_manager.map(Arc::new),
+        work_manager: Arc::new(work_manager),
     };
 
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/pair", post(pair_device))
         .route("/ws", get(ws_handler))
+        .route("/ws/ancillaries/:id", get(ancillary_ws_handler))
         .route("/api/fs/read", post(handlers::fs_read))
         .route("/api/fs/write", post(handlers::fs_write))
         .route("/api/fs/list", post(handlers::fs_list))
@@ -72,6 +77,8 @@ pub async fn serve(
         .route("/api/plugins/list", get(handlers::plugins_list))
         .route("/api/plugins/execute", post(handlers::plugins_execute))
         .route("/api/ancillaries/list", get(ancillaries_list))
+        .route("/api/ancillaries/:id/start", post(ancillary_start_work))
+        .route("/api/ancillaries/:id/stop", post(ancillary_stop_work))
         .route("/api/assignments", get(assignments_list))
         .route("/api/assignments", post(assignments_create))
         .route("/api/assignments/:id", get(assignments_get))
@@ -132,6 +139,99 @@ async fn ws_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(|socket| ws_handler::handle_websocket(socket, state))
+}
+
+#[derive(Debug, Deserialize)]
+struct AncillaryWsQuery {
+    from_seq: Option<u64>,
+}
+
+async fn ancillary_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Path(ancillary_id): Path<String>,
+    Query(query): Query<AncillaryWsQuery>,
+) -> impl IntoResponse {
+    // URL decode the ancillary ID (spaces become %20)
+    let ancillary_id = urlencoding::decode(&ancillary_id)
+        .map(|s| s.into_owned())
+        .unwrap_or(ancillary_id);
+
+    ws.on_upgrade(move |socket| {
+        ancillary_ws::handle_ancillary_ws(socket, state, ancillary_id, query.from_seq)
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct StartWorkRequest {
+    /// Assignment ID to start work on
+    assignment_id: String,
+}
+
+async fn ancillary_start_work(
+    State(state): State<AppState>,
+    Path(ancillary_id): Path<String>,
+    Json(request): Json<StartWorkRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // URL decode the ancillary ID
+    let ancillary_id = urlencoding::decode(&ancillary_id)
+        .map(|s| s.into_owned())
+        .unwrap_or(ancillary_id);
+
+    // Get the assignment
+    let assignment = {
+        let assignments = state.assignments.read().await;
+        assignments.get(&request.assignment_id).cloned()
+    };
+
+    let assignment = assignment.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Assignment not found"})),
+        )
+    })?;
+
+    // Check if ancillary already has active work
+    if state.work_manager.has_active_work(&ancillary_id).await {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "Ancillary already has active work"})),
+        ));
+    }
+
+    // Start work
+    match state.work_manager.start_work(ancillary_id.clone(), assignment).await {
+        Ok(work) => {
+            let status = work.status().await;
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "ancillary_id": ancillary_id,
+                "status": status.to_string()
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )),
+    }
+}
+
+async fn ancillary_stop_work(
+    State(state): State<AppState>,
+    Path(ancillary_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // URL decode the ancillary ID
+    let ancillary_id = urlencoding::decode(&ancillary_id)
+        .map(|s| s.into_owned())
+        .unwrap_or(ancillary_id);
+
+    match state.work_manager.stop_work(&ancillary_id).await {
+        Some(_) => Ok(Json(serde_json::json!({
+            "success": true,
+            "ancillary_id": ancillary_id
+        }))),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 async fn ancillaries_list(
