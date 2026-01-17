@@ -382,18 +382,8 @@ async fn assignments_create(
         assignments.next_available_ancillary(&request.segment, state.config.ancillary.pool_size);
     let ancillary_num = toren_lib::ancillary_number(&ancillary_id).unwrap_or(1);
 
-    // Generate workspace name
-    let existing = assignments.get_by_bead(&bead_id);
-    let active_count = existing
-        .iter()
-        .filter(|a| matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
-        .count();
-
-    let ws_name = if active_count == 0 {
-        bead_id.clone()
-    } else {
-        format!("{}-{}", bead_id, ancillary_num)
-    };
+    // Generate workspace name from ancillary number word
+    let ws_name = toren_lib::number_to_word(ancillary_num).to_lowercase();
 
     // Create workspace
     let ws_path = ws_mgr

@@ -187,23 +187,9 @@ trait Pipe: Sized {
 impl<T> Pipe for T {}
 
 /// Generate workspace name for a bead assignment.
-/// If multiple ancillaries work on the same bead, suffix with ancillary number.
-fn workspace_name_for_assignment(
-    assignment_mgr: &AssignmentManager,
-    bead_id: &str,
-    ancillary_number: u32,
-) -> String {
-    let existing = assignment_mgr.get_by_bead(bead_id);
-    let active_count = existing
-        .iter()
-        .filter(|a| matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
-        .count();
-
-    if active_count == 0 {
-        bead_id.to_string()
-    } else {
-        format!("{}-{}", bead_id, ancillary_number)
-    }
+/// Uses the ancillary number word (e.g. "one", "two") so workspaces can be reused.
+fn workspace_name_for_assignment(ancillary_number: u32) -> String {
+    toren_lib::number_to_word(ancillary_number).to_lowercase()
 }
 
 fn cmd_assign(
@@ -271,8 +257,8 @@ fn cmd_assign(
     let ancillary_num = toren_lib::ancillary_number(&ancillary_id).unwrap_or(1);
     println!("Ancillary: {}", ancillary_id);
 
-    // Generate workspace name
-    let ws_name = workspace_name_for_assignment(&assignment_mgr, &bead_id, ancillary_num);
+    // Generate workspace name from ancillary number word
+    let ws_name = workspace_name_for_assignment(ancillary_num);
 
     // Create workspace
     let ws_path = workspace_mgr.create_workspace(&segment.path, &segment.name, &ws_name)?;
