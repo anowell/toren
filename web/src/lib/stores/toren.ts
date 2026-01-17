@@ -1,5 +1,12 @@
-import { writable, derived } from 'svelte/store';
-import type { WsRequest, WsResponse, CommandOutput, Ancillary, Segment } from '$lib/types/toren';
+import { derived, writable } from 'svelte/store';
+import type {
+	Ancillary,
+	Assignment,
+	CommandOutput,
+	Segment,
+	WsRequest,
+	WsResponse,
+} from '$lib/types/toren';
 
 export interface TorenState {
 	connected: boolean;
@@ -9,11 +16,14 @@ export interface TorenState {
 	sessionToken: string | null;
 	shipUrl: string;
 	ancillaries: Ancillary[];
+	assignments: Assignment[];
 	messages: ChatMessage[];
 	segments: Segment[];
 	segmentRoots: string[];
 	selectedSegment: Segment | null;
+	selectedAncillary: Assignment | null;
 	loadingSegments: boolean;
+	loadingAssignments: boolean;
 }
 
 export interface ChatMessage {
@@ -217,11 +227,14 @@ function createTorenStore() {
 		sessionToken: null,
 		shipUrl: 'http://localhost:8787',
 		ancillaries: [],
+		assignments: [],
 		messages: [],
 		segments: [],
 		segmentRoots: [],
 		selectedSegment: null,
+		selectedAncillary: null,
 		loadingSegments: false,
+		loadingAssignments: false,
 	};
 
 	const { subscribe, set, update } = writable(initialState);
@@ -284,6 +297,28 @@ function createTorenStore() {
 				throw error;
 			}
 		},
+		async loadAssignments(shipUrl: string) {
+			update((state) => ({ ...state, loadingAssignments: true }));
+			try {
+				const response = await fetch(`${shipUrl}/api/assignments`);
+				if (!response.ok) throw new Error('Failed to fetch assignments');
+				const data = await response.json();
+				update((state) => ({
+					...state,
+					assignments: data.assignments,
+					loadingAssignments: false,
+				}));
+			} catch (error) {
+				console.error('Failed to load assignments:', error);
+				update((state) => ({
+					...state,
+					loadingAssignments: false,
+				}));
+			}
+		},
+		selectAncillary(assignment: Assignment | null) {
+			update((state) => ({ ...state, selectedAncillary: assignment }));
+		},
 	};
 }
 
@@ -293,3 +328,11 @@ export const torenStore = createTorenStore();
 export const isConnected = derived(torenStore, ($toren) => $toren.connected);
 export const isAuthenticated = derived(torenStore, ($toren) => $toren.authenticated);
 export const messages = derived(torenStore, ($toren) => $toren.messages);
+export const assignments = derived(torenStore, ($toren) => $toren.assignments);
+
+// Filter assignments for current segment
+export const segmentAssignments = derived(torenStore, ($toren) => {
+	if (!$toren.selectedSegment) return [];
+	const segmentName = $toren.selectedSegment.name.toLowerCase();
+	return $toren.assignments.filter((a) => a.segment.toLowerCase() === segmentName);
+});

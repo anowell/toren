@@ -1,72 +1,72 @@
 <script lang="ts">
-	import { torenStore } from '$lib/stores/toren';
-	import type { Segment } from '$lib/types/toren';
+import { torenStore } from '$lib/stores/toren';
+import type { Segment } from '$lib/types/toren';
 
-	let showCreateModal = false;
-	let newSegmentName = '';
-	let selectedRoot = '';
-	let creating = false;
-	let error = '';
+let showCreateModal = false;
+let newSegmentName = '';
+let selectedRoot = '';
+let creating = false;
+let error = '';
 
-	$: selectedRoot = $torenStore.segmentRoots[0] || '';
+$: selectedRoot = $torenStore.segmentRoots[0] || '';
 
-	function selectSegment(segment: Segment) {
+function selectSegment(segment: Segment) {
+	torenStore.selectSegment(segment);
+}
+
+function openCreateModal() {
+	showCreateModal = true;
+	newSegmentName = '';
+	error = '';
+}
+
+function closeCreateModal() {
+	showCreateModal = false;
+	newSegmentName = '';
+	error = '';
+}
+
+async function handleCreateSegment() {
+	if (!newSegmentName.trim()) {
+		error = 'Segment name is required';
+		return;
+	}
+
+	if (!selectedRoot) {
+		error = 'No root directory available';
+		return;
+	}
+
+	creating = true;
+	error = '';
+
+	try {
+		const segment = await torenStore.createSegment(
+			newSegmentName.trim(),
+			selectedRoot,
+			$torenStore.shipUrl,
+		);
 		torenStore.selectSegment(segment);
+		closeCreateModal();
+	} catch (err) {
+		error = err instanceof Error ? err.message : 'Failed to create segment';
+	} finally {
+		creating = false;
 	}
+}
 
-	function openCreateModal() {
-		showCreateModal = true;
-		newSegmentName = '';
-		error = '';
+function getSegmentIcon(source: string) {
+	switch (source) {
+		case 'glob':
+			return '📁';
+		case 'path':
+			return '📍';
+		case 'root':
+			return '✨';
+		default:
+			return '📂';
 	}
-
-	function closeCreateModal() {
-		showCreateModal = false;
-		newSegmentName = '';
-		error = '';
-	}
-
-	async function handleCreateSegment() {
-		if (!newSegmentName.trim()) {
-			error = 'Segment name is required';
-			return;
-		}
-
-		if (!selectedRoot) {
-			error = 'No root directory available';
-			return;
-		}
-
-		creating = true;
-		error = '';
-
-		try {
-			const segment = await torenStore.createSegment(
-				newSegmentName.trim(),
-				selectedRoot,
-				$torenStore.shipUrl,
-			);
-			torenStore.selectSegment(segment);
-			closeCreateModal();
-		} catch (err) {
-			error = err instanceof Error ? err.message : 'Failed to create segment';
-		} finally {
-			creating = false;
-		}
-	}
-
-	function getSegmentIcon(source: string) {
-		switch (source) {
-			case 'glob':
-				return '📁';
-			case 'path':
-				return '📍';
-			case 'root':
-				return '✨';
-			default:
-				return '📂';
-		}
-	}
+}
 </script>
 
 <div class="segment-selector">

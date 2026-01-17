@@ -24,6 +24,25 @@ export interface Ancillary {
 	last_active: string;
 }
 
+export type AssignmentStatus = 'pending' | 'active' | 'completed' | 'aborted';
+
+export interface AssignmentSource {
+	type: 'Bead' | 'Prompt';
+	original_prompt?: string;
+}
+
+export interface Assignment {
+	id: string;
+	ancillary_id: string;
+	bead_id: string;
+	segment: string;
+	workspace_path: string;
+	source: AssignmentSource;
+	status: AssignmentStatus;
+	created_at: string;
+	updated_at: string;
+}
+
 export interface Segment {
 	name: string;
 	path: string;

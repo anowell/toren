@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach } from 'vitest';
 import { get } from 'svelte/store';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { torenStore } from './toren';
 
 describe('Toren Store', () => {

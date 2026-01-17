@@ -1,25 +1,24 @@
 <script lang="ts">
-	import ChatInterface from '$lib/components/ChatInterface.svelte';
-	import PairingModal from '$lib/components/PairingModal.svelte';
-	import SegmentSelector from '$lib/components/SegmentSelector.svelte';
-	import { torenStore } from '$lib/stores/toren';
+import { goto } from '$app/navigation';
+import PairingModal from '$lib/components/PairingModal.svelte';
+import SegmentSelector from '$lib/components/SegmentSelector.svelte';
+import { torenStore } from '$lib/stores/toren';
 
-	let showSegmentSelector = false;
+let showSegmentSelector = false;
 
-	$: {
-		// Show segment selector if connected and authenticated but no segment selected
-		if ($torenStore.authenticated && !$torenStore.selectedSegment && !showSegmentSelector) {
-			showSegmentSelector = true;
-		}
-		// Hide segment selector once a segment is selected
-		if ($torenStore.selectedSegment && showSegmentSelector) {
-			showSegmentSelector = false;
-		}
-	}
+// Auto-show segment selector when authenticated but no segment
+$: if ($torenStore.authenticated && !$torenStore.selectedSegment && !showSegmentSelector) {
+	showSegmentSelector = true;
+}
 
-	function toggleSegmentSelector() {
-		showSegmentSelector = !showSegmentSelector;
-	}
+// Navigate to segment route when segment is selected
+$: if ($torenStore.selectedSegment) {
+	goto(`/a/${$torenStore.selectedSegment.name.toLowerCase()}`);
+}
+
+function toggleSegmentSelector() {
+	showSegmentSelector = !showSegmentSelector;
+}
 </script>
 
 <svelte:head>
@@ -28,31 +27,23 @@
 
 <PairingModal />
 
-{#if showSegmentSelector}
-	<div class="overlay" on:click={toggleSegmentSelector} role="presentation">
-		<div class="selector-container" on:click|stopPropagation role="dialog">
-			<SegmentSelector />
+{#if $torenStore.authenticated}
+	{#if showSegmentSelector || !$torenStore.selectedSegment}
+		<div class="overlay" on:click={toggleSegmentSelector} role="presentation">
+			<div class="selector-container" on:click|stopPropagation role="dialog">
+				<SegmentSelector />
+			</div>
+		</div>
+	{/if}
+{:else}
+	<!-- Show landing/welcome when not authenticated -->
+	<div class="landing">
+		<div class="landing-content">
+			<h1>Toren</h1>
+			<p>Mobile-first development intelligence</p>
+			<p class="hint">Connect to a Toren daemon to get started</p>
 		</div>
 	</div>
-{:else}
-	<ChatInterface />
-	{#if $torenStore.authenticated}
-		<button class="fab" on:click={toggleSegmentSelector} aria-label="Change project">
-			<svg
-				xmlns="http://www.w3.org/2000/svg"
-				width="24"
-				height="24"
-				viewBox="0 0 24 24"
-				fill="none"
-				stroke="currentColor"
-				stroke-width="2"
-				stroke-linecap="round"
-				stroke-linejoin="round"
-			>
-				<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-			</svg>
-		</button>
-	{/if}
 {/if}
 
 <style>
@@ -83,42 +74,44 @@
 		}
 	}
 
-	.fab {
-		position: fixed;
-		bottom: var(--spacing-lg);
-		right: var(--spacing-lg);
-		width: 56px;
-		height: 56px;
-		border-radius: 50%;
-		background: var(--color-primary);
-		color: white;
+	.landing {
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-		transition: all 0.2s;
-		z-index: 50;
+		height: 100vh;
+		background: var(--color-bg);
 	}
 
-	.fab:hover {
-		background: var(--color-primary-hover);
-		transform: scale(1.05);
-		box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+	.landing-content {
+		text-align: center;
+		padding: var(--spacing-xl);
 	}
 
-	.fab:active {
-		transform: scale(0.95);
+	.landing h1 {
+		font-size: 3rem;
+		color: var(--color-primary);
+		margin: 0 0 var(--spacing-md) 0;
+	}
+
+	.landing p {
+		color: var(--color-text-secondary);
+		margin: 0 0 var(--spacing-sm) 0;
+	}
+
+	.landing .hint {
+		font-size: 0.85rem;
 	}
 
 	@media (min-width: 768px) {
 		.overlay {
 			align-items: center;
 			justify-content: center;
+			background: rgba(0, 0, 0, 0.8);
 		}
 
 		.selector-container {
-			max-width: 600px;
-			max-height: 700px;
+			max-width: 500px;
+			max-height: 600px;
 			border-radius: var(--radius-lg);
 			animation: scaleIn 0.3s ease-out;
 		}

@@ -1,99 +1,99 @@
 <script lang="ts">
-	import { torenStore, client } from '$lib/stores/toren';
+import { client, torenStore } from '$lib/stores/toren';
 
-	let pairingToken = '';
-	let shipUrl = 'http://localhost:8787';
-	let pairing = false;
-	let error = '';
+let pairingToken = '';
+let shipUrl = 'http://localhost:8787';
+let pairing = false;
+let error = '';
 
-	async function handlePair() {
-		error = '';
-		pairing = true;
+async function handlePair() {
+	error = '';
+	pairing = true;
 
-		try {
-			// First, call the /pair REST endpoint
-			const response = await fetch(`${shipUrl}/pair`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ pairing_token: pairingToken }),
-			});
+	try {
+		// First, call the /pair REST endpoint
+		const response = await fetch(`${shipUrl}/pair`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ pairing_token: pairingToken }),
+		});
 
-			if (!response.ok) {
-				throw new Error('Pairing failed');
-			}
-
-			const data = await response.json();
-
-			// Update store with ship URL
-			torenStore.update((state) => ({
-				...state,
-				shipUrl,
-				sessionToken: data.session_token,
-			}));
-
-			// Connect WebSocket
-			torenStore.update((state) => ({ ...state, connecting: true }));
-			await client.connect(shipUrl);
-
-			// Authenticate
-			await client.authenticate(data.session_token);
-
-			// Store session token in localStorage
-			localStorage.setItem('toren_session_token', data.session_token);
-			localStorage.setItem('toren_ship_url', shipUrl);
-
-			// Load segments
-			await torenStore.loadSegments(shipUrl);
-
-			// Restore selected segment from localStorage
-			const savedSegment = localStorage.getItem('toren_selected_segment');
-			if (savedSegment) {
-				try {
-					const segment = JSON.parse(savedSegment);
-					torenStore.selectSegment(segment);
-				} catch (e) {
-					console.error('Failed to restore selected segment:', e);
-				}
-			}
-		} catch (err) {
-			error = err instanceof Error ? err.message : 'Pairing failed';
-			console.error('Pairing error:', err);
-		} finally {
-			pairing = false;
+		if (!response.ok) {
+			throw new Error('Pairing failed');
 		}
+
+		const data = await response.json();
+
+		// Update store with ship URL
+		torenStore.update((state) => ({
+			...state,
+			shipUrl,
+			sessionToken: data.session_token,
+		}));
+
+		// Connect WebSocket
+		torenStore.update((state) => ({ ...state, connecting: true }));
+		await client.connect(shipUrl);
+
+		// Authenticate
+		await client.authenticate(data.session_token);
+
+		// Store session token in localStorage
+		localStorage.setItem('toren_session_token', data.session_token);
+		localStorage.setItem('toren_ship_url', shipUrl);
+
+		// Load segments
+		await torenStore.loadSegments(shipUrl);
+
+		// Restore selected segment from localStorage
+		const savedSegment = localStorage.getItem('toren_selected_segment');
+		if (savedSegment) {
+			try {
+				const segment = JSON.parse(savedSegment);
+				torenStore.selectSegment(segment);
+			} catch (e) {
+				console.error('Failed to restore selected segment:', e);
+			}
+		}
+	} catch (err) {
+		error = err instanceof Error ? err.message : 'Pairing failed';
+		console.error('Pairing error:', err);
+	} finally {
+		pairing = false;
 	}
+}
 
-	// Try to auto-connect with stored credentials
-	$: if (typeof window !== 'undefined') {
-		const storedToken = localStorage.getItem('toren_session_token');
-		const storedUrl = localStorage.getItem('toren_ship_url');
+// Try to auto-connect with stored credentials
+$: if (typeof window !== 'undefined') {
+	const storedToken = localStorage.getItem('toren_session_token');
+	const storedUrl = localStorage.getItem('toren_ship_url');
 
-		if (storedToken && storedUrl && !$torenStore.connected && !$torenStore.connecting) {
-			shipUrl = storedUrl;
-			client
-				.connect(storedUrl)
-				.then(() => client.authenticate(storedToken))
-				.then(() => torenStore.loadSegments(storedUrl))
-				.then(() => {
-					// Restore selected segment
-					const savedSegment = localStorage.getItem('toren_selected_segment');
-					if (savedSegment) {
-						try {
-							const segment = JSON.parse(savedSegment);
-							torenStore.selectSegment(segment);
-						} catch (e) {
-							console.error('Failed to restore selected segment:', e);
-						}
+	if (storedToken && storedUrl && !$torenStore.connected && !$torenStore.connecting) {
+		shipUrl = storedUrl;
+		client
+			.connect(storedUrl)
+			.then(() => client.authenticate(storedToken))
+			.then(() => torenStore.loadSegments(storedUrl))
+			.then(() => {
+				// Restore selected segment
+				const savedSegment = localStorage.getItem('toren_selected_segment');
+				if (savedSegment) {
+					try {
+						const segment = JSON.parse(savedSegment);
+						torenStore.selectSegment(segment);
+					} catch (e) {
+						console.error('Failed to restore selected segment:', e);
 					}
-				})
-				.catch((err) => {
-					console.log('Auto-connect failed:', err);
-					// Clear stored credentials
-					localStorage.removeItem('toren_session_token');
-					localStorage.removeItem('toren_ship_url');
-				});
-		}
+				}
+			})
+			.catch((err) => {
+				console.log('Auto-connect failed:', err);
+				// Clear stored credentials
+				localStorage.removeItem('toren_session_token');
+				localStorage.removeItem('toren_ship_url');
+			});
 	}
+}
 </script>
 
 {#if !$torenStore.authenticated && !$torenStore.connecting}
