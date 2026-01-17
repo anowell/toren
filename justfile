@@ -9,7 +9,7 @@ default:
 
 # Build the Rust daemon
 build:
-    cargo build --release
+    cargo build
 
 # Build the TypeScript ancillary runtime
 build-ancillary:
@@ -22,9 +22,9 @@ build-all: build build-ancillary
 daemon:
     cargo run --bin toren-daemon
 
-# Start the Toren daemon (production - runs release binary, uses ~/.config/toren/config.toml)
-daemon-prod: build
-    ./target/release/toren-daemon
+# Start the web server (dev mode)
+web:
+    cd web && npm run dev
 
 # Send a prompt to Claude through Toren (auto-pairs if needed)
 # Interactive mode: just prompt examples/calculator (asks for input)
@@ -68,9 +68,6 @@ prompt DIR="examples/default":
 
     NODE_PATH=./ancillary/node_modules npx tsx scripts/toren-cli.ts
 
-# Run the calculator kata test (proves the system works end-to-end)
-test-calculator:
-    NODE_PATH=./ancillary/node_modules npx tsx scripts/test-calculator-kata.ts
 
 # Get a session token (requires pairing token from daemon)
 # Usage: just pair 714697
@@ -87,12 +84,6 @@ health:
 plugins:
     curl -s http://localhost:8787/api/plugins/commands | jq .
 
-# Get VCS status
-vcs-status PATH=".":
-    curl -s -X POST http://localhost:8787/api/vcs/status \
-        -H "Content-Type: application/json" \
-        -d '{"path": "{{PATH}}"}' | jq .
-
 # Clean build artifacts
 clean:
     cargo clean
@@ -105,13 +96,6 @@ clean-examples:
     rm -rf examples/calculator
     rm -rf examples/hello-world
 
-# Run the generated calculator example
-run-calculator EXPR:
-    cd examples/calculator && node calculator.js "{{EXPR}}"
-
-# Test the generated calculator
-test-calculator-output:
-    cd examples/calculator && npm test
 
 # Install dependencies
 install:
@@ -123,20 +107,3 @@ fmt:
     cargo fmt
     cd ancillary && npm run build
 
-# Full setup from scratch
-setup: install build-all
-    @echo "✅ Toren setup complete!"
-    @echo ""
-    @echo "Next steps:"
-    @echo "  1. Create .env file:"
-    @echo "       cp .env.example .env"
-    @echo "       # Add your ANTHROPIC_API_KEY"
-    @echo "       # PAIRING_TOKEN is already set to 123456"
-    @echo ""
-    @echo "  2. Start daemon:"
-    @echo "       just daemon"
-    @echo ""
-    @echo "  3. Build something (auto-pairs on first use!):"
-    @echo "       echo 'Build a calculator' | just prompt examples/calculator"
-    @echo ""
-    @echo "Session tokens persist - you only pair once!"
