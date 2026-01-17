@@ -62,6 +62,13 @@ pub struct AncillaryConfig {
     /// Available placeholders: {{task_id}}, {{task_provider}}
     #[serde(default = "default_task_prompt_template")]
     pub task_prompt_template: String,
+    /// Default pool size for ancillaries per segment
+    #[serde(default = "default_pool_size")]
+    pub pool_size: u32,
+}
+
+fn default_pool_size() -> u32 {
+    10
 }
 
 fn default_task_prompt_template() -> String {
@@ -75,6 +82,7 @@ impl Default for AncillaryConfig {
             default_model: "claude-sonnet-4-5-20250929".to_string(),
             workspace_root: None,
             task_prompt_template: default_task_prompt_template(),
+            pool_size: default_pool_size(),
         }
     }
 }

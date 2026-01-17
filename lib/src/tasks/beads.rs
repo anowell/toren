@@ -87,3 +87,49 @@ pub fn claim_bead(bead_id: &str, assignee: &str, working_dir: &Path) -> Result<(
 
     Ok(())
 }
+
+/// Create a new bead from a prompt/description.
+/// Returns the created bead ID.
+pub fn create_bead(
+    title: &str,
+    description: Option<&str>,
+    working_dir: &Path,
+) -> Result<String> {
+    let mut args = vec!["create", "--silent", "--title", title];
+
+    if let Some(desc) = description {
+        args.push("--description");
+        args.push(desc);
+    }
+
+    let output = Command::new("bd")
+        .args(&args)
+        .current_dir(working_dir)
+        .output()
+        .context("Failed to execute bd create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("bd create failed: {}", stderr.trim()));
+    }
+
+    let bead_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if bead_id.is_empty() {
+        return Err(anyhow!("bd create returned empty bead ID"));
+    }
+
+    Ok(bead_id)
+}
+
+/// Create a bead from a prompt and immediately claim it.
+/// Returns the created bead ID.
+pub fn create_and_claim_bead(
+    title: &str,
+    description: Option<&str>,
+    assignee: &str,
+    working_dir: &Path,
+) -> Result<String> {
+    let bead_id = create_bead(title, description, working_dir)?;
+    claim_bead(&bead_id, assignee, working_dir)?;
+    Ok(bead_id)
+}

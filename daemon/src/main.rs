@@ -8,7 +8,7 @@ mod security;
 mod services;
 
 // Re-export from toren-lib for internal use
-use toren_lib::{Config, SegmentManager, WorkspaceManager};
+use toren_lib::{AssignmentManager, Config, SegmentManager, WorkspaceManager};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,6 +50,10 @@ async fn main() -> Result<()> {
     let ancillary_manager = ancillary::AncillaryManager::new();
     info!("Ancillary manager initialized");
 
+    // Initialize assignment manager
+    let assignment_manager = AssignmentManager::new()?;
+    info!("Assignment manager initialized");
+
     // Initialize segment manager
     let segment_manager = SegmentManager::new(&config)?;
     info!("Segment manager initialized");
@@ -64,7 +68,7 @@ async fn main() -> Result<()> {
     let addr = format!("{}:{}", config.host(), config.port());
     info!("Starting API server on {}", addr);
 
-    api::serve(&addr, config, services, security_ctx, plugin_manager, ancillary_manager, segment_manager, workspace_manager).await?;
+    api::serve(&addr, config, services, security_ctx, plugin_manager, ancillary_manager, assignment_manager, segment_manager, workspace_manager).await?;
 
     Ok(())
 }

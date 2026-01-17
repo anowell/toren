@@ -18,7 +18,10 @@ use crate::ancillary::AncillaryManager;
 use crate::plugins::PluginManager;
 use crate::security::SecurityContext;
 use crate::services::Services;
-use toren_lib::{Config, SegmentManager, WorkspaceManager};
+use tokio::sync::RwLock;
+use toren_lib::{
+    Assignment, AssignmentManager, AssignmentStatus, Config, SegmentManager, WorkspaceManager,
+};
 
 mod handlers;
 mod ws_handler;
@@ -30,6 +33,7 @@ pub struct AppState {
     pub security: Arc<SecurityContext>,
     pub plugins: Arc<PluginManager>,
     pub ancillaries: Arc<AncillaryManager>,
+    pub assignments: Arc<RwLock<AssignmentManager>>,
     pub segments: Arc<std::sync::RwLock<SegmentManager>>,
     pub workspaces: Option<Arc<WorkspaceManager>>,
 }
@@ -41,6 +45,7 @@ pub async fn serve(
     security_ctx: SecurityContext,
     plugin_manager: PluginManager,
     ancillary_manager: AncillaryManager,
+    assignment_manager: AssignmentManager,
     segment_manager: SegmentManager,
     workspace_manager: Option<WorkspaceManager>,
 ) -> Result<()> {
@@ -50,6 +55,7 @@ pub async fn serve(
         security: Arc::new(security_ctx),
         plugins: Arc::new(plugin_manager),
         ancillaries: Arc::new(ancillary_manager),
+        assignments: Arc::new(RwLock::new(assignment_manager)),
         segments: Arc::new(std::sync::RwLock::new(segment_manager)),
         workspaces: workspace_manager.map(Arc::new),
     };
@@ -66,6 +72,11 @@ pub async fn serve(
         .route("/api/plugins/list", get(handlers::plugins_list))
         .route("/api/plugins/execute", post(handlers::plugins_execute))
         .route("/api/ancillaries/list", get(ancillaries_list))
+        .route("/api/assignments", get(assignments_list))
+        .route("/api/assignments", post(assignments_create))
+        .route("/api/assignments/:id", get(assignments_get))
+        .route("/api/assignments/:id", axum::routing::delete(assignments_delete))
+        .route("/api/assignments/:id/status", post(assignments_update_status))
         .route("/api/segments/list", get(segments_list))
         .route("/api/segments/create", post(segments_create))
         .route("/api/workspaces/list/:segment", get(workspaces_list))
@@ -238,4 +249,257 @@ async fn workspaces_cleanup(
             })))
         }
     }
+}
+
+// ==================== Assignment API ====================
+
+#[derive(Debug, Deserialize)]
+struct CreateAssignmentRequest {
+    /// Create from existing bead ID
+    #[serde(default)]
+    bead_id: Option<String>,
+    /// Create from prompt (auto-creates bead)
+    #[serde(default)]
+    prompt: Option<String>,
+    /// Title for prompt-based creation
+    #[serde(default)]
+    title: Option<String>,
+    /// Segment name
+    segment: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AssignmentResponse {
+    assignment: Assignment,
+}
+
+async fn assignments_list(State(state): State<AppState>) -> impl IntoResponse {
+    let assignments = state.assignments.read().await;
+    let list = assignments.list_active();
+
+    Json(serde_json::json!({
+        "assignments": list,
+        "count": list.len()
+    }))
+}
+
+async fn assignments_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<AssignmentResponse>, StatusCode> {
+    let assignments = state.assignments.read().await;
+
+    // Try to find by assignment ID first
+    if let Some(assignment) = assignments.get(&id) {
+        return Ok(Json(AssignmentResponse {
+            assignment: assignment.clone(),
+        }));
+    }
+
+    // Try to find by ancillary ID
+    if let Some(assignment) = assignments.get_active_for_ancillary(&id) {
+        return Ok(Json(AssignmentResponse {
+            assignment: assignment.clone(),
+        }));
+    }
+
+    // Try to find by bead ID (return first active)
+    let by_bead = assignments.get_by_bead(&id);
+    if let Some(assignment) = by_bead
+        .into_iter()
+        .find(|a| matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
+    {
+        return Ok(Json(AssignmentResponse {
+            assignment: assignment.clone(),
+        }));
+    }
+
+    Err(StatusCode::NOT_FOUND)
+}
+
+async fn assignments_create(
+    State(state): State<AppState>,
+    Json(request): Json<CreateAssignmentRequest>,
+) -> Result<Json<AssignmentResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let ws_mgr = state
+        .workspaces
+        .as_ref()
+        .ok_or((StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({"error": "workspace_root not configured"}))))?;
+
+    // Get segment path
+    let segment_path = {
+        let segments = state.segments.read().unwrap();
+        segments.get(&request.segment).map(|s| s.path.clone())
+    };
+
+    let segment_path = segment_path.ok_or((
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": format!("Segment not found: {}", request.segment)})),
+    ))?;
+
+    let mut assignments = state.assignments.write().await;
+
+    // Determine bead ID - either from existing or create from prompt
+    let (bead_id, original_prompt) = if let Some(ref prompt) = request.prompt {
+        // Create bead from prompt
+        let title = request.title.clone().unwrap_or_else(|| {
+            prompt.lines().next().unwrap_or(prompt).chars().take(80).collect()
+        });
+
+        let new_bead_id = toren_lib::tasks::beads::create_and_claim_bead(
+            &title,
+            Some(prompt),
+            "claude",
+            &segment_path,
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to create bead: {}", e)})),
+            )
+        })?;
+
+        (new_bead_id, Some(prompt.clone()))
+    } else if let Some(bead_id) = request.bead_id.clone() {
+        // Claim existing bead
+        toren_lib::tasks::beads::claim_bead(&bead_id, "claude", &segment_path).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Failed to claim bead: {}", e)})),
+            )
+        })?;
+
+        (bead_id, None)
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Either bead_id or prompt must be specified"})),
+        ));
+    };
+
+    // Find next available ancillary
+    let ancillary_id =
+        assignments.next_available_ancillary(&request.segment, state.config.ancillary.pool_size);
+    let ancillary_num = toren_lib::ancillary_number(&ancillary_id).unwrap_or(1);
+
+    // Generate workspace name
+    let existing = assignments.get_by_bead(&bead_id);
+    let active_count = existing
+        .iter()
+        .filter(|a| matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
+        .count();
+
+    let ws_name = if active_count == 0 {
+        bead_id.clone()
+    } else {
+        format!("{}-{}", bead_id, ancillary_num)
+    };
+
+    // Create workspace
+    let ws_path = ws_mgr
+        .create_workspace(&segment_path, &request.segment, &ws_name)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to create workspace: {}", e)})),
+            )
+        })?;
+
+    // Create assignment
+    let assignment = if let Some(prompt) = original_prompt {
+        assignments
+            .create_from_prompt(&ancillary_id, &bead_id, &prompt, &request.segment, ws_path)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to create assignment: {}", e)})),
+                )
+            })?
+    } else {
+        assignments
+            .create_from_bead(&ancillary_id, &bead_id, &request.segment, ws_path)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to create assignment: {}", e)})),
+                )
+            })?
+    };
+
+    Ok(Json(AssignmentResponse { assignment }))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateStatusRequest {
+    status: String,
+}
+
+async fn assignments_update_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateStatusRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let status = match request.status.as_str() {
+        "pending" => AssignmentStatus::Pending,
+        "active" => AssignmentStatus::Active,
+        "completed" => AssignmentStatus::Completed,
+        "aborted" => AssignmentStatus::Aborted,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let mut assignments = state.assignments.write().await;
+
+    // Try to find by assignment ID first, then by ancillary ID
+    let assignment_id = if assignments.get(&id).is_some() {
+        id.clone()
+    } else if let Some(a) = assignments.get_active_for_ancillary(&id) {
+        a.id.clone()
+    } else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    assignments
+        .update_status(&assignment_id, status)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({"success": true})))
+}
+
+async fn assignments_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut assignments = state.assignments.write().await;
+
+    // Try to find by assignment ID first
+    if assignments.get(&id).is_some() {
+        assignments
+            .remove(&id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(Json(serde_json::json!({"success": true, "removed": 1})));
+    }
+
+    // Try by ancillary ID
+    let dismissed = assignments
+        .dismiss_ancillary(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !dismissed.is_empty() {
+        return Ok(Json(
+            serde_json::json!({"success": true, "removed": dismissed.len()}),
+        ));
+    }
+
+    // Try by bead ID
+    let dismissed = assignments
+        .dismiss_bead(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !dismissed.is_empty() {
+        return Ok(Json(
+            serde_json::json!({"success": true, "removed": dismissed.len()}),
+        ));
+    }
+
+    Err(StatusCode::NOT_FOUND)
 }
