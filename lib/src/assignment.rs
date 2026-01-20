@@ -391,6 +391,17 @@ impl AssignmentManager {
             .collect()
     }
 
+    /// List active assignments for a specific segment
+    pub fn list_active_segment(&self, segment: &str) -> Vec<&Assignment> {
+        self.assignments
+            .values()
+            .filter(|a| {
+                a.segment.to_lowercase() == segment.to_lowercase()
+                    && matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active)
+            })
+            .collect()
+    }
+
     /// Find the next available ancillary for a segment.
     /// Implements round-robin selection, skipping ancillaries with active assignments.
     pub fn next_available_ancillary(&self, segment: &str, pool_size: u32) -> String {

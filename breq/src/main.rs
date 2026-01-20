@@ -44,11 +44,15 @@ enum Commands {
         danger: bool,
     },
 
-    /// List all assignments
+    /// List assignments (defaults to current segment)
     List {
-        /// Show all assignments (including completed/aborted)
-        #[arg(long)]
+        /// List assignments from all segments
+        #[arg(short, long)]
         all: bool,
+
+        /// List assignments from a specific segment
+        #[arg(short, long, conflicts_with = "all")]
+        segment: Option<String>,
     },
 
     /// Show detailed assignment information
@@ -143,7 +147,7 @@ fn main() -> Result<()> {
             segment,
             danger,
         } => cmd_assign(bead, prompt, title, intent, segment.as_deref(), danger),
-        Commands::List { all } => cmd_list(all),
+        Commands::List { all, segment } => cmd_list(all, segment),
         Commands::Show { reference } => cmd_show(&reference),
         Commands::Resume {
             reference,
@@ -282,20 +286,35 @@ fn cmd_assign(
     Err(err).context("Failed to exec claude")
 }
 
-fn cmd_list(show_all: bool) -> Result<()> {
+fn cmd_list(all_segments: bool, segment_name: Option<String>) -> Result<()> {
+    let config = Config::load()?;
+    let segment_mgr = SegmentManager::new(&config)?;
     let assignment_mgr = AssignmentManager::new()?;
 
-    let assignments = if show_all {
-        assignment_mgr.list()
+    // Determine which segment(s) to list
+    let (assignments, scope_label): (Vec<_>, &str) = if all_segments {
+        (assignment_mgr.list_active().into_iter().collect(), "all segments")
+    } else if let Some(ref name) = segment_name {
+        (
+            assignment_mgr.list_active_segment(name).into_iter().collect(),
+            name.as_str(),
+        )
     } else {
-        assignment_mgr.list_active()
+        // Default: current segment
+        let segment = resolve_segment(&segment_mgr, None)?;
+        (
+            assignment_mgr
+                .list_active_segment(&segment.name)
+                .into_iter()
+                .collect(),
+            "current segment",
+        )
     };
 
     if assignments.is_empty() {
-        if show_all {
-            println!("No assignments.");
-        } else {
-            println!("No active assignments. Use --all to see completed/aborted.");
+        println!("No active assignments in {}.", scope_label);
+        if !all_segments {
+            println!("Use --all to see assignments across all segments.");
         }
         return Ok(());
     }
