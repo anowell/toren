@@ -8,7 +8,21 @@ let selectedRoot = '';
 let creating = false;
 let error = '';
 
-$: selectedRoot = $torenStore.segmentRoots[0] || '';
+$: selectedRoot = ($torenStore.segmentRoots ?? [])[0] || '';
+
+// Get set of segment names that have assignments
+$: segmentsWithAssignments = new Set(
+	($torenStore.assignments ?? []).map((a) => a.segment.toLowerCase())
+);
+
+// Sort segments: those with assignments first, then alphabetically within each group
+$: sortedSegments = [...($torenStore.segments ?? [])].sort((a, b) => {
+	const aHasAssignment = segmentsWithAssignments.has(a.name.toLowerCase());
+	const bHasAssignment = segmentsWithAssignments.has(b.name.toLowerCase());
+	if (aHasAssignment && !bHasAssignment) return -1;
+	if (!aHasAssignment && bHasAssignment) return 1;
+	return a.name.localeCompare(b.name);
+});
 
 function selectSegment(segment: Segment) {
 	torenStore.selectSegment(segment);
@@ -72,7 +86,7 @@ function getSegmentIcon(source: string) {
 <div class="segment-selector">
 	<div class="header">
 		<h2>Select Project</h2>
-		{#if $torenStore.segmentRoots.length > 0}
+		{#if ($torenStore.segmentRoots ?? []).length > 0}
 			<button class="create-btn" on:click={openCreateModal} aria-label="Create new segment">
 				<svg
 					xmlns="http://www.w3.org/2000/svg"
@@ -94,10 +108,10 @@ function getSegmentIcon(source: string) {
 
 	{#if $torenStore.loadingSegments}
 		<div class="loading">Loading segments...</div>
-	{:else if $torenStore.segments.length === 0}
+	{:else if sortedSegments.length === 0}
 		<div class="empty-state">
 			<p>No segments found</p>
-			{#if $torenStore.segmentRoots.length > 0}
+			{#if ($torenStore.segmentRoots ?? []).length > 0}
 				<button class="create-segment-btn" on:click={openCreateModal}>
 					Create New Project
 				</button>
@@ -107,7 +121,7 @@ function getSegmentIcon(source: string) {
 		</div>
 	{:else}
 		<div class="segment-list">
-			{#each $torenStore.segments as segment (segment.path)}
+			{#each sortedSegments as segment (segment.path)}
 				<button
 					class="segment-card"
 					class:selected={$torenStore.selectedSegment?.path === segment.path}
@@ -160,19 +174,19 @@ function getSegmentIcon(source: string) {
 					/>
 				</div>
 
-				{#if $torenStore.segmentRoots.length > 1}
+				{#if ($torenStore.segmentRoots ?? []).length > 1}
 					<div class="form-group">
 						<label for="segment-root">Root Directory</label>
 						<select id="segment-root" bind:value={selectedRoot} disabled={creating}>
-							{#each $torenStore.segmentRoots as root}
+							{#each $torenStore.segmentRoots ?? [] as root}
 								<option value={root}>{root}</option>
 							{/each}
 						</select>
 					</div>
-				{:else if $torenStore.segmentRoots.length === 1}
+				{:else if ($torenStore.segmentRoots ?? []).length === 1}
 					<div class="form-group">
 						<label>Root Directory</label>
-						<div class="read-only">{$torenStore.segmentRoots[0]}</div>
+						<div class="read-only">{($torenStore.segmentRoots ?? [])[0]}</div>
 					</div>
 				{/if}
 

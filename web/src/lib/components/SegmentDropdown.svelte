@@ -1,4 +1,5 @@
 <script lang="ts">
+import { goto } from '$app/navigation';
 import { torenStore } from '$lib/stores/toren';
 import type { Segment } from '$lib/types/toren';
 
@@ -12,6 +13,7 @@ function toggleDropdown() {
 function selectSegment(segment: Segment) {
 	torenStore.selectSegment(segment);
 	isOpen = false;
+	goto(`/a/${segment.name.toLowerCase()}`);
 }
 
 function handleClickOutside(event: MouseEvent) {

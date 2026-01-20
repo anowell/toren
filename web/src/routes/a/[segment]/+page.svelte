@@ -7,6 +7,11 @@ import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
 let messageInput = '';
 let showMobilePanel = false;
 
+function goToSegmentSelector() {
+	torenStore.selectSegment(null);
+	goto('/');
+}
+
 function toggleMobilePanel() {
 	showMobilePanel = !showMobilePanel;
 }
@@ -42,9 +47,9 @@ async function handleSendMessage() {
 	<!-- Header -->
 	<header class="chat-header">
 		<div class="header-left">
-			<a href="/" class="logo-link">
+			<button class="logo-link" on:click={goToSegmentSelector}>
 				<span class="logo">Toren</span>
-			</a>
+			</button>
 			{#if $torenStore.selectedSegment}
 				<SegmentDropdown />
 			{/if}
@@ -228,6 +233,10 @@ async function handleSendMessage() {
 
 	.logo-link {
 		text-decoration: none;
+		background: none;
+		border: none;
+		cursor: pointer;
+		padding: 0;
 	}
 
 	.logo {

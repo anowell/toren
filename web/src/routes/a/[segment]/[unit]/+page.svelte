@@ -7,6 +7,11 @@ import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
 let messageInput = '';
 let showMobilePanel = false;
 
+function goToSegmentSelector() {
+	torenStore.selectSegment(null);
+	goto('/');
+}
+
 // Get current assignment based on unit param
 $: currentAssignment = $segmentAssignments.find((a) => {
 	const unitName = a.ancillary_id.split(' ').pop()?.toLowerCase();
@@ -52,9 +57,9 @@ function capitalizeUnit(unit: string): string {
 	<!-- Header -->
 	<header class="chat-header">
 		<div class="header-left">
-			<a href="/" class="logo-link">
+			<button class="logo-link" on:click={goToSegmentSelector}>
 				<span class="logo">Toren</span>
-			</a>
+			</button>
 			{#if $torenStore.selectedSegment}
 				<SegmentDropdown />
 			{/if}
@@ -246,6 +251,10 @@ function capitalizeUnit(unit: string): string {
 
 	.logo-link {
 		text-decoration: none;
+		background: none;
+		border: none;
+		cursor: pointer;
+		padding: 0;
 	}
 
 	.logo {

@@ -7,7 +7,7 @@ port = 8787
 [segments]
 # Segment roots - any subdirectory under a root is automatically a valid segment.
 # The root directory itself can also be used as a segment.
-roots = ["examples", "."]
+roots = ["examples"]
 
 [ancillary]
 max_concurrent = 5

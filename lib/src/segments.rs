@@ -101,6 +101,32 @@ impl SegmentManager {
         &self.roots
     }
 
+    /// List all segments from all roots.
+    /// Scans each root directory and returns all subdirectories as segments.
+    pub fn list_all(&self) -> Vec<Segment> {
+        let mut segments = Vec::new();
+
+        for root in &self.roots {
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Some(name) = path.file_name() {
+                            let name = name.to_string_lossy().to_string();
+                            // Skip hidden directories
+                            if !name.starts_with('.') {
+                                segments.push(Segment { name, path });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        segments.sort_by(|a, b| a.name.cmp(&b.name));
+        segments
+    }
+
     /// Check if a directory is a valid segment root for creating new segments.
     pub fn can_create_in(&self, root: &Path) -> bool {
         self.roots.iter().any(|r| r == root)

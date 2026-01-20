@@ -257,8 +257,8 @@ function createTorenStore() {
 				const data = await response.json();
 				update((state) => ({
 					...state,
-					segments: data.segments,
-					segmentRoots: data.roots,
+					segments: data.segments ?? [],
+					segmentRoots: data.roots ?? [],
 					loadingSegments: false,
 				}));
 			} catch (error) {

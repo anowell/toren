@@ -249,10 +249,12 @@ async fn segments_list(
 ) -> impl IntoResponse {
     let segments = state.segments.read().unwrap();
     let roots = segments.roots();
+    let all_segments = segments.list_all();
 
     Json(serde_json::json!({
         "roots": roots,
-        "roots_count": roots.len()
+        "roots_count": roots.len(),
+        "segments": all_segments
     }))
 }
 

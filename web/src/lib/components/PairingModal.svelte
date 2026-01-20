@@ -42,8 +42,11 @@ async function handlePair() {
 		localStorage.setItem('toren_session_token', data.session_token);
 		localStorage.setItem('toren_ship_url', shipUrl);
 
-		// Load segments
-		await torenStore.loadSegments(shipUrl);
+		// Load segments and assignments
+		await Promise.all([
+			torenStore.loadSegments(shipUrl),
+			torenStore.loadAssignments(shipUrl),
+		]);
 
 		// Restore selected segment from localStorage
 		const savedSegment = localStorage.getItem('toren_selected_segment');
@@ -73,7 +76,10 @@ $: if (typeof window !== 'undefined') {
 		client
 			.connect(storedUrl)
 			.then(() => client.authenticate(storedToken))
-			.then(() => torenStore.loadSegments(storedUrl))
+			.then(() => Promise.all([
+				torenStore.loadSegments(storedUrl),
+				torenStore.loadAssignments(storedUrl),
+			]))
 			.then(() => {
 				// Restore selected segment
 				const savedSegment = localStorage.getItem('toren_selected_segment');
