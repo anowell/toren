@@ -9,6 +9,6 @@ pub use assignment::{
     Assignment, AssignmentManager, AssignmentRef, AssignmentSource, AssignmentStatus,
 };
 pub use config::Config;
-pub use segments::{Segment, SegmentManager, SegmentSource};
+pub use segments::{Segment, SegmentManager};
 pub use tasks::{fetch_task, generate_prompt, Task, TaskProvider};
 pub use workspace::WorkspaceManager;

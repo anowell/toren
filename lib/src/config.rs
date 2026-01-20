@@ -40,16 +40,15 @@ pub struct ServerConfig {
     pub port: u16,
 }
 
+/// Configuration for segment discovery.
+/// Segments are directories under configured roots.
+/// Any subdirectory of a root is automatically a valid segment.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SegmentsConfig {
-    #[serde(default)]
-    pub globs: Vec<String>,
-
+    /// Root directories that can contain segments.
+    /// Any immediate child directory under a root is a valid segment.
     #[serde(default)]
     pub roots: Vec<PathBuf>,
-
-    #[serde(default)]
-    pub paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

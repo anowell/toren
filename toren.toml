@@ -5,14 +5,9 @@ host = "127.0.0.1"
 port = 8787
 
 [segments]
-# Discover all subdirectories in examples/ as segments
-globs = ["examples/*"]
-
-# Allow creating new segments in examples/
-roots = ["examples"]
-
-# Explicit segment paths
-paths = ["."]
+# Segment roots - any subdirectory under a root is automatically a valid segment.
+# The root directory itself can also be used as a segment.
+roots = ["examples", "."]
 
 [ancillary]
 max_concurrent = 5

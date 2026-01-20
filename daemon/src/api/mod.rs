@@ -248,13 +248,11 @@ async fn segments_list(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let segments = state.segments.read().unwrap();
-    let segment_list = segments.list();
     let roots = segments.roots();
 
     Json(serde_json::json!({
-        "segments": segment_list,
         "roots": roots,
-        "count": segment_list.len()
+        "roots_count": roots.len()
     }))
 }
 
@@ -268,7 +266,7 @@ async fn segments_create(
     State(state): State<AppState>,
     Json(request): Json<CreateSegmentRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mut segments = state.segments.write().unwrap();
+    let segments = state.segments.write().unwrap();
 
     match segments.create_segment(&request.name, &request.root) {
         Ok(segment) => Ok(Json(serde_json::json!({
@@ -290,7 +288,7 @@ async fn workspaces_list(
 
     let segment_path = {
         let segments = state.segments.read().unwrap();
-        segments.get(&segment).map(|s| s.path.clone())
+        segments.find_by_name(&segment).map(|s| s.path.clone())
     };
 
     let segment_path = segment_path.ok_or(StatusCode::NOT_FOUND)?;
@@ -322,7 +320,7 @@ async fn workspaces_cleanup(
 
     let segment_path = {
         let segments = state.segments.read().unwrap();
-        segments.get(&request.segment).map(|s| s.path.clone())
+        segments.find_by_name(&request.segment).map(|s| s.path.clone())
     };
 
     let segment_path = segment_path.ok_or(StatusCode::NOT_FOUND)?;
@@ -429,7 +427,7 @@ async fn assignments_create(
     // Get segment path
     let segment_path = {
         let segments = state.segments.read().unwrap();
-        segments.get(&request.segment).map(|s| s.path.clone())
+        segments.find_by_name(&request.segment).map(|s| s.path.clone())
     };
 
     let segment_path = segment_path.ok_or((

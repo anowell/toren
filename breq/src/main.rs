@@ -156,35 +156,24 @@ fn main() -> Result<()> {
     }
 }
 
-/// Helper to find segment from current directory or specified name
+/// Helper to find segment from current directory or specified name.
+/// Segments are resolved dynamically - any directory under a segment root is valid.
 fn resolve_segment(segment_mgr: &SegmentManager, segment_name: Option<&str>) -> Result<Segment> {
     if let Some(name) = segment_name {
         segment_mgr
-            .get(name)
-            .with_context(|| format!("Segment '{}' not found", name))?
-            .clone()
-            .pipe(Ok)
+            .find_by_name(name)
+            .with_context(|| format!("Segment '{}' not found in any segment root", name))
     } else {
         let cwd = std::env::current_dir()?;
-        segment_mgr
-            .list()
-            .iter()
-            .find(|s| cwd.starts_with(&s.path))
-            .cloned()
-            .context("Could not determine segment from current directory. Use --segment.")
+        segment_mgr.resolve_from_path(&cwd).with_context(|| {
+            "Current directory is not under any segment root.\n\
+             Configure segment roots in toren.toml:\n\
+             [segments]\n\
+             roots = [\"~/proj\"]"
+        })
     }
 }
 
-/// Helper trait to allow chaining with Ok()
-trait Pipe: Sized {
-    fn pipe<F, R>(self, f: F) -> R
-    where
-        F: FnOnce(Self) -> R,
-    {
-        f(self)
-    }
-}
-impl<T> Pipe for T {}
 
 /// Generate workspace name for a bead assignment.
 /// Uses the ancillary number word (e.g. "one", "two") so workspaces can be reused.

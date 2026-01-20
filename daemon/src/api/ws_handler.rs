@@ -124,7 +124,7 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
                     if let (Some(id), Some(seg)) = (aid.clone(), segment.clone()) {
                         let segment_path = {
                             let segments = state.segments.read().unwrap();
-                            segments.get(&seg).map(|s| s.path.clone())
+                            segments.find_by_name(&seg).map(|s| s.path.clone())
                         };
 
                         let (ws_name, working_dir) = match (&workspace, &segment_path) {
@@ -192,7 +192,7 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
                             id.clone(),
                             seg,
                             token.clone(),
-                            ws_name,
+                            ws_name.map(|s| s.to_string()),
                             working_dir.clone(),
                         );
                         ancillary_id = Some(id.clone());
@@ -295,7 +295,7 @@ async fn connect_via_assignment(
         if let Some(ref ws_mgr) = state.workspaces {
             let segment_path = {
                 let segments = state.segments.read().unwrap();
-                segments.get(&assignment.segment).map(|s| s.path.clone())
+                segments.find_by_name(&assignment.segment).map(|s| s.path)
             };
 
             if let Some(seg_path) = segment_path {
