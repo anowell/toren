@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use shellexpand;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +104,12 @@ impl Default for AutoApproveConfig {
     }
 }
 
+/// Expand shell-style paths (e.g., `~` to home directory)
+fn expand_path(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    PathBuf::from(shellexpand::tilde(&path_str).into_owned())
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let config_path = Self::find_config_file()?;
@@ -113,12 +120,36 @@ impl Config {
             let mut config: Config = toml::from_str(&content)
                 .context("Failed to parse config file")?;
             config.config_path = config_path.display().to_string();
+            config.expand_paths();
             Ok(config)
         } else {
             // Create default config
             let config = Self::default();
             config.save(&config_path)?;
             Ok(config)
+        }
+    }
+
+    /// Expand shell-style paths in all path fields
+    fn expand_paths(&mut self) {
+        // Expand segment roots
+        self.segments.roots = self
+            .segments
+            .roots
+            .iter()
+            .map(|p| expand_path(p))
+            .collect();
+
+        // Expand approved directories
+        self.approved_directories = self
+            .approved_directories
+            .iter()
+            .map(|p| expand_path(p))
+            .collect();
+
+        // Expand workspace root
+        if let Some(ref ws_root) = self.ancillary.workspace_root {
+            self.ancillary.workspace_root = Some(expand_path(ws_root));
         }
     }
 
