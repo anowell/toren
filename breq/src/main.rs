@@ -320,7 +320,7 @@ fn cmd_list(all_segments: bool, segment_name: Option<String>) -> Result<()> {
     }
 
     println!(
-        "{:<18} {:<15} {:<12} WORKSPACE",
+        "{:<18} {:<15} {:<12} TITLE",
         "ANCILLARY", "BEAD", "STATUS"
     );
     println!("{}", "-".repeat(70));
@@ -347,19 +347,28 @@ fn cmd_list(all_segments: bool, segment_name: Option<String>) -> Result<()> {
             AssignmentStatus::Aborted => "aborted",
         };
 
-        let ws_display = if ws_exists {
-            assignment.workspace_path.display().to_string()
-        } else {
-            "-".to_string()
-        };
+        // Try to fetch bead title from the segment
+        let title = segment_mgr
+            .find_by_name(&assignment.segment)
+            .and_then(|seg| toren_lib::tasks::fetch_task(&assignment.bead_id, &seg.path).ok())
+            .map(|task| truncate_title(&task.title, 40))
+            .unwrap_or_else(|| "-".to_string());
 
         println!(
             "{:<18} {:<15} {:<12} {}",
-            assignment.ancillary_id, assignment.bead_id, status_str, ws_display
+            assignment.ancillary_id, assignment.bead_id, status_str, title
         );
     }
 
     Ok(())
+}
+
+fn truncate_title(title: &str, max_len: usize) -> String {
+    if title.len() <= max_len {
+        title.to_string()
+    } else {
+        format!("{}...", &title[..max_len - 3])
+    }
 }
 
 fn cmd_show(reference: &str) -> Result<()> {
