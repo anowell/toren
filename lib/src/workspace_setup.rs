@@ -1,0 +1,524 @@
+//! Workspace setup hooks for initializing and tearing down jj workspaces.
+//!
+//! This module implements a lightweight, procedural mechanism for workspace initialization
+//! using `.toren.kdl` configuration files. It supports three primitive actions:
+//! - `template`: Copy and render files with workspace context
+//! - `copy`: Copy files verbatim
+//! - `run`: Execute shell commands
+
+use anyhow::{Context, Result};
+use kdl::{KdlDocument, KdlNode};
+use minijinja::{context, Environment};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tracing::{debug, info, warn};
+
+const TOREN_CONFIG_FILE: &str = ".toren.kdl";
+const STATE_DIR: &str = ".breq";
+const STATE_FILE: &str = "state.json";
+
+/// Workspace context available to templates
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceContext {
+    pub ws: WorkspaceInfo,
+    pub repo: RepoInfo,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceInfo {
+    /// jj workspace name (e.g., "one", "two")
+    pub name: String,
+    /// Filesystem/DNS-safe name
+    pub slug: String,
+    /// Stable small integer index
+    pub idx: u32,
+    /// Unique workspace ID
+    pub id: String,
+    /// Workspace path
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoInfo {
+    /// Repository root path
+    pub root: String,
+    /// Repository name
+    pub name: String,
+}
+
+/// Persistent workspace state stored in .breq/state.json
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkspaceState {
+    /// Version for future migrations
+    version: u32,
+    /// Index allocation: workspace name -> index
+    #[serde(default)]
+    indices: HashMap<String, u32>,
+    /// Next available index
+    #[serde(default)]
+    next_index: u32,
+}
+
+impl WorkspaceState {
+    fn new() -> Self {
+        Self {
+            version: 1,
+            indices: HashMap::new(),
+            next_index: 1,
+        }
+    }
+
+    /// Get or allocate a stable index for a workspace
+    fn get_or_allocate_index(&mut self, workspace_name: &str) -> u32 {
+        if let Some(&idx) = self.indices.get(workspace_name) {
+            idx
+        } else {
+            let idx = self.next_index;
+            self.indices.insert(workspace_name.to_string(), idx);
+            self.next_index += 1;
+            idx
+        }
+    }
+}
+
+/// An action to execute during setup or destroy
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// Copy and render a template with workspace context
+    Template { src: String, dest: String },
+    /// Copy a file verbatim
+    Copy { src: String, dest: String },
+    /// Execute a shell command
+    Run { command: String },
+}
+
+/// Configuration parsed from .toren.kdl
+#[derive(Debug, Default)]
+pub struct BreqConfig {
+    pub setup: Vec<Action>,
+    pub destroy: Vec<Action>,
+}
+
+impl BreqConfig {
+    /// Check if a .toren.kdl file exists in the given directory
+    pub fn exists(repo_root: &Path) -> bool {
+        repo_root.join(TOREN_CONFIG_FILE).exists()
+    }
+
+    /// Parse a .toren.kdl file from the repository root
+    pub fn parse(repo_root: &Path) -> Result<Self> {
+        let config_path = repo_root.join(TOREN_CONFIG_FILE);
+
+        if !config_path.exists() {
+            debug!("No {} found at {}", TOREN_CONFIG_FILE, config_path.display());
+            return Ok(Self::default());
+        }
+
+        let content = fs::read_to_string(&config_path)
+            .with_context(|| format!("Failed to read {}", config_path.display()))?;
+
+        Self::parse_kdl(&content)
+            .with_context(|| format!("Failed to parse {}", config_path.display()))
+    }
+
+    fn parse_kdl(content: &str) -> Result<Self> {
+        let doc: KdlDocument = content.parse()?;
+        let mut config = Self::default();
+
+        for node in doc.nodes() {
+            match node.name().value() {
+                "setup" => {
+                    config.setup = Self::parse_block(node)?;
+                }
+                "destroy" => {
+                    config.destroy = Self::parse_block(node)?;
+                }
+                other => {
+                    warn!("Unknown top-level block in .toren.kdl: {}", other);
+                }
+            }
+        }
+
+        Ok(config)
+    }
+
+    fn parse_block(node: &KdlNode) -> Result<Vec<Action>> {
+        let mut actions = Vec::new();
+
+        if let Some(children) = node.children() {
+            for child in children.nodes() {
+                let action = Self::parse_action(child)?;
+                actions.push(action);
+            }
+        }
+
+        Ok(actions)
+    }
+
+    fn parse_action(node: &KdlNode) -> Result<Action> {
+        match node.name().value() {
+            "template" => {
+                let src = node
+                    .get("src")
+                    .and_then(|v| v.as_string())
+                    .context("template requires src= attribute")?
+                    .to_string();
+                let dest = node
+                    .get("dest")
+                    .and_then(|v| v.as_string())
+                    .context("template requires dest= attribute")?
+                    .to_string();
+                Ok(Action::Template { src, dest })
+            }
+            "copy" => {
+                let src = node
+                    .get("src")
+                    .and_then(|v| v.as_string())
+                    .context("copy requires src= attribute")?
+                    .to_string();
+                let dest = node
+                    .get("dest")
+                    .and_then(|v| v.as_string())
+                    .context("copy requires dest= attribute")?
+                    .to_string();
+                Ok(Action::Copy { src, dest })
+            }
+            "run" => {
+                // run takes command as first argument: run "pnpm install"
+                let command = node
+                    .entries()
+                    .first()
+                    .and_then(|e| e.value().as_string())
+                    .context("run requires a command argument")?
+                    .to_string();
+                Ok(Action::Run { command })
+            }
+            other => {
+                anyhow::bail!("Unknown action type: {}", other);
+            }
+        }
+    }
+}
+
+/// Manages workspace setup state and execution
+pub struct WorkspaceSetup {
+    /// Path to the repository root (where .toren.kdl lives)
+    repo_root: PathBuf,
+    /// Path to the workspace being set up
+    workspace_path: PathBuf,
+    /// Workspace name (jj workspace name)
+    workspace_name: String,
+}
+
+impl WorkspaceSetup {
+    pub fn new(repo_root: PathBuf, workspace_path: PathBuf, workspace_name: String) -> Self {
+        Self {
+            repo_root,
+            workspace_path,
+            workspace_name,
+        }
+    }
+
+    /// Load state from .breq/state.json in the repo root
+    fn load_state(&self) -> Result<WorkspaceState> {
+        let state_path = self.repo_root.join(STATE_DIR).join(STATE_FILE);
+
+        if !state_path.exists() {
+            return Ok(WorkspaceState::new());
+        }
+
+        let content = fs::read_to_string(&state_path)
+            .with_context(|| format!("Failed to read {}", state_path.display()))?;
+
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", state_path.display()))
+    }
+
+    /// Save state to .breq/state.json in the repo root
+    fn save_state(&self, state: &WorkspaceState) -> Result<()> {
+        let state_dir = self.repo_root.join(STATE_DIR);
+        fs::create_dir_all(&state_dir)
+            .with_context(|| format!("Failed to create {}", state_dir.display()))?;
+
+        let state_path = state_dir.join(STATE_FILE);
+        let content = serde_json::to_string_pretty(state)?;
+
+        fs::write(&state_path, content)
+            .with_context(|| format!("Failed to write {}", state_path.display()))?;
+
+        Ok(())
+    }
+
+    /// Build workspace context for template rendering
+    fn build_context(&self, state: &mut WorkspaceState) -> Result<WorkspaceContext> {
+        let idx = state.get_or_allocate_index(&self.workspace_name);
+
+        // Generate a slug-safe name
+        let slug = self
+            .workspace_name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+
+        // Generate unique workspace ID
+        let id = format!("{}-{}", slug, idx);
+
+        let repo_name = self
+            .repo_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        Ok(WorkspaceContext {
+            ws: WorkspaceInfo {
+                name: self.workspace_name.clone(),
+                slug,
+                idx,
+                id,
+                path: self.workspace_path.display().to_string(),
+            },
+            repo: RepoInfo {
+                root: self.repo_root.display().to_string(),
+                name: repo_name,
+            },
+        })
+    }
+
+    /// Run the setup block
+    pub fn run_setup(&self) -> Result<()> {
+        let config = BreqConfig::parse(&self.repo_root)?;
+
+        if config.setup.is_empty() {
+            debug!("No setup actions defined");
+            return Ok(());
+        }
+
+        info!(
+            "Running workspace setup for '{}' in {}",
+            self.workspace_name,
+            self.workspace_path.display()
+        );
+
+        let mut state = self.load_state()?;
+        let ctx = self.build_context(&mut state)?;
+
+        // Save state with allocated index
+        self.save_state(&state)?;
+
+        self.execute_actions(&config.setup, &ctx)?;
+
+        info!("Workspace setup complete");
+        Ok(())
+    }
+
+    /// Run the destroy block
+    pub fn run_destroy(&self) -> Result<()> {
+        let config = BreqConfig::parse(&self.repo_root)?;
+
+        if config.destroy.is_empty() {
+            debug!("No destroy actions defined");
+            return Ok(());
+        }
+
+        info!(
+            "Running workspace destroy for '{}' in {}",
+            self.workspace_name,
+            self.workspace_path.display()
+        );
+
+        let mut state = self.load_state()?;
+        let ctx = self.build_context(&mut state)?;
+
+        self.execute_actions(&config.destroy, &ctx)?;
+
+        info!("Workspace destroy complete");
+        Ok(())
+    }
+
+    /// Execute a list of actions in order
+    fn execute_actions(&self, actions: &[Action], ctx: &WorkspaceContext) -> Result<()> {
+        for (i, action) in actions.iter().enumerate() {
+            debug!("Executing action {}: {:?}", i + 1, action);
+            self.execute_action(action, ctx)
+                .with_context(|| format!("Action {} failed", i + 1))?;
+        }
+        Ok(())
+    }
+
+    fn execute_action(&self, action: &Action, ctx: &WorkspaceContext) -> Result<()> {
+        match action {
+            Action::Template { src, dest } => self.execute_template(src, dest, ctx),
+            Action::Copy { src, dest } => self.execute_copy(src, dest),
+            Action::Run { command } => self.execute_run(command),
+        }
+    }
+
+    fn execute_template(&self, src: &str, dest: &str, ctx: &WorkspaceContext) -> Result<()> {
+        let src_path = self.workspace_path.join(src);
+        let dest_path = self.workspace_path.join(dest);
+
+        let template_content = fs::read_to_string(&src_path)
+            .with_context(|| format!("Failed to read template: {}", src_path.display()))?;
+
+        let mut env = Environment::new();
+        env.add_template("template", &template_content)?;
+
+        let template = env.get_template("template")?;
+        let rendered = template.render(context! {
+            ws => ctx.ws,
+            repo => ctx.repo,
+        })?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::write(&dest_path, rendered)
+            .with_context(|| format!("Failed to write: {}", dest_path.display()))?;
+
+        info!("  template: {} -> {}", src, dest);
+        Ok(())
+    }
+
+    fn execute_copy(&self, src: &str, dest: &str) -> Result<()> {
+        let src_path = self.workspace_path.join(src);
+        let dest_path = self.workspace_path.join(dest);
+
+        // Ensure parent directory exists
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::copy(&src_path, &dest_path)
+            .with_context(|| format!("Failed to copy {} to {}", src_path.display(), dest_path.display()))?;
+
+        info!("  copy: {} -> {}", src, dest);
+        Ok(())
+    }
+
+    fn execute_run(&self, command: &str) -> Result<()> {
+        info!("  run: {}", command);
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&self.workspace_path)
+            .output()
+            .with_context(|| format!("Failed to execute: {}", command))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            anyhow::bail!(
+                "Command failed: {}\nstdout: {}\nstderr: {}",
+                command,
+                stdout,
+                stderr
+            );
+        }
+
+        // Print stdout if any
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.is_empty() {
+            for line in stdout.lines() {
+                debug!("    {}", line);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_kdl_basic() {
+        let content = r#"
+setup {
+    template src=".env.breq" dest=".env"
+    run "pnpm install"
+}
+
+destroy {
+    run "rm -rf node_modules"
+}
+"#;
+
+        let config = BreqConfig::parse_kdl(content).unwrap();
+
+        assert_eq!(config.setup.len(), 2);
+        assert_eq!(config.destroy.len(), 1);
+
+        match &config.setup[0] {
+            Action::Template { src, dest } => {
+                assert_eq!(src, ".env.breq");
+                assert_eq!(dest, ".env");
+            }
+            _ => panic!("Expected Template action"),
+        }
+
+        match &config.setup[1] {
+            Action::Run { command } => {
+                assert_eq!(command, "pnpm install");
+            }
+            _ => panic!("Expected Run action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_kdl_copy() {
+        let content = r#"
+setup {
+    copy src="config.example.json" dest="config.json"
+}
+"#;
+
+        let config = BreqConfig::parse_kdl(content).unwrap();
+
+        assert_eq!(config.setup.len(), 1);
+        match &config.setup[0] {
+            Action::Copy { src, dest } => {
+                assert_eq!(src, "config.example.json");
+                assert_eq!(dest, "config.json");
+            }
+            _ => panic!("Expected Copy action"),
+        }
+    }
+
+    #[test]
+    fn test_workspace_state_index_allocation() {
+        let mut state = WorkspaceState::new();
+
+        let idx1 = state.get_or_allocate_index("one");
+        let idx2 = state.get_or_allocate_index("two");
+        let idx1_again = state.get_or_allocate_index("one");
+
+        assert_eq!(idx1, 1);
+        assert_eq!(idx2, 2);
+        assert_eq!(idx1_again, 1); // Same workspace should get same index
+    }
+
+    #[test]
+    fn test_empty_config() {
+        let content = "";
+        let config = BreqConfig::parse_kdl(content).unwrap();
+
+        assert!(config.setup.is_empty());
+        assert!(config.destroy.is_empty());
+    }
+}

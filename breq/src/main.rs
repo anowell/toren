@@ -96,6 +96,22 @@ enum Commands {
         /// Bead ID or ancillary reference
         reference: String,
     },
+
+    /// Workspace management commands
+    #[command(visible_alias = "ws")]
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommands {
+    /// Run setup hooks for current workspace
+    Setup,
+
+    /// Run destroy hooks for current workspace
+    Destroy,
 }
 
 #[derive(Clone, Copy, ValueEnum, Default)]
@@ -157,6 +173,10 @@ fn main() -> Result<()> {
         Commands::Abort { reference, close } => cmd_abort(&reference, close),
         Commands::Approve { reference } => cmd_approve(&reference),
         Commands::Dismiss { reference } => cmd_dismiss(&reference),
+        Commands::Workspace { command } => match command {
+            WorkspaceCommands::Setup => cmd_ws_setup(),
+            WorkspaceCommands::Destroy => cmd_ws_destroy(),
+        },
     }
 }
 
@@ -253,8 +273,8 @@ fn cmd_assign(
     // Generate workspace name from ancillary number word
     let ws_name = workspace_name_for_assignment(ancillary_num);
 
-    // Create workspace
-    let ws_path = workspace_mgr.create_workspace(&segment.path, &segment.name, &ws_name)?;
+    // Create workspace and run setup hooks
+    let ws_path = workspace_mgr.create_workspace_with_setup(&segment.path, &segment.name, &ws_name)?;
     println!("Workspace: {}", ws_path.display());
 
     // Record assignment
@@ -737,5 +757,110 @@ fn cmd_dismiss(reference: &str) -> Result<()> {
     }
 
     println!("Workspace and bead left unchanged. Use `breq abort` to cleanup.");
+    Ok(())
+}
+
+/// Detect workspace context from current directory
+fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let cwd = std::env::current_dir()?;
+
+    // Check if we're in a jj workspace
+    if !cwd.join(".jj").exists() {
+        anyhow::bail!(
+            "Not in a jj workspace. Run this command from within a workspace directory."
+        );
+    }
+
+    // Get the workspace name from jj
+    let output = Command::new("jj")
+        .args(["workspace", "root"])
+        .current_dir(&cwd)
+        .output()
+        .context("Failed to run jj workspace root")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to determine workspace root");
+    }
+
+    let workspace_path = std::path::PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    );
+
+    // Extract workspace name from path (last component)
+    let workspace_name = workspace_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("Invalid workspace path")?
+        .to_string();
+
+    // Find the repo root (segment path) - look for .toren.kdl or use jj root
+    // First, try to find .toren.kdl by walking up from workspace
+    let mut segment_path = None;
+    let mut check_path = workspace_path.parent();
+    while let Some(parent) = check_path {
+        if parent.join(".toren.kdl").exists() {
+            segment_path = Some(parent.to_path_buf());
+            break;
+        }
+        // Also check if this is the repo root (has .jj and is not a workspace)
+        if parent.join(".jj").exists() && parent != workspace_path {
+            segment_path = Some(parent.to_path_buf());
+            break;
+        }
+        check_path = parent.parent();
+    }
+
+    let segment_path = segment_path.context(
+        "Could not find segment root. Ensure you're in a breq-managed workspace.",
+    )?;
+
+    Ok((segment_path, workspace_path, workspace_name))
+}
+
+fn cmd_ws_setup() -> Result<()> {
+    let config = Config::load()?;
+    let workspace_root = config
+        .ancillary
+        .workspace_root
+        .clone()
+        .context("workspace_root not configured")?;
+
+    let workspace_mgr = WorkspaceManager::new(workspace_root);
+
+    let (segment_path, workspace_path, workspace_name) = detect_workspace_context()?;
+
+    println!(
+        "Running setup for workspace '{}' in {}",
+        workspace_name,
+        workspace_path.display()
+    );
+
+    workspace_mgr.run_setup(&segment_path, &workspace_path, &workspace_name)?;
+
+    println!("Setup complete.");
+    Ok(())
+}
+
+fn cmd_ws_destroy() -> Result<()> {
+    let config = Config::load()?;
+    let workspace_root = config
+        .ancillary
+        .workspace_root
+        .clone()
+        .context("workspace_root not configured")?;
+
+    let workspace_mgr = WorkspaceManager::new(workspace_root);
+
+    let (segment_path, workspace_path, workspace_name) = detect_workspace_context()?;
+
+    println!(
+        "Running destroy for workspace '{}' in {}",
+        workspace_name,
+        workspace_path.display()
+    );
+
+    workspace_mgr.run_destroy(&segment_path, &workspace_path, &workspace_name)?;
+
+    println!("Destroy complete.");
     Ok(())
 }

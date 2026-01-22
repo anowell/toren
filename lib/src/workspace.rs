@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
+use crate::workspace_setup::{BreqConfig, WorkspaceSetup};
+
 /// Manages jujutsu workspaces for ancillaries
 pub struct WorkspaceManager {
     workspace_root: PathBuf,
@@ -159,5 +161,90 @@ impl WorkspaceManager {
     pub fn workspace_exists(&self, segment_name: &str, workspace_name: &str) -> bool {
         let ws_path = self.workspace_path(segment_name, workspace_name);
         ws_path.exists() && ws_path.join(".jj").exists()
+    }
+
+    /// Run workspace setup hooks if .breq.kdl exists
+    /// Called automatically after workspace creation, but can also be invoked manually
+    pub fn run_setup(
+        &self,
+        segment_path: &Path,
+        workspace_path: &Path,
+        workspace_name: &str,
+    ) -> Result<()> {
+        if !BreqConfig::exists(segment_path) {
+            debug!("No .breq.kdl found, skipping setup");
+            return Ok(());
+        }
+
+        let setup = WorkspaceSetup::new(
+            segment_path.to_path_buf(),
+            workspace_path.to_path_buf(),
+            workspace_name.to_string(),
+        );
+
+        setup.run_setup()
+    }
+
+    /// Run workspace destroy hooks if .breq.kdl exists
+    /// Should be called before cleanup to allow cleanup scripts to run
+    pub fn run_destroy(
+        &self,
+        segment_path: &Path,
+        workspace_path: &Path,
+        workspace_name: &str,
+    ) -> Result<()> {
+        if !BreqConfig::exists(segment_path) {
+            debug!("No .breq.kdl found, skipping destroy");
+            return Ok(());
+        }
+
+        let setup = WorkspaceSetup::new(
+            segment_path.to_path_buf(),
+            workspace_path.to_path_buf(),
+            workspace_name.to_string(),
+        );
+
+        setup.run_destroy()
+    }
+
+    /// Create workspace and run setup hooks
+    /// This is the recommended method for creating workspaces with full initialization
+    pub fn create_workspace_with_setup(
+        &self,
+        segment_path: &Path,
+        segment_name: &str,
+        workspace_name: &str,
+    ) -> Result<PathBuf> {
+        let ws_path = self.create_workspace(segment_path, segment_name, workspace_name)?;
+
+        // Run setup hooks if .breq.kdl exists
+        if let Err(e) = self.run_setup(segment_path, &ws_path, workspace_name) {
+            warn!("Workspace setup failed: {}", e);
+            // Don't fail the workspace creation, just warn
+            // The workspace is still usable, setup can be retried
+        }
+
+        Ok(ws_path)
+    }
+
+    /// Cleanup workspace with destroy hooks
+    /// Runs destroy hooks before removing the workspace
+    pub fn cleanup_workspace_with_destroy(
+        &self,
+        segment_path: &Path,
+        segment_name: &str,
+        workspace_name: &str,
+    ) -> Result<()> {
+        let ws_path = self.workspace_path(segment_name, workspace_name);
+
+        // Run destroy hooks if workspace exists and .breq.kdl exists
+        if ws_path.exists() {
+            if let Err(e) = self.run_destroy(segment_path, &ws_path, workspace_name) {
+                warn!("Workspace destroy hooks failed: {}", e);
+                // Continue with cleanup even if destroy fails
+            }
+        }
+
+        self.cleanup_workspace(segment_path, segment_name, workspace_name)
     }
 }
