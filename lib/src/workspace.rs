@@ -120,13 +120,23 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    /// Cleanup a workspace completely (forget + delete)
+    /// Cleanup a workspace completely (destroy hooks + forget + delete)
     pub fn cleanup_workspace(
         &self,
         segment_path: &Path,
         segment_name: &str,
         workspace_name: &str,
     ) -> Result<()> {
+        let ws_path = self.workspace_path(segment_name, workspace_name);
+
+        // Run destroy hooks if workspace exists
+        if ws_path.exists() {
+            if let Err(e) = self.run_destroy(segment_path, &ws_path, workspace_name) {
+                warn!("Workspace destroy hooks failed: {}", e);
+                // Continue with cleanup even if destroy fails
+            }
+        }
+
         self.forget_workspace(segment_path, workspace_name)?;
         self.delete_workspace(segment_name, workspace_name)?;
         Ok(())
@@ -217,34 +227,11 @@ impl WorkspaceManager {
     ) -> Result<PathBuf> {
         let ws_path = self.create_workspace(segment_path, segment_name, workspace_name)?;
 
-        // Run setup hooks if .breq.kdl exists
-        if let Err(e) = self.run_setup(segment_path, &ws_path, workspace_name) {
-            warn!("Workspace setup failed: {}", e);
-            // Don't fail the workspace creation, just warn
-            // The workspace is still usable, setup can be retried
-        }
+        // Run setup hooks if .toren.kdl exists - fail if setup fails
+        self.run_setup(segment_path, &ws_path, workspace_name)
+            .with_context(|| format!("Workspace setup failed for '{}'", workspace_name))?;
 
         Ok(ws_path)
     }
 
-    /// Cleanup workspace with destroy hooks
-    /// Runs destroy hooks before removing the workspace
-    pub fn cleanup_workspace_with_destroy(
-        &self,
-        segment_path: &Path,
-        segment_name: &str,
-        workspace_name: &str,
-    ) -> Result<()> {
-        let ws_path = self.workspace_path(segment_name, workspace_name);
-
-        // Run destroy hooks if workspace exists and .breq.kdl exists
-        if ws_path.exists() {
-            if let Err(e) = self.run_destroy(segment_path, &ws_path, workspace_name) {
-                warn!("Workspace destroy hooks failed: {}", e);
-                // Continue with cleanup even if destroy fails
-            }
-        }
-
-        self.cleanup_workspace(segment_path, segment_name, workspace_name)
-    }
 }

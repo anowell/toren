@@ -11,6 +11,10 @@ use toren_lib::{
 #[command(name = "breq")]
 #[command(about = "Spawn Claude ancillaries for bead-driven development")]
 struct Cli {
+    /// Increase verbosity (-v for DEBUG, -vv for TRACE)
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -147,12 +151,18 @@ impl Intent {
 }
 
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let log_level = match cli.verbose {
+        0 => tracing::Level::INFO,
+        1 => tracing::Level::DEBUG,
+        _ => tracing::Level::TRACE,
+    };
+
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(log_level)
         .with_target(false)
         .init();
-
-    let cli = Cli::parse();
 
     match cli.command {
         Commands::Assign {

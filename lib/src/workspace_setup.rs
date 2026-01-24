@@ -7,6 +7,7 @@
 //! - `run`: Execute shell commands
 
 use anyhow::{Context, Result};
+use clonetree::Options as CloneOptions;
 use kdl::{KdlDocument, KdlNode};
 use minijinja::{context, Environment};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 const TOREN_CONFIG_FILE: &str = ".toren.kdl";
 const STATE_DIR: &str = ".breq";
@@ -89,10 +90,12 @@ impl WorkspaceState {
 pub enum Action {
     /// Copy and render a template with workspace context
     Template { src: String, dest: String },
-    /// Copy a file verbatim
-    Copy { src: String, dest: String },
+    /// Copy a file or directory using CoW when available, with fallback to regular copy
+    Copy { src: String, dest: String, from: Option<String> },
+    /// Create a symlink for truly shared content
+    Share { src: String, from: Option<String> },
     /// Execute a shell command
-    Run { command: String },
+    Run { command: String, cwd: Option<String> },
 }
 
 /// Configuration parsed from .toren.kdl
@@ -113,9 +116,11 @@ impl BreqConfig {
         let config_path = repo_root.join(TOREN_CONFIG_FILE);
 
         if !config_path.exists() {
-            debug!("No {} found at {}", TOREN_CONFIG_FILE, config_path.display());
+            trace!("No {} found at {}", TOREN_CONFIG_FILE, config_path.display());
             return Ok(Self::default());
         }
+
+        trace!("Found config file: {}", config_path.display());
 
         let content = fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read {}", config_path.display()))?;
@@ -182,9 +187,26 @@ impl BreqConfig {
                 let dest = node
                     .get("dest")
                     .and_then(|v| v.as_string())
-                    .context("copy requires dest= attribute")?
+                    .map(|s| s.to_string());
+                let from = node
+                    .get("from")
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_string());
+                // dest defaults to src if not specified
+                let dest = dest.unwrap_or_else(|| src.clone());
+                Ok(Action::Copy { src, dest, from })
+            }
+            "share" => {
+                let src = node
+                    .get("src")
+                    .and_then(|v| v.as_string())
+                    .context("share requires src= attribute")?
                     .to_string();
-                Ok(Action::Copy { src, dest })
+                let from = node
+                    .get("from")
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_string());
+                Ok(Action::Share { src, from })
             }
             "run" => {
                 // run takes command as first argument: run "pnpm install"
@@ -194,7 +216,11 @@ impl BreqConfig {
                     .and_then(|e| e.value().as_string())
                     .context("run requires a command argument")?
                     .to_string();
-                Ok(Action::Run { command })
+                let cwd = node
+                    .get("cwd")
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_string());
+                Ok(Action::Run { command, cwd })
             }
             other => {
                 anyhow::bail!("Unknown action type: {}", other);
@@ -350,7 +376,7 @@ impl WorkspaceSetup {
     /// Execute a list of actions in order
     fn execute_actions(&self, actions: &[Action], ctx: &WorkspaceContext) -> Result<()> {
         for (i, action) in actions.iter().enumerate() {
-            debug!("Executing action {}: {:?}", i + 1, action);
+            trace!("Executing action {}: {:?}", i + 1, action);
             self.execute_action(action, ctx)
                 .with_context(|| format!("Action {} failed", i + 1))?;
         }
@@ -360,13 +386,16 @@ impl WorkspaceSetup {
     fn execute_action(&self, action: &Action, ctx: &WorkspaceContext) -> Result<()> {
         match action {
             Action::Template { src, dest } => self.execute_template(src, dest, ctx),
-            Action::Copy { src, dest } => self.execute_copy(src, dest),
-            Action::Run { command } => self.execute_run(command),
+            Action::Copy { src, dest, from } => self.execute_copy(src, dest, from.as_deref(), ctx),
+            Action::Share { src, from } => self.execute_share(src, from.as_deref(), ctx),
+            Action::Run { command, cwd } => self.execute_run(command, cwd.as_deref()),
         }
     }
 
     fn execute_template(&self, src: &str, dest: &str, ctx: &WorkspaceContext) -> Result<()> {
-        let src_path = self.workspace_path.join(src);
+        // Source is relative to repo root (template files are versioned)
+        let src_path = self.repo_root.join(src);
+        // Dest is relative to workspace
         let dest_path = self.workspace_path.join(dest);
 
         let template_content = fs::read_to_string(&src_path)
@@ -393,8 +422,15 @@ impl WorkspaceSetup {
         Ok(())
     }
 
-    fn execute_copy(&self, src: &str, dest: &str) -> Result<()> {
-        let src_path = self.workspace_path.join(src);
+    fn execute_copy(&self, src: &str, dest: &str, from: Option<&str>, ctx: &WorkspaceContext) -> Result<()> {
+        // Resolve source: from attribute (with template rendering) or repo root
+        let src_path = if let Some(from_template) = from {
+            let rendered_from = self.render_string(from_template, ctx)?;
+            PathBuf::from(rendered_from).join(src)
+        } else {
+            self.repo_root.join(src)
+        };
+        // Dest is relative to workspace
         let dest_path = self.workspace_path.join(dest);
 
         // Ensure parent directory exists
@@ -402,20 +438,77 @@ impl WorkspaceSetup {
             fs::create_dir_all(parent)?;
         }
 
-        fs::copy(&src_path, &dest_path)
+        // Use clonetree for CoW with automatic fallback
+        clonetree::clone_tree(&src_path, &dest_path, &CloneOptions::new())
             .with_context(|| format!("Failed to copy {} to {}", src_path.display(), dest_path.display()))?;
 
-        info!("  copy: {} -> {}", src, dest);
+        info!("  copy: {} -> {}", src_path.display(), dest);
         Ok(())
     }
 
-    fn execute_run(&self, command: &str) -> Result<()> {
-        info!("  run: {}", command);
+    fn execute_share(&self, src: &str, from: Option<&str>, ctx: &WorkspaceContext) -> Result<()> {
+        // Resolve source: from attribute (with template rendering) or repo root
+        let src_path = if let Some(from_template) = from {
+            let rendered_from = self.render_string(from_template, ctx)?;
+            PathBuf::from(rendered_from).join(src)
+        } else {
+            PathBuf::from(&ctx.repo.root).join(src)
+        };
+        let dest_path = self.workspace_path.join(src);
+
+        // Ensure parent directory exists
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Create symlink
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&src_path, &dest_path)
+            .with_context(|| format!("Failed to symlink {} -> {}", dest_path.display(), src_path.display()))?;
+
+        #[cfg(windows)]
+        {
+            if src_path.is_dir() {
+                std::os::windows::fs::symlink_dir(&src_path, &dest_path)
+            } else {
+                std::os::windows::fs::symlink_file(&src_path, &dest_path)
+            }
+            .with_context(|| format!("Failed to symlink {} -> {}", dest_path.display(), src_path.display()))?;
+        }
+
+        info!("  share: {} -> {}", dest_path.display(), src_path.display());
+        Ok(())
+    }
+
+    /// Render a string template with workspace context
+    fn render_string(&self, template: &str, ctx: &WorkspaceContext) -> Result<String> {
+        let mut env = Environment::new();
+        env.add_template("inline", template)?;
+        let tmpl = env.get_template("inline")?;
+        let rendered = tmpl.render(context! {
+            ws => ctx.ws,
+            repo => ctx.repo,
+        })?;
+        Ok(rendered)
+    }
+
+    fn execute_run(&self, command: &str, cwd: Option<&str>) -> Result<()> {
+        // Resolve cwd: if provided, relative to workspace; otherwise workspace root
+        let work_dir = match cwd {
+            Some(dir) => self.workspace_path.join(dir),
+            None => self.workspace_path.clone(),
+        };
+
+        if let Some(dir) = cwd {
+            info!("  run: {} (in {})", command, dir);
+        } else {
+            info!("  run: {}", command);
+        }
 
         let output = Command::new("sh")
             .arg("-c")
             .arg(command)
-            .current_dir(&self.workspace_path)
+            .current_dir(&work_dir)
             .output()
             .with_context(|| format!("Failed to execute: {}", command))?;
 
@@ -473,8 +566,9 @@ destroy {
         }
 
         match &config.setup[1] {
-            Action::Run { command } => {
+            Action::Run { command, cwd } => {
                 assert_eq!(command, "pnpm install");
+                assert!(cwd.is_none());
             }
             _ => panic!("Expected Run action"),
         }
@@ -492,9 +586,10 @@ setup {
 
         assert_eq!(config.setup.len(), 1);
         match &config.setup[0] {
-            Action::Copy { src, dest } => {
+            Action::Copy { src, dest, from } => {
                 assert_eq!(src, "config.example.json");
                 assert_eq!(dest, "config.json");
+                assert!(from.is_none());
             }
             _ => panic!("Expected Copy action"),
         }
@@ -520,5 +615,91 @@ setup {
 
         assert!(config.setup.is_empty());
         assert!(config.destroy.is_empty());
+    }
+
+    #[test]
+    fn test_parse_kdl_share() {
+        let content = r#"
+setup {
+    share src="node_modules" from="{{ repo.root }}"
+    share src=".pnpm-store"
+}
+"#;
+
+        let config = BreqConfig::parse_kdl(content).unwrap();
+
+        assert_eq!(config.setup.len(), 2);
+        match &config.setup[0] {
+            Action::Share { src, from } => {
+                assert_eq!(src, "node_modules");
+                assert_eq!(from.as_deref(), Some("{{ repo.root }}"));
+            }
+            _ => panic!("Expected Share action"),
+        }
+        match &config.setup[1] {
+            Action::Share { src, from } => {
+                assert_eq!(src, ".pnpm-store");
+                assert!(from.is_none());
+            }
+            _ => panic!("Expected Share action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_kdl_copy_with_from() {
+        let content = r#"
+setup {
+    copy src="node_modules" from="{{ repo.root }}"
+    copy src="config.json" dest="config.json"
+}
+"#;
+
+        let config = BreqConfig::parse_kdl(content).unwrap();
+
+        assert_eq!(config.setup.len(), 2);
+        match &config.setup[0] {
+            Action::Copy { src, dest, from } => {
+                assert_eq!(src, "node_modules");
+                assert_eq!(dest, "node_modules"); // dest defaults to src
+                assert_eq!(from.as_deref(), Some("{{ repo.root }}"));
+            }
+            _ => panic!("Expected Copy action"),
+        }
+        match &config.setup[1] {
+            Action::Copy { src, dest, from } => {
+                assert_eq!(src, "config.json");
+                assert_eq!(dest, "config.json");
+                assert!(from.is_none());
+            }
+            _ => panic!("Expected Copy action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_kdl_run_with_cwd() {
+        let content = r#"
+setup {
+    run "pnpm install" cwd="web"
+    run "cargo build"
+}
+"#;
+
+        let config = BreqConfig::parse_kdl(content).unwrap();
+
+        assert_eq!(config.setup.len(), 2);
+        match &config.setup[0] {
+            Action::Run { command, cwd } => {
+                assert_eq!(command, "pnpm install");
+                assert_eq!(cwd.as_deref(), Some("web"));
+            }
+            _ => panic!("Expected Run action"),
+        }
+        match &config.setup[1] {
+            Action::Run { command, cwd } => {
+                assert_eq!(command, "cargo build");
+                assert!(cwd.is_none());
+            }
+            _ => panic!("Expected Run action"),
+        }
     }
 }
