@@ -10,16 +10,13 @@ use anyhow::{Context, Result};
 use clonetree::Options as CloneOptions;
 use kdl::{KdlDocument, KdlNode};
 use minijinja::{context, Environment};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, trace, warn};
 
 const TOREN_CONFIG_FILE: &str = ".toren.kdl";
-const STATE_DIR: &str = ".breq";
-const STATE_FILE: &str = "state.json";
 
 /// Workspace context available to templates
 #[derive(Debug, Clone, Serialize)]
@@ -34,10 +31,8 @@ pub struct WorkspaceInfo {
     pub name: String,
     /// Filesystem/DNS-safe name
     pub slug: String,
-    /// Stable small integer index
-    pub idx: u32,
-    /// Unique workspace ID
-    pub id: String,
+    /// Numeric portion parsed from workspace name (e.g., "breq-123" -> 123)
+    pub num: Option<u32>,
     /// Workspace path
     pub path: String,
 }
@@ -48,41 +43,6 @@ pub struct RepoInfo {
     pub root: String,
     /// Repository name
     pub name: String,
-}
-
-/// Persistent workspace state stored in .breq/state.json
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WorkspaceState {
-    /// Version for future migrations
-    version: u32,
-    /// Index allocation: workspace name -> index
-    #[serde(default)]
-    indices: HashMap<String, u32>,
-    /// Next available index
-    #[serde(default)]
-    next_index: u32,
-}
-
-impl WorkspaceState {
-    fn new() -> Self {
-        Self {
-            version: 1,
-            indices: HashMap::new(),
-            next_index: 1,
-        }
-    }
-
-    /// Get or allocate a stable index for a workspace
-    fn get_or_allocate_index(&mut self, workspace_name: &str) -> u32 {
-        if let Some(&idx) = self.indices.get(workspace_name) {
-            idx
-        } else {
-            let idx = self.next_index;
-            self.indices.insert(workspace_name.to_string(), idx);
-            self.next_index += 1;
-            idx
-        }
-    }
 }
 
 /// An action to execute during setup or destroy
@@ -248,40 +208,8 @@ impl WorkspaceSetup {
         }
     }
 
-    /// Load state from .breq/state.json in the repo root
-    fn load_state(&self) -> Result<WorkspaceState> {
-        let state_path = self.repo_root.join(STATE_DIR).join(STATE_FILE);
-
-        if !state_path.exists() {
-            return Ok(WorkspaceState::new());
-        }
-
-        let content = fs::read_to_string(&state_path)
-            .with_context(|| format!("Failed to read {}", state_path.display()))?;
-
-        serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", state_path.display()))
-    }
-
-    /// Save state to .breq/state.json in the repo root
-    fn save_state(&self, state: &WorkspaceState) -> Result<()> {
-        let state_dir = self.repo_root.join(STATE_DIR);
-        fs::create_dir_all(&state_dir)
-            .with_context(|| format!("Failed to create {}", state_dir.display()))?;
-
-        let state_path = state_dir.join(STATE_FILE);
-        let content = serde_json::to_string_pretty(state)?;
-
-        fs::write(&state_path, content)
-            .with_context(|| format!("Failed to write {}", state_path.display()))?;
-
-        Ok(())
-    }
-
     /// Build workspace context for template rendering
-    fn build_context(&self, state: &mut WorkspaceState) -> Result<WorkspaceContext> {
-        let idx = state.get_or_allocate_index(&self.workspace_name);
-
+    fn build_context(&self) -> WorkspaceContext {
         // Generate a slug-safe name
         let slug = self
             .workspace_name
@@ -297,8 +225,14 @@ impl WorkspaceSetup {
             .trim_matches('-')
             .to_string();
 
-        // Generate unique workspace ID
-        let id = format!("{}-{}", slug, idx);
+        // Parse numeric portion from workspace name (e.g., "breq-123" -> 123)
+        let num = self
+            .workspace_name
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u32>()
+            .ok();
 
         let repo_name = self
             .repo_root
@@ -307,19 +241,18 @@ impl WorkspaceSetup {
             .unwrap_or("unknown")
             .to_string();
 
-        Ok(WorkspaceContext {
+        WorkspaceContext {
             ws: WorkspaceInfo {
                 name: self.workspace_name.clone(),
                 slug,
-                idx,
-                id,
+                num,
                 path: self.workspace_path.display().to_string(),
             },
             repo: RepoInfo {
                 root: self.repo_root.display().to_string(),
                 name: repo_name,
             },
-        })
+        }
     }
 
     /// Run the setup block
@@ -337,12 +270,7 @@ impl WorkspaceSetup {
             self.workspace_path.display()
         );
 
-        let mut state = self.load_state()?;
-        let ctx = self.build_context(&mut state)?;
-
-        // Save state with allocated index
-        self.save_state(&state)?;
-
+        let ctx = self.build_context();
         self.execute_actions(&config.setup, &ctx)?;
 
         info!("Workspace setup complete");
@@ -364,9 +292,7 @@ impl WorkspaceSetup {
             self.workspace_path.display()
         );
 
-        let mut state = self.load_state()?;
-        let ctx = self.build_context(&mut state)?;
-
+        let ctx = self.build_context();
         self.execute_actions(&config.destroy, &ctx)?;
 
         info!("Workspace destroy complete");
@@ -593,19 +519,6 @@ setup {
             }
             _ => panic!("Expected Copy action"),
         }
-    }
-
-    #[test]
-    fn test_workspace_state_index_allocation() {
-        let mut state = WorkspaceState::new();
-
-        let idx1 = state.get_or_allocate_index("one");
-        let idx2 = state.get_or_allocate_index("two");
-        let idx1_again = state.get_or_allocate_index("one");
-
-        assert_eq!(idx1, 1);
-        assert_eq!(idx2, 2);
-        assert_eq!(idx1_again, 1); // Same workspace should get same index
     }
 
     #[test]

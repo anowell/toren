@@ -77,10 +77,9 @@ destroy {
 
 **Template variables:**
 ```
-{{ ws.name }}    # Workspace name (e.g., "one")
+{{ ws.name }}    # Workspace name (e.g., "breq-abc")
 {{ ws.slug }}    # Filesystem-safe name
-{{ ws.idx }}     # Stable integer index (1, 2, 3...)
-{{ ws.id }}      # Unique ID (e.g., "one-1")
+{{ ws.num }}     # Numeric portion of name (e.g., "breq-123" -> 123)
 {{ ws.path }}    # Full workspace path
 {{ repo.root }}  # Repository root path
 {{ repo.name }}  # Repository name
@@ -88,7 +87,7 @@ destroy {
 
 Example `.env.breq` template:
 ```env
-PORT={{ 3000 + ws.idx }}
+PORT={{ 3000 + ws.num }}
 DATABASE_URL=postgres://localhost/myapp_{{ ws.slug }}
 ```
 
