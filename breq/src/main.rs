@@ -6,6 +6,29 @@ use toren_lib::{
     AssignmentManager, AssignmentRef, AssignmentStatus, Config, Segment, SegmentManager,
     WorkspaceManager,
 };
+use tracing::{debug, info};
+use tracing_subscriber::fmt::time::FormatTime;
+
+/// Custom time formatter that displays only HH:MM:SS (UTC)
+struct ShortTime;
+
+impl FormatTime for ShortTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let secs_of_day = now % 86400;
+        let hours = secs_of_day / 3600;
+        let minutes = (secs_of_day % 3600) / 60;
+        let seconds = secs_of_day % 60;
+
+        write!(w, "{:02}:{:02}:{:02}", hours, minutes, seconds)
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "breq")]
@@ -164,6 +187,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(log_level)
         .with_target(false)
+        .with_timer(ShortTime)
         .init();
 
     match cli.command {
@@ -622,7 +646,7 @@ fn cmd_abort(reference: &str, close: bool) -> Result<()> {
         if close {
             println!("Closing bead {}...", bead_id);
             toren_lib::tasks::beads::update_bead_status(&bead_id, "closed", &segment.path)?;
-            println!("Bead closed.");
+            info!("Bead closed.");
         } else {
             // Unassign and reopen
             let _ = toren_lib::tasks::beads::update_bead_assignee(&bead_id, "", &segment.path);
@@ -708,7 +732,7 @@ fn cmd_complete(reference: &str, push: bool, keep_open: bool) -> Result<()> {
             if !keep_open {
                 println!("No assignment found, closing bead {}...", bead_id);
                 toren_lib::tasks::beads::update_bead_status(&bead_id, "closed", &segment.path)?;
-                println!("Bead closed.");
+                info!("Bead closed.");
             } else {
                 println!("No assignment found for bead {}.", bead_id);
             }
@@ -745,12 +769,28 @@ fn cmd_complete(reference: &str, push: bool, keep_open: bool) -> Result<()> {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty());
 
-        // Show the changes
+        // Show the changes (suppress stale working copy warnings since we're about to delete)
         println!("\nChanges:");
-        let _ = Command::new("jj")
+        let output = Command::new("jj")
             .args(["log", "-r", "@"])
             .current_dir(&assignment.workspace_path)
-            .status();
+            .output();
+
+        if let Ok(output) = output {
+            // Print stdout (the actual log output)
+            if !output.stdout.is_empty() {
+                print!("{}", String::from_utf8_lossy(&output.stdout));
+            }
+            // Filter stderr: suppress "working copy is stale" messages
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for line in stderr.lines() {
+                if !line.contains("working copy is stale")
+                    && !line.contains("workspace update-stale")
+                {
+                    eprintln!("{}", line);
+                }
+            }
+        }
 
         // Push if requested
         if push {
@@ -782,7 +822,7 @@ fn cmd_complete(reference: &str, push: bool, keep_open: bool) -> Result<()> {
             .unwrap_or("unknown");
 
         workspace_mgr.cleanup_workspace(&segment.path, &segment.name, ws_name)?;
-        println!("Workspace cleaned up.");
+        debug!("Workspace cleaned up.");
     }
 
     // Remove assignment
