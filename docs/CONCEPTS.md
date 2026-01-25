@@ -44,6 +44,52 @@ Toren (daemon)
     └── Api One
 ```
 
+## The breq CLI
+
+`breq` (bead request) manages work assignments between beads (tasks) and ancillaries.
+
+### Core Principle
+
+**Ancillary = Workspace**: An ancillary is in use exactly when its workspace exists. When work completes or is aborted, both the workspace and assignment are cleaned up together.
+
+### Commands
+
+| Command | Description | Bead Effect |
+|---------|-------------|-------------|
+| `breq assign <bead>` | Deploy ancillary on task | → in_progress |
+| `breq complete <ref>` | Keep commits, cleanup workspace | → closed |
+| `breq abort <ref>` | Discard work, cleanup workspace | → open (unassigned) |
+| `breq abort --close` | Abort and close bead | → closed |
+| `breq resume <ref>` | Continue work (recreates workspace if needed) | (reopens if needed) |
+
+### Workflow Examples
+
+**Complete a task:**
+```bash
+breq assign my-bead        # Creates workspace, assigns to Claude
+# ... Claude works ...
+breq complete one          # Cleanup, close bead, print commit ref
+jj rebase -r abc123 -d main  # Integrate from default workspace
+```
+
+**Discard and retry:**
+```bash
+breq abort one             # Cleanup, bead returns to open
+breq assign my-bead        # Start fresh
+```
+
+**Continue interrupted work:**
+```bash
+breq resume one            # Recreates workspace if needed, launches Claude
+```
+
+### State Recovery
+
+Each command handles inconsistent states gracefully:
+- `complete` - works even if workspace is already gone
+- `abort` - works even if workspace is missing or assignment is stale
+- `resume` - recreates workspace if missing, reopens bead if closed
+
 ## Environment Variables
 
 ```bash

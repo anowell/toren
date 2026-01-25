@@ -89,16 +89,18 @@ enum Commands {
         close: bool,
     },
 
-    /// Accept work and push changes
-    Approve {
+    /// Complete work: cleanup workspace, close bead, print revision for integration
+    Complete {
         /// Bead ID or ancillary reference
         reference: String,
-    },
 
-    /// Free up an ancillary without touching bead/workspace
-    Dismiss {
-        /// Bead ID or ancillary reference
-        reference: String,
+        /// Also push the commits (jj git push -c <rev>)
+        #[arg(long)]
+        push: bool,
+
+        /// Keep bead open instead of closing
+        #[arg(long)]
+        keep_open: bool,
     },
 
     /// Workspace management commands
@@ -181,8 +183,11 @@ fn main() -> Result<()> {
             danger,
         } => cmd_resume(&reference, instruction.as_deref(), danger),
         Commands::Abort { reference, close } => cmd_abort(&reference, close),
-        Commands::Approve { reference } => cmd_approve(&reference),
-        Commands::Dismiss { reference } => cmd_dismiss(&reference),
+        Commands::Complete {
+            reference,
+            push,
+            keep_open,
+        } => cmd_complete(&reference, push, keep_open),
         Commands::Workspace { command } => match command {
             WorkspaceCommands::Setup => cmd_ws_setup(),
             WorkspaceCommands::Destroy => cmd_ws_destroy(),
@@ -486,20 +491,34 @@ fn cmd_resume(reference: &str, instruction: Option<&str>, danger: bool) -> Resul
     let segment = resolve_segment(&segment_mgr, None)?;
     let ref_ = AssignmentRef::parse(reference, &segment.name);
 
-    // Clone the assignment data we need before mutating assignment_mgr
+    // Find assignment - check all assignments, not just active ones
+    // This allows resuming completed/aborted assignments
     let assignment = {
-        let assignments = assignment_mgr.resolve_active(&ref_);
+        let mut assignments = assignment_mgr.resolve(&ref_);
 
         if assignments.is_empty() {
-            anyhow::bail!("No active assignment found for: {}", reference);
+            anyhow::bail!("No assignment found for: {}", reference);
         }
 
+        // Prefer active assignments, but fall back to any assignment
+        assignments.sort_by(|a, b| {
+            let a_active = matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active);
+            let b_active = matches!(b.status, AssignmentStatus::Pending | AssignmentStatus::Active);
+            b_active.cmp(&a_active)
+        });
+
         if assignments.len() > 1 {
-            println!("Multiple active assignments found:");
-            for a in &assignments {
-                println!("  {} -> {}", a.ancillary_id, a.bead_id);
+            let active_count = assignments
+                .iter()
+                .filter(|a| matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
+                .count();
+            if active_count > 1 {
+                println!("Multiple active assignments found:");
+                for a in &assignments {
+                    println!("  {} -> {}", a.ancillary_id, a.bead_id);
+                }
+                anyhow::bail!("Please specify a unique ancillary or bead");
             }
-            anyhow::bail!("Please specify a unique ancillary or bead");
         }
 
         assignments[0].clone()
@@ -515,29 +534,31 @@ fn cmd_resume(reference: &str, instruction: Option<&str>, danger: bool) -> Resul
             .and_then(|n| n.to_str())
             .context("Invalid workspace path")?;
 
-        workspace_mgr.create_workspace(&segment.path, &segment.name, ws_name)?;
+        workspace_mgr.create_workspace_with_setup(&segment.path, &segment.name, ws_name)?;
         println!("Workspace recreated: {}", ws_path.display());
     }
 
     // Update status to active
     assignment_mgr.update_status(&assignment.id, AssignmentStatus::Active)?;
 
-    // Check if bead is closed and reopen if needed
-    if let Ok(task) = toren_lib::tasks::fetch_task(&assignment.bead_id, &segment.path) {
-        println!("Resuming work on {} - {}", task.id, task.title);
-    } else {
-        println!("Attempting to reopen bead...");
-        let _ = toren_lib::tasks::beads::update_bead_status(
-            &assignment.bead_id,
-            "in_progress",
-            &segment.path,
-        );
-    }
+    // Ensure bead is in_progress and assigned to claude
+    let task_title = match toren_lib::tasks::fetch_task(&assignment.bead_id, &segment.path) {
+        Ok(task) => {
+            println!("Resuming work on {} - {}", task.id, task.title);
+            task.title
+        }
+        Err(_) => {
+            // Bead might be closed or not found, try to reopen
+            println!("Reopening bead...");
+            toren_lib::tasks::beads::claim_bead(&assignment.bead_id, "claude", &segment.path)?;
+            assignment.bead_id.clone()
+        }
+    };
 
     let prompt = instruction.map(|s| s.to_string()).unwrap_or_else(|| {
         format!(
-            "Continue working on bead {}. Review progress and complete remaining work.",
-            assignment.bead_id
+            "Continue working on bead {}: {}. Review progress and complete remaining work.",
+            assignment.bead_id, task_title
         )
     });
 
@@ -569,58 +590,71 @@ fn cmd_abort(reference: &str, close: bool) -> Result<()> {
     let segment = resolve_segment(&segment_mgr, None)?;
     let ref_ = AssignmentRef::parse(reference, &segment.name);
 
-    // Get active assignments to abort
+    // Get all assignments (active or not) to abort
     let assignments: Vec<_> = assignment_mgr
-        .resolve_active(&ref_)
+        .resolve(&ref_)
         .iter()
         .map(|a| (*a).clone())
         .collect();
 
     if assignments.is_empty() {
-        // Fall back to legacy behavior - treat as bead ID directly
+        // No assignment found - handle as bead reference for cleanup
         let bead_id = match &ref_ {
             AssignmentRef::Bead(id) => id.clone(),
-            AssignmentRef::Ancillary(_) => {
-                anyhow::bail!("No active assignment found for: {}", reference);
+            AssignmentRef::Ancillary(anc) => {
+                // Try to find workspace by ancillary name
+                let ws_name = anc.split_whitespace().last().unwrap_or(anc).to_lowercase();
+                let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name);
+                if ws_path.exists() {
+                    println!("Cleaning up orphaned workspace: {}", ws_path.display());
+                    workspace_mgr.cleanup_workspace(&segment.path, &segment.name, &ws_name)?;
+                    println!("Workspace removed.");
+                } else {
+                    println!("No assignment or workspace found for: {}", reference);
+                }
+                return Ok(());
             }
         };
 
-        // Legacy: cleanup workspace by bead ID
-        println!("Cleaning up workspace for {}", bead_id);
-        workspace_mgr.cleanup_workspace(&segment.path, &segment.name, &bead_id)?;
-        println!("Workspace removed.");
+        // Try to cleanup workspace if it exists (orphaned workspace case)
+        let _ = workspace_mgr.cleanup_workspace(&segment.path, &segment.name, &bead_id);
 
         if close {
-            println!("Closing bead...");
+            println!("Closing bead {}...", bead_id);
             toren_lib::tasks::beads::update_bead_status(&bead_id, "closed", &segment.path)?;
             println!("Bead closed.");
         } else {
+            // Unassign and reopen
+            let _ = toren_lib::tasks::beads::update_bead_assignee(&bead_id, "", &segment.path);
             toren_lib::tasks::beads::update_bead_status(&bead_id, "open", &segment.path)?;
-            println!("Bead returned to open.");
+            println!("Bead {} unassigned and returned to open.", bead_id);
         }
         return Ok(());
     }
 
+    // Process each assignment
     for assignment in &assignments {
         println!(
-            "Aborting assignment: {} -> {}",
+            "Aborting: {} -> {}",
             assignment.ancillary_id, assignment.bead_id
         );
 
-        // Cleanup workspace
+        // Cleanup workspace if it exists
         if assignment.workspace_path.exists() {
             let ws_name = assignment
                 .workspace_path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or(&assignment.bead_id);
+                .unwrap_or("unknown");
 
             workspace_mgr.cleanup_workspace(&segment.path, &segment.name, ws_name)?;
             println!("  Workspace removed.");
+        } else {
+            println!("  (Workspace already gone)");
         }
 
-        // Update assignment status to aborted
-        assignment_mgr.update_status(&assignment.id, AssignmentStatus::Aborted)?;
+        // Remove assignment completely
+        assignment_mgr.remove(&assignment.id)?;
     }
 
     // Handle bead status
@@ -631,24 +665,17 @@ fn cmd_abort(reference: &str, close: bool) -> Result<()> {
             println!("Closing bead {}...", bead_id);
             toren_lib::tasks::beads::update_bead_status(bead_id, "closed", &segment.path)?;
         } else {
-            // Only reopen if no other active assignments exist for this bead
-            let remaining = assignment_mgr
-                .get_by_bead(bead_id)
-                .into_iter()
-                .filter(|a| matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
-                .count();
-
-            if remaining == 0 {
-                toren_lib::tasks::beads::update_bead_status(bead_id, "open", &segment.path)?;
-                println!("Bead {} returned to open.", bead_id);
-            }
+            // Unassign and reopen
+            let _ = toren_lib::tasks::beads::update_bead_assignee(bead_id, "", &segment.path);
+            toren_lib::tasks::beads::update_bead_status(bead_id, "open", &segment.path)?;
+            println!("Bead {} unassigned and returned to open.", bead_id);
         }
     }
 
     Ok(())
 }
 
-fn cmd_approve(reference: &str) -> Result<()> {
+fn cmd_complete(reference: &str, push: bool, keep_open: bool) -> Result<()> {
     let config = Config::load()?;
 
     let workspace_root = config
@@ -664,35 +691,27 @@ fn cmd_approve(reference: &str) -> Result<()> {
     let segment = resolve_segment(&segment_mgr, None)?;
     let ref_ = AssignmentRef::parse(reference, &segment.name);
 
-    // Clone the assignment data we need before mutating assignment_mgr
+    // Find the assignment
     let assignment = {
         let assignments = assignment_mgr.resolve_active(&ref_);
 
         if assignments.is_empty() {
-            // Fall back to legacy behavior
+            // No assignment found - check if this is a bead reference
             let bead_id = match &ref_ {
-                AssignmentRef::Bead(id) => id.as_str(),
+                AssignmentRef::Bead(id) => id.clone(),
                 AssignmentRef::Ancillary(_) => {
                     anyhow::bail!("No active assignment found for: {}", reference);
                 }
             };
 
-            let ws_path = workspace_mgr.workspace_path(&segment.name, bead_id);
-            if !ws_path.exists() {
-                anyhow::bail!("No workspace found for bead {}", bead_id);
+            // No assignment, just close the bead if requested
+            if !keep_open {
+                println!("No assignment found, closing bead {}...", bead_id);
+                toren_lib::tasks::beads::update_bead_status(&bead_id, "closed", &segment.path)?;
+                println!("Bead closed.");
+            } else {
+                println!("No assignment found for bead {}.", bead_id);
             }
-
-            println!("Changes to approve:");
-            let _ = Command::new("jj")
-                .args(["log", "-n", "10"])
-                .current_dir(&ws_path)
-                .status();
-
-            println!("\nTo push changes:");
-            println!("  cd {}", ws_path.display());
-            println!("  jj git push");
-            println!("\nThen cleanup:");
-            println!("  breq abort {}", bead_id);
             return Ok(());
         }
 
@@ -701,72 +720,88 @@ fn cmd_approve(reference: &str) -> Result<()> {
             for a in &assignments {
                 println!("  {} -> {}", a.ancillary_id, a.bead_id);
             }
-            anyhow::bail!("Please specify a unique ancillary to approve");
+            anyhow::bail!("Please specify a unique reference");
         }
 
         assignments[0].clone()
     };
 
-    if !assignment.workspace_path.exists() {
-        anyhow::bail!(
-            "Workspace not found: {}",
-            assignment.workspace_path.display()
-        );
-    }
-
     println!(
-        "Approving: {} -> {}",
+        "Completing: {} -> {}",
         assignment.ancillary_id, assignment.bead_id
     );
-    println!("\nChanges to approve:");
-    let _ = Command::new("jj")
-        .args(["log", "-n", "10"])
-        .current_dir(&assignment.workspace_path)
-        .status();
 
-    // Mark as completed
-    assignment_mgr.update_status(&assignment.id, AssignmentStatus::Completed)?;
+    // Get the current revision before cleanup (if workspace exists)
+    let revision = if assignment.workspace_path.exists() {
+        // Get the working copy commit
+        let output = Command::new("jj")
+            .args(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
+            .current_dir(&assignment.workspace_path)
+            .output()
+            .ok();
 
-    println!("\nTo push changes:");
-    println!("  cd {}", assignment.workspace_path.display());
-    println!("  jj git push");
-    println!("\nWorkspace left for manual cleanup.");
+        let rev = output
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
 
-    Ok(())
-}
+        // Show the changes
+        println!("\nChanges:");
+        let _ = Command::new("jj")
+            .args(["log", "-r", "@"])
+            .current_dir(&assignment.workspace_path)
+            .status();
 
-fn cmd_dismiss(reference: &str) -> Result<()> {
-    let config = Config::load()?;
-    let segment_mgr = SegmentManager::new(&config)?;
-    let mut assignment_mgr = AssignmentManager::new()?;
-
-    let segment = resolve_segment(&segment_mgr, None)?;
-    let ref_ = AssignmentRef::parse(reference, &segment.name);
-
-    match &ref_ {
-        AssignmentRef::Ancillary(ancillary_id) => {
-            let dismissed = assignment_mgr.dismiss_ancillary(ancillary_id)?;
-            if dismissed.is_empty() {
-                println!("No assignments found for ancillary: {}", ancillary_id);
-            } else {
-                for a in dismissed {
-                    println!("Dismissed: {} -> {}", a.ancillary_id, a.bead_id);
+        // Push if requested
+        if push {
+            if let Some(ref rev) = rev {
+                println!("\nPushing...");
+                let status = Command::new("jj")
+                    .args(["git", "push", "-c", rev])
+                    .current_dir(&assignment.workspace_path)
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("Failed to push changes");
                 }
+                println!("Pushed.");
             }
         }
-        AssignmentRef::Bead(bead_id) => {
-            let dismissed = assignment_mgr.dismiss_bead(bead_id)?;
-            if dismissed.is_empty() {
-                println!("No assignments found for bead: {}", bead_id);
-            } else {
-                for a in dismissed {
-                    println!("Dismissed: {} -> {}", a.ancillary_id, a.bead_id);
-                }
-            }
+
+        rev
+    } else {
+        println!("(Workspace already cleaned up)");
+        None
+    };
+
+    // Cleanup workspace if it exists
+    if assignment.workspace_path.exists() {
+        let ws_name = assignment
+            .workspace_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+
+        workspace_mgr.cleanup_workspace(&segment.path, &segment.name, ws_name)?;
+        println!("Workspace cleaned up.");
+    }
+
+    // Remove assignment
+    assignment_mgr.remove(&assignment.id)?;
+
+    // Close bead unless --keep-open
+    if !keep_open {
+        toren_lib::tasks::beads::update_bead_status(&assignment.bead_id, "closed", &segment.path)?;
+        println!("Bead closed.");
+    }
+
+    // Print integration instructions
+    if let Some(rev) = revision {
+        if !push {
+            println!("\nCommit preserved at: {}", &rev[..12.min(rev.len())]);
+            println!("To integrate: jj rebase -r {} -d main", &rev[..12.min(rev.len())]);
         }
     }
 
-    println!("Workspace and bead left unchanged. Use `breq abort` to cleanup.");
     Ok(())
 }
 
