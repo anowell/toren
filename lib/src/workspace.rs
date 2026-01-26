@@ -180,6 +180,7 @@ impl WorkspaceManager {
         segment_path: &Path,
         workspace_path: &Path,
         workspace_name: &str,
+        ancillary_num: Option<u32>,
     ) -> Result<()> {
         if !BreqConfig::exists(segment_path) {
             debug!("No .breq.kdl found, skipping setup");
@@ -190,6 +191,7 @@ impl WorkspaceManager {
             segment_path.to_path_buf(),
             workspace_path.to_path_buf(),
             workspace_name.to_string(),
+            ancillary_num,
         );
 
         setup.run_setup()
@@ -212,6 +214,7 @@ impl WorkspaceManager {
             segment_path.to_path_buf(),
             workspace_path.to_path_buf(),
             workspace_name.to_string(),
+            None, // ancillary_num not available during destroy
         );
 
         setup.run_destroy()
@@ -224,11 +227,12 @@ impl WorkspaceManager {
         segment_path: &Path,
         segment_name: &str,
         workspace_name: &str,
+        ancillary_num: Option<u32>,
     ) -> Result<PathBuf> {
         let ws_path = self.create_workspace(segment_path, segment_name, workspace_name)?;
 
         // Run setup hooks if .toren.kdl exists - fail if setup fails
-        self.run_setup(segment_path, &ws_path, workspace_name)
+        self.run_setup(segment_path, &ws_path, workspace_name, ancillary_num)
             .with_context(|| format!("Workspace setup failed for '{}'", workspace_name))?;
 
         Ok(ws_path)

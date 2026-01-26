@@ -29,9 +29,7 @@ pub struct WorkspaceContext {
 pub struct WorkspaceInfo {
     /// jj workspace name (e.g., "one", "two")
     pub name: String,
-    /// Filesystem/DNS-safe name
-    pub slug: String,
-    /// Numeric portion parsed from workspace name (e.g., "breq-123" -> 123)
+    /// Ancillary number (1 for "one", 2 for "two", etc.)
     pub num: Option<u32>,
     /// Workspace path
     pub path: String,
@@ -197,43 +195,27 @@ pub struct WorkspaceSetup {
     workspace_path: PathBuf,
     /// Workspace name (jj workspace name)
     workspace_name: String,
+    /// Ancillary number (if known)
+    ancillary_num: Option<u32>,
 }
 
 impl WorkspaceSetup {
-    pub fn new(repo_root: PathBuf, workspace_path: PathBuf, workspace_name: String) -> Self {
+    pub fn new(
+        repo_root: PathBuf,
+        workspace_path: PathBuf,
+        workspace_name: String,
+        ancillary_num: Option<u32>,
+    ) -> Self {
         Self {
             repo_root,
             workspace_path,
             workspace_name,
+            ancillary_num,
         }
     }
 
     /// Build workspace context for template rendering
     fn build_context(&self) -> WorkspaceContext {
-        // Generate a slug-safe name
-        let slug = self
-            .workspace_name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() {
-                    c.to_ascii_lowercase()
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>()
-            .trim_matches('-')
-            .to_string();
-
-        // Parse numeric portion from workspace name (e.g., "breq-123" -> 123)
-        let num = self
-            .workspace_name
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse::<u32>()
-            .ok();
-
         let repo_name = self
             .repo_root
             .file_name()
@@ -244,8 +226,7 @@ impl WorkspaceSetup {
         WorkspaceContext {
             ws: WorkspaceInfo {
                 name: self.workspace_name.clone(),
-                slug,
-                num,
+                num: self.ancillary_num,
                 path: self.workspace_path.display().to_string(),
             },
             repo: RepoInfo {

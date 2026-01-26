@@ -313,7 +313,7 @@ fn cmd_assign(
     let ws_name = workspace_name_for_assignment(ancillary_num);
 
     // Create workspace and run setup hooks
-    let ws_path = workspace_mgr.create_workspace_with_setup(&segment.path, &segment.name, &ws_name)?;
+    let ws_path = workspace_mgr.create_workspace_with_setup(&segment.path, &segment.name, &ws_name, Some(ancillary_num))?;
     println!("Workspace: {}", ws_path.display());
 
     // Record assignment
@@ -557,8 +557,9 @@ fn cmd_resume(reference: &str, instruction: Option<&str>, danger: bool) -> Resul
             .file_name()
             .and_then(|n| n.to_str())
             .context("Invalid workspace path")?;
+        let ancillary_num = toren_lib::ancillary_number(&assignment.ancillary_id);
 
-        workspace_mgr.create_workspace_with_setup(&segment.path, &segment.name, ws_name)?;
+        workspace_mgr.create_workspace_with_setup(&segment.path, &segment.name, ws_name, ancillary_num)?;
         println!("Workspace recreated: {}", ws_path.display());
     }
 
@@ -913,6 +914,8 @@ fn cmd_ws_setup() -> Result<()> {
     let workspace_mgr = WorkspaceManager::new(workspace_root);
 
     let (segment_path, workspace_path, workspace_name) = detect_workspace_context()?;
+    // Infer ancillary number from workspace name (e.g., "one" -> 1)
+    let ancillary_num = toren_lib::word_to_number(&workspace_name);
 
     println!(
         "Running setup for workspace '{}' in {}",
@@ -920,7 +923,7 @@ fn cmd_ws_setup() -> Result<()> {
         workspace_path.display()
     );
 
-    workspace_mgr.run_setup(&segment_path, &workspace_path, &workspace_name)?;
+    workspace_mgr.run_setup(&segment_path, &workspace_path, &workspace_name, ancillary_num)?;
 
     println!("Setup complete.");
     Ok(())
