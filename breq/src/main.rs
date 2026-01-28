@@ -132,6 +132,13 @@ enum Commands {
         #[command(subcommand)]
         command: WorkspaceCommands,
     },
+
+    /// Initialize .toren.kdl in the current repository
+    Init {
+        /// Add .toren.kdl to .git/info/exclude instead of committing it
+        #[arg(long)]
+        stealth: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -216,6 +223,7 @@ fn main() -> Result<()> {
             WorkspaceCommands::Setup => cmd_ws_setup(),
             WorkspaceCommands::Destroy => cmd_ws_destroy(),
         },
+        Commands::Init { stealth } => cmd_init(stealth),
     }
 }
 
@@ -926,6 +934,140 @@ fn cmd_ws_setup() -> Result<()> {
     workspace_mgr.run_setup(&segment_path, &workspace_path, &workspace_name, ancillary_num)?;
 
     println!("Setup complete.");
+    Ok(())
+}
+
+fn cmd_init(stealth: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+
+    // Must be in a jj repo
+    if !cwd.join(".jj").exists() {
+        anyhow::bail!("Not a jujutsu repository. breq init must be run from a jj repo root.");
+    }
+
+    // Must be at the workspace root (jj root == cwd)
+    let output = Command::new("jj")
+        .args(["workspace", "root"])
+        .current_dir(&cwd)
+        .output()
+        .context("Failed to run jj workspace root")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to determine jj workspace root");
+    }
+
+    let jj_root = std::path::PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    );
+
+    if jj_root != cwd {
+        anyhow::bail!(
+            "breq init must be run from the workspace root: {}",
+            jj_root.display()
+        );
+    }
+
+    let config_path = cwd.join(".toren.kdl");
+    if config_path.exists() {
+        anyhow::bail!(".toren.kdl already exists. Remove it first to re-initialize.");
+    }
+
+    // Collect setup actions
+    let mut copy_entries: Vec<String> = Vec::new();
+
+    // Check for .beads directory
+    if cwd.join(".beads").exists() {
+        copy_entries.push(".beads".to_string());
+    }
+
+    // Discover build artifact directories from .gitignore
+    let well_known_artifacts = [
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        ".next",
+        ".nuxt",
+        ".output",
+        ".svelte-kit",
+        "vendor",
+        "__pycache__",
+    ];
+
+    let gitignore_path = cwd.join(".gitignore");
+    if gitignore_path.exists() {
+        let gitignore = std::fs::read_to_string(&gitignore_path)
+            .context("Failed to read .gitignore")?;
+
+        for line in gitignore.lines() {
+            let line = line.trim().trim_end_matches('/');
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            // Check if this gitignored entry matches a well-known artifact dir
+            for artifact in &well_known_artifacts {
+                if line == *artifact || line.ends_with(&format!("/{}", artifact)) {
+                    // Check if the directory actually exists in the repo
+                    let artifact_path = cwd.join(line);
+                    if artifact_path.is_dir() {
+                        let entry = line.to_string();
+                        if !copy_entries.contains(&entry) {
+                            copy_entries.push(entry);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also check for well-known artifacts that exist even if not in .gitignore
+    // (they might be using nested gitignores or global gitignore)
+    for artifact in &well_known_artifacts {
+        let artifact_path = cwd.join(artifact);
+        if artifact_path.is_dir() {
+            let entry = artifact.to_string();
+            if !copy_entries.contains(&entry) {
+                copy_entries.push(entry);
+            }
+        }
+    }
+
+    // Generate .toren.kdl content
+    let mut kdl = String::from("setup {\n");
+    for entry in &copy_entries {
+        kdl.push_str(&format!("    copy src=\"{}\"\n", entry));
+    }
+    kdl.push_str("}\n\ndestroy { }\n");
+
+    std::fs::write(&config_path, &kdl).context("Failed to write .toren.kdl")?;
+    println!("Created .toren.kdl with {} copy entries", copy_entries.len());
+
+    for entry in &copy_entries {
+        println!("  copy src=\"{}\"", entry);
+    }
+
+    // Stealth mode: add to .git/info/exclude
+    if stealth {
+        let git_info_dir = cwd.join(".git").join("info");
+        if git_info_dir.exists() {
+            let exclude_path = git_info_dir.join("exclude");
+            let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+            if !existing.lines().any(|l| l.trim() == ".toren.kdl") {
+                let mut content = existing;
+                if !content.ends_with('\n') && !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(".toren.kdl\n");
+                std::fs::write(&exclude_path, content)
+                    .context("Failed to update .git/info/exclude")?;
+                println!("Added .toren.kdl to .git/info/exclude");
+            }
+        } else {
+            println!("Warning: .git/info directory not found, --stealth had no effect");
+        }
+    }
+
     Ok(())
 }
 
