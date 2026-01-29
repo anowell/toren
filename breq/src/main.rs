@@ -133,6 +133,21 @@ enum Commands {
         command: WorkspaceCommands,
     },
 
+    /// Navigate to a workspace directory or run a command in it
+    #[command(visible_alias = "g")]
+    Go {
+        /// Workspace name (e.g. "one", "two") or ancillary reference
+        workspace: String,
+
+        /// Segment to use (defaults to current directory's segment)
+        #[arg(short, long)]
+        segment: Option<String>,
+
+        /// Command to run in the workspace directory (after --)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
+
     /// Initialize .toren.kdl in the current repository
     Init {
         /// Add .toren.kdl to .git/info/exclude instead of committing it
@@ -219,6 +234,11 @@ fn main() -> Result<()> {
             push,
             keep_open,
         } => cmd_complete(&reference, push, keep_open),
+        Commands::Go {
+            workspace,
+            segment,
+            cmd,
+        } => cmd_go(&workspace, segment.as_deref(), cmd),
         Commands::Workspace { command } => match command {
             WorkspaceCommands::Setup => cmd_ws_setup(),
             WorkspaceCommands::Destroy => cmd_ws_destroy(),
@@ -909,6 +929,47 @@ fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf,
     )?;
 
     Ok((segment_path, workspace_path, workspace_name))
+}
+
+fn cmd_go(workspace: &str, segment_name: Option<&str>, cmd: Vec<String>) -> Result<()> {
+    let config = Config::load()?;
+
+    let workspace_root = config
+        .ancillary
+        .workspace_root
+        .clone()
+        .context("workspace_root not configured in toren.toml")?;
+
+    let workspace_mgr = WorkspaceManager::new(workspace_root);
+    let segment_mgr = SegmentManager::new(&config)?;
+    let segment = resolve_segment(&segment_mgr, segment_name)?;
+
+    // Resolve workspace name: could be a word like "one" or an ancillary reference
+    let ws_name = workspace.to_lowercase();
+    let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name);
+
+    if !ws_path.exists() {
+        anyhow::bail!(
+            "Workspace '{}' not found at {}",
+            ws_name,
+            ws_path.display()
+        );
+    }
+
+    let (program, args): (String, Vec<String>) = if cmd.is_empty() {
+        // No command: spawn an interactive shell in the workspace
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        (shell, vec![])
+    } else {
+        (cmd[0].clone(), cmd[1..].to_vec())
+    };
+
+    println!("{}", ws_path.display());
+    let err = Command::new(&program)
+        .args(&args)
+        .current_dir(&ws_path)
+        .exec();
+    Err(err).with_context(|| format!("Failed to exec: {}", program))
 }
 
 fn cmd_ws_setup() -> Result<()> {
