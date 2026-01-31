@@ -1035,10 +1035,22 @@ fn cmd_init(stealth: bool) -> Result<()> {
 
     // Collect setup actions
     let mut copy_entries: Vec<String> = Vec::new();
+    let mut share_entries: Vec<String> = Vec::new();
 
     // Check for .beads directory
     if cwd.join(".beads").exists() {
-        copy_entries.push(".beads".to_string());
+        // If .beads is tracked by VCS, skip it - workspaces will get it from the repo
+        let is_tracked = std::process::Command::new("git")
+            .args(["ls-files", "--error-unmatch", ".beads"])
+            .current_dir(&cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !is_tracked {
+            share_entries.push(".beads".to_string());
+        }
     }
 
     // Discover build artifact directories from .gitignore
@@ -1096,14 +1108,21 @@ fn cmd_init(stealth: bool) -> Result<()> {
 
     // Generate .toren.kdl content
     let mut kdl = String::from("setup {\n");
+    for entry in &share_entries {
+        kdl.push_str(&format!("    share src=\"{}\"\n", entry));
+    }
     for entry in &copy_entries {
         kdl.push_str(&format!("    copy src=\"{}\"\n", entry));
     }
     kdl.push_str("}\n\ndestroy { }\n");
 
+    let total = share_entries.len() + copy_entries.len();
     std::fs::write(&config_path, &kdl).context("Failed to write .toren.kdl")?;
-    println!("Created .toren.kdl with {} copy entries", copy_entries.len());
+    println!("Created .toren.kdl with {} setup entries", total);
 
+    for entry in &share_entries {
+        println!("  share src=\"{}\"", entry);
+    }
     for entry in &copy_entries {
         println!("  copy src=\"{}\"", entry);
     }
