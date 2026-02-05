@@ -17,7 +17,7 @@ build-release:
 
 # Start the Toren daemon (dev mode)
 daemon:
-    cargo run --bin toren-daemon
+    bacon run -- --bin toren-daemon
 
 # Start the web UI (dev mode)
 web:
