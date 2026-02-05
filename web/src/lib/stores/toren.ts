@@ -1,9 +1,13 @@
 import { derived, writable } from 'svelte/store';
 import type {
+	AncillaryWsRequest,
+	AncillaryWsResponse,
 	Ancillary,
 	Assignment,
 	CommandOutput,
+	CreateAssignmentRequest,
 	Segment,
+	WorkEvent,
 	WsRequest,
 	WsResponse,
 } from '$lib/types/toren';
@@ -318,6 +322,40 @@ function createTorenStore() {
 		},
 		selectAncillary(assignment: Assignment | null) {
 			update((state) => ({ ...state, selectedAncillary: assignment }));
+		},
+		async createAssignment(
+			shipUrl: string,
+			request: CreateAssignmentRequest,
+		): Promise<Assignment> {
+			const response = await fetch(`${shipUrl}/api/assignments`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(request),
+			});
+			if (!response.ok) {
+				const data = await response.json().catch(() => ({}));
+				throw new Error(data.error || 'Failed to create assignment');
+			}
+			const data = await response.json();
+			const assignment = data.assignment;
+			// Add to assignments list
+			update((state) => ({
+				...state,
+				assignments: [...state.assignments, assignment],
+			}));
+			return assignment;
+		},
+		async startWork(shipUrl: string, ancillaryId: string, assignmentId: string): Promise<void> {
+			const encoded = encodeURIComponent(ancillaryId);
+			const response = await fetch(`${shipUrl}/api/ancillaries/${encoded}/start`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ assignment_id: assignmentId }),
+			});
+			if (!response.ok) {
+				const data = await response.json().catch(() => ({}));
+				throw new Error(data.error || 'Failed to start work');
+			}
 		},
 	};
 }

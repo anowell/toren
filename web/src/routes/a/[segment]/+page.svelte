@@ -6,6 +6,8 @@ import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
 
 let messageInput = '';
 let showMobilePanel = false;
+let sending = false;
+let sendError: string | null = null;
 
 function goToSegmentSelector() {
 	torenStore.selectSegment(null);
@@ -32,14 +34,38 @@ function navigateToNewAncillary() {
 }
 
 async function handleSendMessage() {
-	if (!messageInput.trim()) return;
+	if (!messageInput.trim() || sending) return;
 
 	const content = messageInput.trim();
+	const segment = $torenStore.selectedSegment?.name;
+	if (!segment) return;
+
+	sending = true;
+	sendError = null;
 	messageInput = '';
 
-	// TODO: Call API to create assignment and get assigned ancillary
-	// Then navigate to /a/<segment>/<unit> with the assigned unit
-	console.log('Send message for new ancillary:', content);
+	try {
+		const shipUrl = $torenStore.shipUrl;
+
+		// 1. Create assignment (creates bead + workspace)
+		const assignment = await torenStore.createAssignment(shipUrl, {
+			prompt: content,
+			segment,
+		});
+
+		// 2. Start the Claude agent work
+		await torenStore.startWork(shipUrl, assignment.ancillary_id, assignment.id);
+
+		// 3. Navigate to the ancillary's chat page
+		const unit = assignment.ancillary_id.split(' ').pop()?.toLowerCase();
+		goto(`/a/${$page.params.segment}/${unit}`);
+	} catch (err) {
+		sendError = err instanceof Error ? err.message : 'Failed to create ancillary';
+		// Restore the message so user can retry
+		messageInput = content;
+	} finally {
+		sending = false;
+	}
 }
 </script>
 
@@ -85,9 +111,18 @@ async function handleSendMessage() {
 	<!-- Messages area -->
 	<div class="chat-messages">
 		<div class="empty-state">
-			<div class="empty-icon">+</div>
-			<h2>New Ancillary</h2>
-			<p>Send a message to start a new task. An ancillary will be assigned automatically.</p>
+			{#if sending}
+				<div class="empty-icon spinning">+</div>
+				<h2>Spinning up ancillary...</h2>
+				<p>Creating workspace and starting agent</p>
+			{:else}
+				<div class="empty-icon">+</div>
+				<h2>New Ancillary</h2>
+				<p>Send a message to start a new task. An ancillary will be assigned automatically.</p>
+				{#if sendError}
+					<p class="error-text">{sendError}</p>
+				{/if}
+			{/if}
 		</div>
 	</div>
 
@@ -119,6 +154,7 @@ async function handleSendMessage() {
 				bind:value={messageInput}
 				placeholder="Describe a task..."
 				rows="1"
+				disabled={sending}
 				on:keydown={(e) => {
 					if (e.key === 'Enter' && !e.shiftKey) {
 						e.preventDefault();
@@ -126,7 +162,7 @@ async function handleSendMessage() {
 					}
 				}}
 			></textarea>
-			<button type="submit" disabled={!messageInput.trim()} aria-label="Send message">
+			<button type="submit" disabled={!messageInput.trim() || sending} aria-label="Send message">
 				<svg
 					xmlns="http://www.w3.org/2000/svg"
 					width="20"
@@ -322,6 +358,24 @@ async function handleSendMessage() {
 		border: 2px dashed var(--color-border);
 		border-radius: 50%;
 		margin-bottom: var(--spacing-md);
+	}
+
+	.empty-icon.spinning {
+		animation: spin 1.5s linear infinite;
+		border-style: solid;
+		border-color: var(--color-primary) transparent transparent transparent;
+	}
+
+	@keyframes spin {
+		to {
+			transform: rotate(360deg);
+		}
+	}
+
+	.error-text {
+		color: var(--color-error);
+		font-size: 0.85rem;
+		margin-top: var(--spacing-sm);
 	}
 
 	.empty-state h2 {

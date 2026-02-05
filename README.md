@@ -36,6 +36,20 @@ workspace_root = "~/.toren/workspaces"
 pool_size = 10
 ```
 
+### Claude Authentication
+
+The daemon spawns Claude Code sessions, which require authentication. Either:
+
+```bash
+# Option A: Claude Max/Pro subscription (OAuth token)
+claude setup-token
+# Then export the token before starting the daemon:
+export CLAUDE_CODE_OAUTH_TOKEN=<token>
+
+# Option B: Anthropic API key
+export ANTHROPIC_API_KEY=<your-key>
+```
+
 ### Basic Workflow
 
 ```bash

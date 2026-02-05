@@ -485,9 +485,9 @@ async fn assignments_create(
     // Generate workspace name from ancillary number word
     let ws_name = toren_lib::number_to_word(ancillary_num).to_lowercase();
 
-    // Create workspace
+    // Create workspace (with setup hooks)
     let ws_path = ws_mgr
-        .create_workspace(&segment_path, &request.segment, &ws_name)
+        .create_workspace_with_setup(&segment_path, &request.segment, &ws_name, Some(ancillary_num))
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
