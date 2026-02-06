@@ -2,23 +2,29 @@
 
 > *"I am Toren. I am continuity."*
 
-Distributed development intelligence - orchestrate Claude Code sessions across workspaces.
+Toren orchestrates AI-assisted development by managing:
+- **Agent sessions** - Claude Code sessions with persistent context
+- **Issues** - Beads for task tracking and handoff
+- **Isolated workspaces** - jj workspaces with per-workspace config, hooks, and copy-on-write content
 
-## Usage
+## Interfaces
 
-### Installation
+Toren provides multiple ways to interact with this functionality:
+
+- **Breq** - CLI using Claude's TUI for interactive sessions
+- **Daemon API** - REST + WebSocket interface using Claude Code SDK
+- **Web** - Browser-based interface connecting to the daemon
+- **Mobile** - Coming soon (tunnels to the daemon)
+
+## Installation
 
 ```bash
 # Install the CLI and daemon
 cargo install --path breq
 cargo install --path daemon
-
-# Or build locally
-cargo build --release
-# Binaries at target/release/breq and target/release/toren-daemon
 ```
 
-### Configuration
+## Configuration
 
 Create `toren.toml` in your project root (or `~/.config/toren/config.toml` for global config):
 
@@ -41,16 +47,14 @@ pool_size = 10
 The daemon spawns Claude Code sessions, which require authentication. Either:
 
 ```bash
-# Option A: Claude Max/Pro subscription (OAuth token)
-claude setup-token
-# Then export the token before starting the daemon:
-export CLAUDE_CODE_OAUTH_TOKEN=<token>
-
-# Option B: Anthropic API key
+# Option A: Anthropic API key
 export ANTHROPIC_API_KEY=<your-key>
+
+# Option B: Claude Max/Pro subscription (OAuth token via `claude setup-token`)
+export CLAUDE_CODE_OAUTH_TOKEN=<token>
 ```
 
-### Basic Workflow
+## Breq Usage
 
 ```bash
 # Start the daemon (optional - for web UI and remote access)
@@ -65,16 +69,40 @@ breq list                          # Show active assignments
 breq resume <ref>                  # Continue work on assignment
 breq approve <ref>                 # Accept completed work
 breq abort <ref>                   # Discard and cleanup
+
+# Navigate to workspaces
+breq go <workspace>                # Spawn shell in workspace
+breq go <workspace> -- <cmd>       # Run command in workspace
 ```
 
-### Workspace Setup Hooks
+## Web Interface
 
-Add a `.toren.kdl` file to your repo root to automate workspace initialization:
+The web UI provides mobile-friendly access to your Toren sessions. Note: significant functionality is still missing.
+
+```bash
+cd web && pnpm install && pnpm dev
+# Open http://localhost:5173
+```
+
+## Workspace Hooks
+
+Toren uses `.toren.kdl` to customize setup and teardown of workspaces. Generate a starter config with:
+
+```bash
+breq init             # Auto-discovers common patterns (.beads, node_modules, target, etc.)
+breq init --stealth   # Same, but adds .toren.kdl to .git/info/exclude
+```
+
+### Manual Configuration
+
+Add a `.toren.kdl` file to your repo root:
 
 ```kdl
 setup {
     template src=".env.breq" dest=".env"
     copy src="config.example.json" dest="config.json"
+    copy src="node_modules"
+    share src=".beads"
     run "pnpm install"
     run "just migrate"
 }
@@ -86,8 +114,11 @@ destroy {
 
 **Actions:**
 - `template src="..." dest="..."` - Copy and render with workspace context
-- `copy src="..." dest="..."` - Copy file verbatim
+- `copy src="..." [dest="..."]` - Copy file/directory using CoW when available
+- `share src="..."` - Symlink to shared content (e.g., `.beads` directory)
 - `run "command"` - Execute shell command
+
+For `copy`, `dest` defaults to `src` (or basename if `src` is absolute).
 
 **Template variables:**
 ```
@@ -104,70 +135,9 @@ PORT={{ 5173 + ws.num }}
 DATABASE_URL=postgres://localhost/myapp_{{ ws.name }}
 ```
 
-**Manual execution:**
-```bash
-breq ws setup     # Run setup in current workspace
-breq ws destroy   # Run destroy in current workspace
-```
-
-### Web Interface
-
-The web UI provides mobile-friendly access to your Toren sessions:
-
-```bash
-cd web && pnpm install && pnpm dev
-# Open http://localhost:5173
-```
-
-## Developer Setup
-
-### Prerequisites
-
-- Rust toolchain (`rustup`)
-- Node.js and pnpm (for web UI)
-- jj (Jujutsu VCS)
-
-### Setup
-
-```bash
-git clone <repo> && cd toren
-cargo build
-cd web && pnpm install
-```
-
-### Development Commands
-
-```bash
-# Run the daemon (with hot reload via cargo)
-just daemon
-
-# Run the web UI (Vite dev server)
-just web
-
-# Run the CLI during development
-cargo run --bin breq -- <args>
-# Or after building:
-just cli <args>
-```
-
-### Project Structure
-
-```
-toren/
-├── breq/           # CLI for assignment management
-├── daemon/         # Rust daemon (Axum + WebSocket)
-├── lib/            # Shared library (toren-lib)
-├── web/            # SvelteKit web interface
-├── docs/           # Architecture documentation
-└── examples/       # Sample segments
-```
-
 ## Documentation
 
 - [docs/CONCEPTS.md](docs/CONCEPTS.md) - Naming and metaphor
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Technical design
 - [docs/SEGMENTS.md](docs/SEGMENTS.md) - Segment configuration
 
-## License
-
-MIT

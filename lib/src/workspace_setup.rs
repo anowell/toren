@@ -18,6 +18,19 @@ use tracing::{debug, info, trace, warn};
 
 const TOREN_CONFIG_FILE: &str = ".toren.kdl";
 
+/// Derive default dest from src: if src is relative, use it as-is; if absolute, use basename.
+fn default_dest(src: &str) -> String {
+    let path = Path::new(src);
+    if path.is_absolute() {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(src)
+            .to_string()
+    } else {
+        src.to_string()
+    }
+}
+
 /// Workspace context available to templates
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceContext {
@@ -150,8 +163,8 @@ impl BreqConfig {
                     .get("from")
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
-                // dest defaults to src if not specified
-                let dest = dest.unwrap_or_else(|| src.clone());
+                // dest defaults to src if relative, or basename of src if absolute
+                let dest = dest.unwrap_or_else(|| default_dest(&src));
                 Ok(Action::Copy { src, dest, from })
             }
             "share" => {
@@ -563,6 +576,36 @@ setup {
             Action::Copy { src, dest, from } => {
                 assert_eq!(src, "config.json");
                 assert_eq!(dest, "config.json");
+                assert!(from.is_none());
+            }
+            _ => panic!("Expected Copy action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_kdl_copy_absolute_src() {
+        let content = r#"
+setup {
+    copy src="/some/path/to/node_modules"
+    copy src="relative/path"
+}
+"#;
+
+        let config = BreqConfig::parse_kdl(content).unwrap();
+
+        assert_eq!(config.setup.len(), 2);
+        match &config.setup[0] {
+            Action::Copy { src, dest, from } => {
+                assert_eq!(src, "/some/path/to/node_modules");
+                assert_eq!(dest, "node_modules"); // basename for absolute paths
+                assert!(from.is_none());
+            }
+            _ => panic!("Expected Copy action"),
+        }
+        match &config.setup[1] {
+            Action::Copy { src, dest, from } => {
+                assert_eq!(src, "relative/path");
+                assert_eq!(dest, "relative/path"); // relative paths preserved
                 assert!(from.is_none());
             }
             _ => panic!("Expected Copy action"),
