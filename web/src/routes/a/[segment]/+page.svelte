@@ -576,6 +576,10 @@ async function handleSendMessage() {
 		gap: var(--spacing-sm);
 	}
 
+	.mobile-item.selected .item-main {
+		color: var(--color-primary);
+	}
+
 	.item-name {
 		font-weight: 500;
 		color: var(--color-text);
