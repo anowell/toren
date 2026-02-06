@@ -3,6 +3,7 @@ import { page } from '$app/stores';
 import { goto } from '$app/navigation';
 import { onDestroy, afterUpdate, tick } from 'svelte';
 import { torenStore, segmentAssignments } from '$lib/stores/toren';
+import { connectionStore } from '$lib/stores/connection';
 import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
 import type { AncillaryWsResponse, WorkEvent, WorkOp } from '$lib/types/toren';
 
@@ -31,8 +32,9 @@ $: currentAssignment = $segmentAssignments.find((a) => {
 // Build the ancillary ID for WebSocket connection
 $: ancillaryId = currentAssignment?.ancillary_id ?? null;
 
-// Connect/reconnect when ancillary changes
-$: if (ancillaryId) {
+// Connect/reconnect when ancillary changes or auth state changes
+// Gate on authenticated — only open ancillary WS when main connection is up
+$: if (ancillaryId && $torenStore.authenticated) {
 	connectToAncillary(ancillaryId);
 } else {
 	disconnectAncillary();

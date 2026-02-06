@@ -1,5 +1,6 @@
 <script lang="ts">
 import { client, torenStore } from '$lib/stores/toren';
+import { connectionStore } from '$lib/stores/connection';
 
 let pairingToken = '';
 let shipUrl = 'http://localhost:8787';
@@ -11,7 +12,7 @@ async function handlePair() {
 	pairing = true;
 
 	try {
-		// First, call the /pair REST endpoint
+		// Call the /pair REST endpoint
 		const response = await fetch(`${shipUrl}/pair`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
@@ -24,23 +25,23 @@ async function handlePair() {
 
 		const data = await response.json();
 
-		// Update store with ship URL
-		torenStore.update((state) => ({
-			...state,
-			shipUrl,
-			sessionToken: data.session_token,
-		}));
-
-		// Connect WebSocket
-		torenStore.update((state) => ({ ...state, connecting: true }));
-		await client.connect(shipUrl);
-
-		// Authenticate
-		await client.authenticate(data.session_token);
-
-		// Store session token in localStorage
+		// Store credentials and let the root layout's ConnectionManager handle the rest.
+		// We set the token/url in localStorage directly, then trigger a connect.
 		localStorage.setItem('toren_session_token', data.session_token);
 		localStorage.setItem('toren_ship_url', shipUrl);
+
+		// Connect WebSocket + authenticate through the ConnectionManager path
+		torenStore.update((state) => ({ ...state, shipUrl, connecting: true }));
+		await client.connect(shipUrl);
+		await client.authenticate(data.session_token);
+
+		torenStore.update((state) => ({
+			...state,
+			authenticated: true,
+			sessionToken: data.session_token,
+			connected: true,
+			connecting: false,
+		}));
 
 		// Load segments and assignments
 		await Promise.all([
@@ -65,44 +66,9 @@ async function handlePair() {
 		pairing = false;
 	}
 }
-
-// Try to auto-connect with stored credentials
-$: if (typeof window !== 'undefined') {
-	const storedToken = localStorage.getItem('toren_session_token');
-	const storedUrl = localStorage.getItem('toren_ship_url');
-
-	if (storedToken && storedUrl && !$torenStore.connected && !$torenStore.connecting) {
-		shipUrl = storedUrl;
-		client
-			.connect(storedUrl)
-			.then(() => client.authenticate(storedToken))
-			.then(() => Promise.all([
-				torenStore.loadSegments(storedUrl),
-				torenStore.loadAssignments(storedUrl),
-			]))
-			.then(() => {
-				// Restore selected segment
-				const savedSegment = localStorage.getItem('toren_selected_segment');
-				if (savedSegment) {
-					try {
-						const segment = JSON.parse(savedSegment);
-						torenStore.selectSegment(segment);
-					} catch (e) {
-						console.error('Failed to restore selected segment:', e);
-					}
-				}
-			})
-			.catch((err) => {
-				console.log('Auto-connect failed:', err);
-				// Clear stored credentials
-				localStorage.removeItem('toren_session_token');
-				localStorage.removeItem('toren_ship_url');
-			});
-	}
-}
 </script>
 
-{#if !$torenStore.authenticated && !$torenStore.connecting}
+{#if !$torenStore.authenticated && !$torenStore.connecting && $connectionStore.phase === 'idle'}
 	<div class="modal-overlay">
 		<div class="modal">
 			<h2>Connect to Toren</h2>

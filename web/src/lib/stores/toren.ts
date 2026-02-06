@@ -40,9 +40,6 @@ export interface ChatMessage {
 
 class TorenClient {
 	private ws: WebSocket | null = null;
-	private reconnectAttempts = 0;
-	private maxReconnectAttempts = 5;
-	private reconnectDelay = 1000;
 
 	constructor() {}
 
@@ -61,7 +58,6 @@ class TorenClient {
 						connecting: false,
 						error: null,
 					}));
-					this.reconnectAttempts = 0;
 					resolve();
 				};
 
@@ -91,17 +87,7 @@ class TorenClient {
 						connected: false,
 						authenticated: false,
 					}));
-
-					// Attempt reconnect
-					if (this.reconnectAttempts < this.maxReconnectAttempts) {
-						this.reconnectAttempts++;
-						const delay = this.reconnectDelay * this.reconnectAttempts;
-						console.log(`Reconnecting in ${delay}ms...`);
-						setTimeout(() => {
-							const state = torenStore.get();
-							this.connect(state.shipUrl);
-						}, delay);
-					}
+					// Reconnect is handled by ConnectionManager via notifyDisconnect()
 				};
 			} catch (error) {
 				torenStore.update((state) => ({

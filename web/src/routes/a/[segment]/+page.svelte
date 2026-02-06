@@ -2,6 +2,7 @@
 import { page } from '$app/stores';
 import { goto } from '$app/navigation';
 import { torenStore, segmentAssignments } from '$lib/stores/toren';
+import { connectionStore } from '$lib/stores/connection';
 import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
 
 let messageInput = '';
@@ -82,8 +83,16 @@ async function handleSendMessage() {
 		</div>
 		<div class="header-right">
 			<div class="status">
-				<span class="status-dot" class:connected={$torenStore.connected}></span>
-				<span class="status-text">{$torenStore.connected ? 'Connected' : 'Disconnected'}</span>
+				<span
+					class="status-dot"
+					class:connected={$connectionStore.phase === 'connected'}
+					class:reconnecting={$connectionStore.phase === 'connecting' || $connectionStore.phase === 'authenticating'}
+				></span>
+				<span class="status-text">
+					{#if $connectionStore.phase === 'connected'}Connected
+					{:else if $connectionStore.phase === 'connecting' || $connectionStore.phase === 'authenticating'}Reconnecting...
+					{:else}Disconnected{/if}
+				</span>
 			</div>
 		</div>
 	</header>
@@ -301,6 +310,10 @@ async function handleSendMessage() {
 
 	.status-dot.connected {
 		background: var(--color-success);
+	}
+
+	.status-dot.reconnecting {
+		background: var(--color-warning);
 	}
 
 	.status-text {
