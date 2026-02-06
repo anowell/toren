@@ -15,6 +15,7 @@ onMount(() => {
 		await Promise.all([
 			torenStore.loadSegments(state.shipUrl),
 			torenStore.loadAssignments(state.shipUrl),
+			torenStore.loadAncillaries(state.shipUrl),
 		]);
 
 		// Restore selected segment from localStorage
@@ -27,6 +28,14 @@ onMount(() => {
 				console.error('Failed to restore selected segment:', e);
 			}
 		}
+	};
+
+	manager.onHeartbeat = async () => {
+		const state = $torenStore;
+		await Promise.all([
+			torenStore.loadAncillaries(state.shipUrl),
+			torenStore.loadAssignments(state.shipUrl),
+		]);
 	};
 
 	manager.init();

@@ -70,6 +70,9 @@ export class ConnectionManager {
 	/** Callback invoked after a successful connect+auth cycle (used to reload data) */
 	onConnected: (() => Promise<void>) | null = null;
 
+	/** Callback invoked after each successful heartbeat (used to refresh data) */
+	onHeartbeat: (() => Promise<void>) | null = null;
+
 	constructor(deps?: Partial<ConnectionManagerDeps>) {
 		this.deps = { ...defaultDeps, ...deps };
 	}
@@ -252,6 +255,13 @@ export class ConnectionManager {
 		try {
 			const resp = await this.deps.fetch(`${shipUrl}/health`, { signal: AbortSignal.timeout(5000) });
 			if (!resp.ok) throw new Error(`Health check returned ${resp.status}`);
+
+			if (this.destroyed) return;
+
+			// Refresh data on successful heartbeat
+			if (this.onHeartbeat) {
+				await this.onHeartbeat();
+			}
 
 			if (this.destroyed) return;
 			// Schedule next tick

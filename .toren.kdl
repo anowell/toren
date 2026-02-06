@@ -1,8 +1,8 @@
 setup {
     // template src=".env.breq" dest=".env"
-    copy src=".beads" dest=".beads"
-    copy src="target" dest="target"
-    copy src="web/node_modules" dest="web/node_modules"
+    share src=".beads"
+    copy src="target"
+    copy src="web/node_modules"
     // run "pnpm install" cwd="web"
     // run "just migrate"
 }

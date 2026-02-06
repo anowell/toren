@@ -49,6 +49,7 @@ vi.mock('./toren', async () => {
 		reset: () => set({ ...initialState }),
 		loadSegments: vi.fn().mockResolvedValue(undefined),
 		loadAssignments: vi.fn().mockResolvedValue(undefined),
+		loadAncillaries: vi.fn().mockResolvedValue(undefined),
 		selectSegment: vi.fn(),
 	};
 
@@ -552,6 +553,54 @@ describe('ConnectionManager', () => {
 		});
 
 		expect(state().attempt).toBe(0);
+	});
+
+	// ── Test: Heartbeat triggers onHeartbeat callback ───────────────
+
+	it('calls onHeartbeat after successful health check', async () => {
+		const storage = createMockStorage({
+			toren_session_token: 'tok-123',
+			toren_ship_url: 'http://localhost:8787',
+		});
+
+		vi.mocked(client.connect).mockImplementation(async () => {
+			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+		});
+		vi.mocked(client.authenticate).mockResolvedValue(undefined);
+
+		// Capture the setTimeout callback for the heartbeat
+		const timeoutCallbacks: Array<{ fn: () => void; ms: number }> = [];
+		const mockSetTimeout = vi.fn((fn: () => void, ms: number) => {
+			const id = timeoutCallbacks.length;
+			timeoutCallbacks.push({ fn, ms });
+			return id as any;
+		});
+
+		const mockFetch = vi.fn().mockResolvedValue({ ok: true } as Response);
+		const onHeartbeat = vi.fn().mockResolvedValue(undefined);
+
+		const deps = createTestDeps({
+			storage,
+			setTimeout: mockSetTimeout,
+			fetch: mockFetch,
+		});
+		mgr = new ConnectionManager(deps);
+		mgr.onConnected = vi.fn().mockResolvedValue(undefined);
+		mgr.onHeartbeat = onHeartbeat;
+		mgr.init();
+
+		await vi.waitFor(() => {
+			expect(phase()).toBe('connected');
+		});
+
+		// Find and fire the heartbeat timeout
+		const heartbeatEntry = timeoutCallbacks.find((e) => e.ms === HEARTBEAT_INTERVAL_MS);
+		expect(heartbeatEntry).toBeDefined();
+		heartbeatEntry!.fn();
+
+		await vi.waitFor(() => {
+			expect(onHeartbeat).toHaveBeenCalledTimes(1);
+		});
 	});
 
 	// ── Additional: destroy stops everything ───────────────────────
