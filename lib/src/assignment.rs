@@ -51,6 +51,9 @@ pub struct Assignment {
     pub created_at: String,
     /// When the assignment was last updated (RFC 3339)
     pub updated_at: String,
+    /// Title of the associated bead (for display purposes)
+    #[serde(default)]
+    pub bead_title: Option<String>,
 }
 
 /// Number words for ancillary naming (One through Twenty)
@@ -220,6 +223,7 @@ impl AssignmentManager {
         bead_id: &str,
         segment: &str,
         workspace_path: PathBuf,
+        bead_title: Option<String>,
     ) -> Result<Assignment> {
         let now = chrono::Utc::now().to_rfc3339();
         let id = uuid::Uuid::new_v4().to_string();
@@ -234,6 +238,7 @@ impl AssignmentManager {
             status: AssignmentStatus::Pending,
             created_at: now.clone(),
             updated_at: now,
+            bead_title,
         };
 
         self.assignments.insert(assignment.id.clone(), assignment.clone());
@@ -251,6 +256,7 @@ impl AssignmentManager {
         original_prompt: &str,
         segment: &str,
         workspace_path: PathBuf,
+        bead_title: Option<String>,
     ) -> Result<Assignment> {
         let now = chrono::Utc::now().to_rfc3339();
         let id = uuid::Uuid::new_v4().to_string();
@@ -267,6 +273,7 @@ impl AssignmentManager {
             status: AssignmentStatus::Pending,
             created_at: now.clone(),
             updated_at: now,
+            bead_title,
         };
 
         self.assignments.insert(assignment.id.clone(), assignment.clone());

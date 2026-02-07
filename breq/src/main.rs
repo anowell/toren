@@ -352,9 +352,10 @@ fn cmd_assign(
             prompt_text,
             &segment.name,
             ws_path.clone(),
+            Some(task_title.clone()),
         )?;
     } else {
-        assignment_mgr.create_from_bead(&ancillary_id, &bead_id, &segment.name, ws_path.clone())?;
+        assignment_mgr.create_from_bead(&ancillary_id, &bead_id, &segment.name, ws_path.clone(), Some(task_title.clone()))?;
     }
 
     // Build prompt for Claude

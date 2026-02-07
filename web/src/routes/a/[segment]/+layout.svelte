@@ -1,7 +1,8 @@
 <script lang="ts">
 import { page } from '$app/stores';
 import { goto } from '$app/navigation';
-import { torenStore, segmentAssignments } from '$lib/stores/toren';
+import { torenStore, segmentAssignments, getAncillaryDisplayStatus, getBeadDisplayStatus, stripBeadPrefix } from '$lib/stores/toren';
+import BeadStatusIcon from '$lib/components/BeadStatusIcon.svelte';
 
 // Load assignments when authenticated
 let assignmentsLoaded = false;
@@ -38,6 +39,12 @@ function navigateToAncillary(ancillaryId: string) {
 
 function navigateToNewAncillary() {
 	goto(`/a/${$page.params.segment}`);
+}
+
+function lookupAncillaryDisplayStatus(ancillaryId: string): 'busy' | 'ready' {
+	const ancillary = $torenStore.ancillaries.find((a) => a.id === ancillaryId);
+	if (!ancillary) return 'ready';
+	return getAncillaryDisplayStatus(ancillary.status);
 }
 </script>
 
@@ -79,19 +86,20 @@ function navigateToNewAncillary() {
 
 			{#each $segmentAssignments as assignment (assignment.id)}
 				{@const unitName = assignment.ancillary_id.split(' ').pop()?.toLowerCase()}
+				{@const displayStatus = lookupAncillaryDisplayStatus(assignment.ancillary_id)}
+				{@const beadStatus = getBeadDisplayStatus(assignment.status)}
 				<button
 					class="ancillary-card"
 					class:selected={currentUnit === unitName}
 					on:click={() => navigateToAncillary(assignment.ancillary_id)}
 				>
 					<div class="card-header">
+						<span class="ancillary-status-dot" class:busy={displayStatus === 'busy'} class:ready={displayStatus === 'ready'}></span>
 						<span class="ancillary-name">{assignment.ancillary_id}</span>
-						<span class="status-badge status-{assignment.status}">
-							{assignment.status}
-						</span>
 					</div>
 					<div class="card-body">
-						<span class="bead-id">{assignment.bead_id}</span>
+						<BeadStatusIcon status={beadStatus} />
+						<span class="bead-label">{stripBeadPrefix(assignment.bead_id)}{#if assignment.bead_title}: {assignment.bead_title}{/if}</span>
 					</div>
 				</button>
 			{/each}
@@ -200,8 +208,22 @@ function navigateToNewAncillary() {
 	.card-header {
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
 		gap: var(--spacing-sm);
+	}
+
+	.ancillary-status-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		flex-shrink: 0;
+	}
+
+	.ancillary-status-dot.ready {
+		background: var(--color-success);
+	}
+
+	.ancillary-status-dot.busy {
+		background: var(--color-warning);
 	}
 
 	.ancillary-name {
@@ -210,43 +232,19 @@ function navigateToNewAncillary() {
 		font-size: 0.9rem;
 	}
 
-	.status-badge {
-		padding: 2px 6px;
-		border-radius: var(--radius-sm);
-		font-size: 0.65rem;
-		font-weight: 600;
-		text-transform: uppercase;
-	}
-
-	.status-pending {
-		background: var(--color-warning);
-		color: var(--color-bg);
-	}
-
-	.status-active {
-		background: var(--color-success);
-		color: var(--color-bg);
-	}
-
-	.status-completed {
-		background: var(--color-primary);
-		color: white;
-	}
-
-	.status-aborted {
-		background: var(--color-error);
-		color: white;
-	}
-
 	.card-body {
 		display: flex;
 		align-items: center;
+		gap: var(--spacing-xs);
+		color: var(--color-text-secondary);
 	}
 
-	.bead-id {
+	.bead-label {
 		font-size: 0.8rem;
 		color: var(--color-text-secondary);
-		font-family: var(--font-mono);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.main-content {

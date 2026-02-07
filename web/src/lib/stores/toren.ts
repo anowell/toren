@@ -3,7 +3,11 @@ import type {
 	AncillaryWsRequest,
 	AncillaryWsResponse,
 	Ancillary,
+	AncillaryDisplayStatus,
+	AncillaryStatus,
 	Assignment,
+	AssignmentStatus,
+	BeadDisplayStatus,
 	CommandOutput,
 	CreateAssignmentRequest,
 	Segment,
@@ -207,6 +211,30 @@ class TorenClient {
 // Create singleton instance
 export const client = new TorenClient();
 
+// Status mapping helpers
+const BUSY_STATUSES: Set<AncillaryStatus> = new Set(['starting', 'working', 'executing']);
+
+export function getAncillaryDisplayStatus(status: AncillaryStatus): AncillaryDisplayStatus {
+	return BUSY_STATUSES.has(status) ? 'busy' : 'ready';
+}
+
+export function stripBeadPrefix(beadId: string): string {
+	const idx = beadId.indexOf('-');
+	return idx >= 0 ? beadId.slice(idx + 1) : beadId;
+}
+
+export function getBeadDisplayStatus(status: AssignmentStatus): BeadDisplayStatus {
+	switch (status) {
+		case 'pending':
+			return 'open';
+		case 'active':
+			return 'in_progress';
+		case 'completed':
+		case 'aborted':
+			return 'closed';
+	}
+}
+
 // Create the store with a custom store that includes helper methods
 function createTorenStore() {
 	const initialState: TorenState = {
@@ -304,6 +332,19 @@ function createTorenStore() {
 					...state,
 					loadingAssignments: false,
 				}));
+			}
+		},
+		async loadAncillaries(shipUrl: string) {
+			try {
+				const response = await fetch(`${shipUrl}/api/ancillaries/list`);
+				if (!response.ok) throw new Error('Failed to fetch ancillaries');
+				const data = await response.json();
+				update((state) => ({
+					...state,
+					ancillaries: data.ancillaries ?? [],
+				}));
+			} catch (error) {
+				console.error('Failed to load ancillaries:', error);
 			}
 		},
 		selectAncillary(assignment: Assignment | null) {

@@ -17,10 +17,25 @@ export interface VcsStatus {
 	deleted: string[];
 }
 
+export type AncillaryStatus =
+	| 'idle'
+	| 'starting'
+	| 'working'
+	| 'awaiting_input'
+	| 'completed'
+	| 'failed'
+	| 'connected'
+	| 'executing'
+	| 'disconnected';
+
+export type AncillaryDisplayStatus = 'busy' | 'ready';
+
+export type BeadDisplayStatus = 'open' | 'in_progress' | 'closed';
+
 export interface Ancillary {
 	id: string;
 	segment: string;
-	status: 'Idle' | 'Thinking' | 'Executing';
+	status: AncillaryStatus;
 	last_active: string;
 }
 
@@ -41,6 +56,7 @@ export interface Assignment {
 	status: AssignmentStatus;
 	created_at: string;
 	updated_at: string;
+	bead_title?: string;
 }
 
 export interface Segment {

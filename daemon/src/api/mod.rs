@@ -440,7 +440,7 @@ async fn assignments_create(
     let mut assignments = state.assignments.write().await;
 
     // Determine bead ID - either from existing or create from prompt
-    let (bead_id, original_prompt) = if let Some(ref prompt) = request.prompt {
+    let (bead_id, original_prompt, bead_title) = if let Some(ref prompt) = request.prompt {
         // Create bead from prompt
         let title = request.title.clone().unwrap_or_else(|| {
             prompt.lines().next().unwrap_or(prompt).chars().take(80).collect()
@@ -459,7 +459,7 @@ async fn assignments_create(
             )
         })?;
 
-        (new_bead_id, Some(prompt.clone()))
+        (new_bead_id, Some(prompt.clone()), Some(title))
     } else if let Some(bead_id) = request.bead_id.clone() {
         // Claim existing bead
         toren_lib::tasks::beads::claim_bead(&bead_id, "claude", &segment_path).map_err(|e| {
@@ -469,7 +469,12 @@ async fn assignments_create(
             )
         })?;
 
-        (bead_id, None)
+        // Fetch bead title for display
+        let title = toren_lib::tasks::beads::fetch_bead(&bead_id, &segment_path)
+            .ok()
+            .map(|t| t.title);
+
+        (bead_id, None, title)
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -498,7 +503,7 @@ async fn assignments_create(
     // Create assignment
     let assignment = if let Some(prompt) = original_prompt {
         assignments
-            .create_from_prompt(&ancillary_id, &bead_id, &prompt, &request.segment, ws_path)
+            .create_from_prompt(&ancillary_id, &bead_id, &prompt, &request.segment, ws_path, bead_title)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -507,7 +512,7 @@ async fn assignments_create(
             })?
     } else {
         assignments
-            .create_from_bead(&ancillary_id, &bead_id, &request.segment, ws_path)
+            .create_from_bead(&ancillary_id, &bead_id, &request.segment, ws_path, bead_title)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,

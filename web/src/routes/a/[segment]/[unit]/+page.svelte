@@ -2,7 +2,8 @@
 import { page } from '$app/stores';
 import { goto } from '$app/navigation';
 import { onDestroy, afterUpdate, tick } from 'svelte';
-import { torenStore, segmentAssignments } from '$lib/stores/toren';
+import { torenStore, segmentAssignments, getAncillaryDisplayStatus, getBeadDisplayStatus, stripBeadPrefix } from '$lib/stores/toren';
+import BeadStatusIcon from '$lib/components/BeadStatusIcon.svelte';
 import { connectionStore } from '$lib/stores/connection';
 import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
 import type { AncillaryWsResponse, WorkEvent, WorkOp } from '$lib/types/toren';
@@ -31,6 +32,17 @@ $: currentAssignment = $segmentAssignments.find((a) => {
 
 // Build the ancillary ID for WebSocket connection
 $: ancillaryId = currentAssignment?.ancillary_id ?? null;
+
+// Look up polled ancillary display status
+$: ancillaryDisplayStatus = (() => {
+	if (!ancillaryId) return 'ready' as const;
+	const ancillary = $torenStore.ancillaries.find((a) => a.id === ancillaryId);
+	if (!ancillary) return 'ready' as const;
+	return getAncillaryDisplayStatus(ancillary.status);
+})();
+
+// Bead display status
+$: beadDisplayStatus = currentAssignment ? getBeadDisplayStatus(currentAssignment.status) : null;
 
 // Connect/reconnect when ancillary changes or auth state changes
 // Gate on authenticated — only open ancillary WS when main connection is up
@@ -157,6 +169,12 @@ function capitalizeUnit(unit: string): string {
 	return unit.charAt(0).toUpperCase() + unit.slice(1);
 }
 
+function lookupAncillaryDisplayStatus(ancillaryId: string): 'busy' | 'ready' {
+	const ancillary = $torenStore.ancillaries.find((a) => a.id === ancillaryId);
+	if (!ancillary) return 'ready';
+	return getAncillaryDisplayStatus(ancillary.status);
+}
+
 // Group consecutive events into display items
 interface DisplayItem {
 	type: 'assistant' | 'user' | 'tool' | 'status' | 'error';
@@ -255,8 +273,16 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 				</button>
 			{/if}
 			<div class="status">
-				<span class="status-dot" class:connected={isWorking} class:done={isDone}></span>
-				<span class="status-text">{workStatus}</span>
+				<span
+					class="status-dot"
+					class:connected={$connectionStore.phase === 'connected'}
+					class:reconnecting={$connectionStore.phase === 'connecting' || $connectionStore.phase === 'authenticating'}
+				></span>
+				<span class="status-text">
+					{#if $connectionStore.phase === 'connected'}Connected
+					{:else if $connectionStore.phase === 'connecting' || $connectionStore.phase === 'authenticating'}Reconnecting...
+					{:else}Disconnected{/if}
+				</span>
 			</div>
 		</div>
 	</header>
@@ -266,8 +292,13 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 		<div class="ancillary-indicator">
 			<span class="ancillary-name">{currentAssignment.ancillary_id}</span>
 			<span class="separator">·</span>
-			<span class="bead-id">{currentAssignment.bead_id}</span>
-			<span class="status-badge status-{currentAssignment.status}">{currentAssignment.status}</span>
+			{#if beadDisplayStatus}
+				<BeadStatusIcon status={beadDisplayStatus} />
+			{/if}
+			<span class="bead-label">{stripBeadPrefix(currentAssignment.bead_id)}{#if currentAssignment.bead_title}: {currentAssignment.bead_title}{/if}</span>
+			<span class="ancillary-display-badge" class:busy={ancillaryDisplayStatus === 'busy'} class:ready={ancillaryDisplayStatus === 'ready'}>
+				{ancillaryDisplayStatus}
+			</span>
 		</div>
 	{:else}
 		<div class="ancillary-indicator not-found">
@@ -428,16 +459,18 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 
 				{#each $segmentAssignments as assignment (assignment.id)}
 					{@const unitName = assignment.ancillary_id.split(' ').pop()?.toLowerCase()}
+					{@const displayStatus = lookupAncillaryDisplayStatus(assignment.ancillary_id)}
+					{@const beadStatus = getBeadDisplayStatus(assignment.status)}
 					<button
 						class="mobile-item"
 						class:selected={unitName === $page.params.unit?.toLowerCase()}
 						on:click={() => navigateToAncillary(assignment.ancillary_id)}
 					>
 						<div class="item-main">
+							<span class="ancillary-status-dot" class:busy={displayStatus === 'busy'} class:ready={displayStatus === 'ready'}></span>
 							<span class="item-name">{assignment.ancillary_id}</span>
-							<span class="item-status status-{assignment.status}">{assignment.status}</span>
 						</div>
-						<span class="item-bead">{assignment.bead_id}</span>
+						<span class="item-bead"><BeadStatusIcon status={beadStatus} /> {stripBeadPrefix(assignment.bead_id)}{#if assignment.bead_title}: {assignment.bead_title}{/if}</span>
 					</button>
 				{/each}
 			</div>
@@ -525,8 +558,8 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 		background: var(--color-success);
 	}
 
-	.status-dot.done {
-		background: var(--color-primary);
+	.status-dot.reconnecting {
+		background: var(--color-warning);
 	}
 
 	.status-text {
@@ -559,38 +592,31 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 		color: var(--color-text-secondary);
 	}
 
-	.bead-id {
-		font-family: var(--font-mono);
+	.bead-label {
 		color: var(--color-text-secondary);
+		font-size: 0.8rem;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
-	.status-badge {
+	.ancillary-display-badge {
 		margin-left: auto;
-		padding: 2px 6px;
+		padding: 2px 8px;
 		border-radius: var(--radius-sm);
 		font-size: 0.7rem;
 		font-weight: 600;
 		text-transform: uppercase;
 	}
 
-	.status-pending {
+	.ancillary-display-badge.busy {
 		background: var(--color-warning);
 		color: var(--color-bg);
 	}
 
-	.status-active {
+	.ancillary-display-badge.ready {
 		background: var(--color-success);
 		color: var(--color-bg);
-	}
-
-	.status-completed {
-		background: var(--color-primary);
-		color: white;
-	}
-
-	.status-aborted {
-		background: var(--color-error);
-		color: white;
 	}
 
 	.ancillary-indicator .hint {
@@ -920,28 +946,24 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 		gap: var(--spacing-sm);
 	}
 
+	.ancillary-status-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		flex-shrink: 0;
+	}
+
+	.ancillary-status-dot.ready {
+		background: var(--color-success);
+	}
+
+	.ancillary-status-dot.busy {
+		background: var(--color-warning);
+	}
+
 	.item-name {
 		font-weight: 500;
 		color: var(--color-text);
-	}
-
-	.item-status {
-		margin-left: auto;
-		padding: 2px 6px;
-		border-radius: var(--radius-sm);
-		font-size: 0.7rem;
-		font-weight: 600;
-		text-transform: uppercase;
-	}
-
-	.item-status.status-pending {
-		background: var(--color-warning);
-		color: var(--color-bg);
-	}
-
-	.item-status.status-active {
-		background: var(--color-success);
-		color: var(--color-bg);
 	}
 
 	.item-bead {

@@ -1,7 +1,8 @@
 <script lang="ts">
 import { page } from '$app/stores';
 import { goto } from '$app/navigation';
-import { torenStore, segmentAssignments } from '$lib/stores/toren';
+import { torenStore, segmentAssignments, getAncillaryDisplayStatus, getBeadDisplayStatus, stripBeadPrefix } from '$lib/stores/toren';
+import BeadStatusIcon from '$lib/components/BeadStatusIcon.svelte';
 import { connectionStore } from '$lib/stores/connection';
 import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
 
@@ -32,6 +33,12 @@ function navigateToAncillary(ancillaryId: string) {
 
 function navigateToNewAncillary() {
 	closeMobilePanel();
+}
+
+function lookupAncillaryDisplayStatus(ancillaryId: string): 'busy' | 'ready' {
+	const ancillary = $torenStore.ancillaries.find((a) => a.id === ancillaryId);
+	if (!ancillary) return 'ready';
+	return getAncillaryDisplayStatus(ancillary.status);
 }
 
 async function handleSendMessage() {
@@ -238,12 +245,14 @@ async function handleSendMessage() {
 				</button>
 
 				{#each $segmentAssignments as assignment (assignment.id)}
+					{@const displayStatus = lookupAncillaryDisplayStatus(assignment.ancillary_id)}
+					{@const beadStatus = getBeadDisplayStatus(assignment.status)}
 					<button class="mobile-item" on:click={() => navigateToAncillary(assignment.ancillary_id)}>
 						<div class="item-main">
+							<span class="ancillary-status-dot" class:busy={displayStatus === 'busy'} class:ready={displayStatus === 'ready'}></span>
 							<span class="item-name">{assignment.ancillary_id}</span>
-							<span class="item-status status-{assignment.status}">{assignment.status}</span>
 						</div>
-						<span class="item-bead">{assignment.bead_id}</span>
+						<span class="item-bead"><BeadStatusIcon status={beadStatus} /> {stripBeadPrefix(assignment.bead_id)}{#if assignment.bead_title}: {assignment.bead_title}{/if}</span>
 					</button>
 				{/each}
 			</div>
@@ -594,28 +603,24 @@ async function handleSendMessage() {
 		color: var(--color-primary);
 	}
 
+	.ancillary-status-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		flex-shrink: 0;
+	}
+
+	.ancillary-status-dot.ready {
+		background: var(--color-success);
+	}
+
+	.ancillary-status-dot.busy {
+		background: var(--color-warning);
+	}
+
 	.item-name {
 		font-weight: 500;
 		color: var(--color-text);
-	}
-
-	.item-status {
-		margin-left: auto;
-		padding: 2px 6px;
-		border-radius: var(--radius-sm);
-		font-size: 0.7rem;
-		font-weight: 600;
-		text-transform: uppercase;
-	}
-
-	.item-status.status-pending {
-		background: var(--color-warning);
-		color: var(--color-bg);
-	}
-
-	.item-status.status-active {
-		background: var(--color-success);
-		color: var(--color-bg);
 	}
 
 	.item-bead {
