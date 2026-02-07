@@ -57,6 +57,7 @@ export interface Assignment {
 	created_at: string;
 	updated_at: string;
 	bead_title?: string;
+	session_id?: string;
 }
 
 export interface Segment {

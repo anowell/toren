@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::RwLock as TokioRwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 pub use runtime::{AncillaryWork, ClientInput, WorkStatus};
-use toren_lib::Assignment;
+use toren_lib::{Assignment, AssignmentManager, AssignmentStatus};
 pub use work_log::WorkEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -162,13 +162,21 @@ impl Default for AncillaryManager {
 pub struct WorkManager {
     /// Active work keyed by ancillary ID
     active_work: TokioRwLock<HashMap<String, Arc<AncillaryWork>>>,
+    /// Reference to assignment manager for persisting status changes
+    assignments: Option<Arc<TokioRwLock<AssignmentManager>>>,
 }
 
 impl WorkManager {
     pub fn new() -> Self {
         Self {
             active_work: TokioRwLock::new(HashMap::new()),
+            assignments: None,
         }
+    }
+
+    /// Set the assignment manager reference for status persistence
+    pub fn set_assignments(&mut self, assignments: Arc<TokioRwLock<AssignmentManager>>) {
+        self.assignments = Some(assignments);
     }
 
     /// Start work for an ancillary on an assignment
@@ -182,11 +190,87 @@ impl WorkManager {
             ancillary_id, assignment.bead_id
         );
 
+        let assignment_id = assignment.id.clone();
         let work = AncillaryWork::start(ancillary_id.clone(), assignment).await?;
         let work = Arc::new(work);
 
         let mut active = self.active_work.write().await;
         active.insert(ancillary_id, work.clone());
+
+        // Spawn a monitor task to persist assignment status and session_id
+        if let Some(ref assignments) = self.assignments {
+            let assignments = assignments.clone();
+            let (mut event_rx, _) = work.subscribe();
+            let monitor_work = work.clone();
+            tokio::spawn(async move {
+                let mut session_id_captured = false;
+
+                // Listen for work events to capture session_id
+                loop {
+                    tokio::select! {
+                        event = event_rx.recv() => {
+                            match event {
+                                Ok(ev) => {
+                                    // Check for session_id in status change events
+                                    if !session_id_captured {
+                                        if let work_log::WorkOp::StatusChange { ref status } = ev.op {
+                                            if let Some(sid) = status.strip_prefix("session_id:") {
+                                                let mut mgr = assignments.write().await;
+                                                let _ = mgr.update_session_id(&assignment_id, Some(sid.to_string()));
+                                                info!("Captured session_id {} for assignment {}", sid, assignment_id);
+                                                session_id_captured = true;
+                                            }
+                                        }
+                                    }
+
+                                    // Check for terminal events
+                                    match ev.op {
+                                        work_log::WorkOp::AssignmentCompleted => {
+                                            let mut mgr = assignments.write().await;
+                                            if let Err(e) = mgr.update_status(&assignment_id, AssignmentStatus::Completed) {
+                                                warn!("Failed to persist completed status for {}: {}", assignment_id, e);
+                                            } else {
+                                                info!("Persisted completed status for assignment {}", assignment_id);
+                                            }
+                                            break;
+                                        }
+                                        work_log::WorkOp::AssignmentFailed { .. } => {
+                                            let mut mgr = assignments.write().await;
+                                            if let Err(e) = mgr.update_status(&assignment_id, AssignmentStatus::Aborted) {
+                                                warn!("Failed to persist aborted status for {}: {}", assignment_id, e);
+                                            } else {
+                                                info!("Persisted aborted status for assignment {}", assignment_id);
+                                            }
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    // Missed some events, continue listening
+                                    continue;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    // Channel closed, fall back to polling
+                                    let status = monitor_work.status().await;
+                                    let mut mgr = assignments.write().await;
+                                    match status {
+                                        WorkStatus::Completed => {
+                                            let _ = mgr.update_status(&assignment_id, AssignmentStatus::Completed);
+                                        }
+                                        WorkStatus::Failed { .. } => {
+                                            let _ = mgr.update_status(&assignment_id, AssignmentStatus::Aborted);
+                                        }
+                                        _ => {}
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         Ok(work)
     }

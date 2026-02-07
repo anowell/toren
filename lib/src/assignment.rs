@@ -54,6 +54,9 @@ pub struct Assignment {
     /// Title of the associated bead (for display purposes)
     #[serde(default)]
     pub bead_title: Option<String>,
+    /// Claude session ID for cross-interface handoff (breq <-> toren)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Number words for ancillary naming (One through Twenty)
@@ -265,6 +268,7 @@ impl AssignmentManager {
             created_at: now.clone(),
             updated_at: now,
             bead_title,
+            session_id: None,
         };
 
         self.assignments
@@ -304,6 +308,7 @@ impl AssignmentManager {
             created_at: now.clone(),
             updated_at: now,
             bead_title,
+            session_id: None,
         };
 
         self.assignments
@@ -321,6 +326,22 @@ impl AssignmentManager {
     pub fn update_status(&mut self, assignment_id: &str, status: AssignmentStatus) -> Result<bool> {
         if let Some(assignment) = self.assignments.get_mut(assignment_id) {
             assignment.status = status;
+            assignment.updated_at = chrono::Utc::now().to_rfc3339();
+            self.save()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Update assignment session ID (for cross-interface handoff)
+    pub fn update_session_id(
+        &mut self,
+        assignment_id: &str,
+        session_id: Option<String>,
+    ) -> Result<bool> {
+        if let Some(assignment) = self.assignments.get_mut(assignment_id) {
+            assignment.session_id = session_id;
             assignment.updated_at = chrono::Utc::now().to_rfc3339();
             self.save()?;
             Ok(true)

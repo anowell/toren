@@ -48,15 +48,20 @@ pub async fn serve(
     assignment_manager: AssignmentManager,
     segment_manager: SegmentManager,
     workspace_manager: Option<WorkspaceManager>,
-    work_manager: WorkManager,
+    mut work_manager: WorkManager,
 ) -> Result<()> {
+    let assignments = Arc::new(RwLock::new(assignment_manager));
+
+    // Give work manager a reference to assignments for status persistence
+    work_manager.set_assignments(assignments.clone());
+
     let state = AppState {
         config: Arc::new(config),
         services,
         security: Arc::new(security_ctx),
         plugins: Arc::new(plugin_manager),
         ancillaries: Arc::new(ancillary_manager),
-        assignments: Arc::new(RwLock::new(assignment_manager)),
+        assignments,
         segments: Arc::new(std::sync::RwLock::new(segment_manager)),
         workspaces: workspace_manager.map(Arc::new),
         work_manager: Arc::new(work_manager),
@@ -88,6 +93,12 @@ pub async fn serve(
             "/api/assignments/:id/status",
             post(assignments_update_status),
         )
+        .route(
+            "/api/assignments/:id/complete",
+            post(assignments_complete),
+        )
+        .route("/api/assignments/:id/abort", post(assignments_abort))
+        .route("/api/assignments/:id/resume", post(assignments_resume))
         .route("/api/segments/list", get(segments_list))
         .route("/api/segments/create", post(segments_create))
         .route("/api/workspaces/list/:segment", get(workspaces_list))
@@ -387,11 +398,11 @@ struct AssignmentResponse {
 
 async fn assignments_list(State(state): State<AppState>) -> impl IntoResponse {
     let assignments = state.assignments.read().await;
-    let list = assignments.list_active();
+    let all = assignments.list();
 
     Json(serde_json::json!({
-        "assignments": list,
-        "count": list.len()
+        "assignments": all,
+        "count": all.len()
     }))
 }
 
@@ -641,4 +652,269 @@ async fn assignments_delete(
     }
 
     Err(StatusCode::NOT_FOUND)
+}
+
+// ==================== Assignment Lifecycle Endpoints ====================
+
+/// Helper to resolve an assignment by ID, ancillary ID, or bead ID
+fn resolve_assignment(assignments: &AssignmentManager, id: &str) -> Option<Assignment> {
+    // Try by assignment ID
+    if let Some(a) = assignments.get(id) {
+        return Some(a.clone());
+    }
+    // Try by ancillary ID (active assignment)
+    if let Some(a) = assignments.get_active_for_ancillary(id) {
+        return Some(a.clone());
+    }
+    // Try by bead ID (first match of any status)
+    let by_bead = assignments.get_by_bead(id);
+    if let Some(a) = by_bead.into_iter().next() {
+        return Some(a.clone());
+    }
+    None
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteRequest {
+    /// Whether to push changes via jj git push
+    #[serde(default)]
+    push: bool,
+    /// Whether to keep the bead open (default: close it)
+    #[serde(default)]
+    keep_open: bool,
+}
+
+async fn assignments_complete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<CompleteRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let ws_mgr = state.workspaces.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "workspace_root not configured"})),
+    ))?;
+
+    let mut assignments = state.assignments.write().await;
+
+    let assignment = resolve_assignment(&assignments, &id).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "Assignment not found"})),
+    ))?;
+
+    // Stop active work if running
+    let _ = state
+        .work_manager
+        .stop_work(&assignment.ancillary_id)
+        .await;
+
+    // Get segment path
+    let segment_path = {
+        let segments = state.segments.read().unwrap();
+        segments
+            .find_by_name(&assignment.segment)
+            .map(|s| s.path.clone())
+    };
+
+    let segment_path = segment_path.ok_or((
+        StatusCode::NOT_FOUND,
+        Json(
+            serde_json::json!({"error": format!("Segment not found: {}", assignment.segment)}),
+        ),
+    ))?;
+
+    let opts = toren_lib::CompleteOptions {
+        push: request.push,
+        keep_open: request.keep_open,
+        segment_path: &segment_path,
+    };
+
+    let result =
+        toren_lib::complete_assignment(&assignment, &mut assignments, ws_mgr, &opts).map_err(
+            |e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+            },
+        )?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "revision": result.revision,
+        "pushed": result.pushed,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AbortRequest {
+    /// Whether to close the bead (default: reopen it)
+    #[serde(default)]
+    close_bead: bool,
+}
+
+async fn assignments_abort(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<AbortRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let ws_mgr = state.workspaces.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "workspace_root not configured"})),
+    ))?;
+
+    let mut assignments = state.assignments.write().await;
+
+    let assignment = resolve_assignment(&assignments, &id).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "Assignment not found"})),
+    ))?;
+
+    // Stop active work if running
+    let _ = state
+        .work_manager
+        .stop_work(&assignment.ancillary_id)
+        .await;
+
+    // Get segment path
+    let segment_path = {
+        let segments = state.segments.read().unwrap();
+        segments
+            .find_by_name(&assignment.segment)
+            .map(|s| s.path.clone())
+    };
+
+    let segment_path = segment_path.ok_or((
+        StatusCode::NOT_FOUND,
+        Json(
+            serde_json::json!({"error": format!("Segment not found: {}", assignment.segment)}),
+        ),
+    ))?;
+
+    let opts = toren_lib::AbortOptions {
+        close_bead: request.close_bead,
+        segment_path: &segment_path,
+    };
+
+    toren_lib::abort_assignment(&assignment, &mut assignments, ws_mgr, &opts).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "bead_closed": request.close_bead,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ResumeRequest {
+    /// Custom instruction/prompt for the resumed work
+    #[serde(default)]
+    instruction: Option<String>,
+    /// Whether to auto-start SDK work after resume preparation
+    #[serde(default = "default_true")]
+    start_work: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+async fn assignments_resume(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ResumeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let ws_mgr = state.workspaces.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "workspace_root not configured"})),
+    ))?;
+
+    let mut assignments = state.assignments.write().await;
+
+    let assignment = resolve_assignment(&assignments, &id).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "Assignment not found"})),
+    ))?;
+
+    // Get segment path
+    let segment_path = {
+        let segments = state.segments.read().unwrap();
+        segments
+            .find_by_name(&assignment.segment)
+            .map(|s| s.path.clone())
+    };
+
+    let segment_path = segment_path.ok_or((
+        StatusCode::NOT_FOUND,
+        Json(
+            serde_json::json!({"error": format!("Segment not found: {}", assignment.segment)}),
+        ),
+    ))?;
+
+    let opts = toren_lib::ResumeOptions {
+        instruction: request.instruction.as_deref(),
+        segment_path: &segment_path,
+        segment_name: &assignment.segment,
+    };
+
+    let resume_result =
+        toren_lib::prepare_resume(&assignment, &mut assignments, ws_mgr, &opts).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
+
+    // Re-read the updated assignment (status may have changed)
+    let updated_assignment = assignments.get(&assignment.id).cloned().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "Assignment not found after resume preparation"})),
+    ))?;
+
+    // Optionally start SDK work
+    let work_started = if request.start_work {
+        // Check if ancillary already has active work
+        if state
+            .work_manager
+            .has_active_work(&assignment.ancillary_id)
+            .await
+        {
+            false
+        } else {
+            // Use the assignment with the resume prompt as source
+            let mut resume_assignment = updated_assignment.clone();
+            resume_assignment.source = toren_lib::AssignmentSource::Prompt {
+                original_prompt: resume_result.prompt.clone(),
+            };
+
+            match state
+                .work_manager
+                .start_work(assignment.ancillary_id.clone(), resume_assignment)
+                .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(
+                            serde_json::json!({"error": format!("Failed to start work: {}", e)}),
+                        ),
+                    ));
+                }
+            }
+        }
+    } else {
+        false
+    };
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "workspace_recreated": resume_result.workspace_recreated,
+        "prompt": resume_result.prompt,
+        "work_started": work_started,
+        "assignment": updated_assignment,
+    })))
 }

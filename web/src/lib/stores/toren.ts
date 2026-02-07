@@ -373,6 +373,78 @@ function createTorenStore() {
 				throw new Error(data.error || 'Failed to start work');
 			}
 		},
+		async completeAssignment(
+			shipUrl: string,
+			assignmentId: string,
+			options?: { push?: boolean; keep_open?: boolean },
+		): Promise<{ revision?: string; pushed: boolean }> {
+			const response = await fetch(`${shipUrl}/api/assignments/${assignmentId}/complete`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					push: options?.push ?? false,
+					keep_open: options?.keep_open ?? false,
+				}),
+			});
+			if (!response.ok) {
+				const data = await response.json().catch(() => ({}));
+				throw new Error(data.error || 'Failed to complete assignment');
+			}
+			const data = await response.json();
+			// Remove assignment from local state
+			update((state) => ({
+				...state,
+				assignments: state.assignments.filter((a) => a.id !== assignmentId),
+			}));
+			return { revision: data.revision, pushed: data.pushed };
+		},
+		async abortAssignment(
+			shipUrl: string,
+			assignmentId: string,
+			options?: { close_bead?: boolean },
+		): Promise<void> {
+			const response = await fetch(`${shipUrl}/api/assignments/${assignmentId}/abort`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ close_bead: options?.close_bead ?? false }),
+			});
+			if (!response.ok) {
+				const data = await response.json().catch(() => ({}));
+				throw new Error(data.error || 'Failed to abort assignment');
+			}
+			// Remove assignment from local state
+			update((state) => ({
+				...state,
+				assignments: state.assignments.filter((a) => a.id !== assignmentId),
+			}));
+		},
+		async resumeAssignment(
+			shipUrl: string,
+			assignmentId: string,
+			options?: { instruction?: string; start_work?: boolean },
+		): Promise<{ assignment: Assignment; work_started: boolean }> {
+			const response = await fetch(`${shipUrl}/api/assignments/${assignmentId}/resume`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					instruction: options?.instruction,
+					start_work: options?.start_work ?? true,
+				}),
+			});
+			if (!response.ok) {
+				const data = await response.json().catch(() => ({}));
+				throw new Error(data.error || 'Failed to resume assignment');
+			}
+			const data = await response.json();
+			// Update assignment in local state
+			update((state) => ({
+				...state,
+				assignments: state.assignments.map((a) =>
+					a.id === assignmentId ? data.assignment : a,
+				),
+			}));
+			return { assignment: data.assignment, work_started: data.work_started };
+		},
 	};
 }
 

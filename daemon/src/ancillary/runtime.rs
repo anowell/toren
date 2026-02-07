@@ -278,10 +278,31 @@ impl AncillaryWork {
                 }
             }
             Message::Result(result_msg) => {
-                // Log the result
+                // Capture session ID for cross-interface handoff
+                if !result_msg.session_id.is_empty() {
+                    Self::log_op(
+                        work_log,
+                        event_tx,
+                        WorkOp::StatusChange {
+                            status: format!("session_id:{}", result_msg.session_id),
+                        },
+                    )
+                    .await;
+                }
                 info!("{} result: {:?}", ancillary_id, result_msg);
             }
             Message::System(sys_msg) => {
+                // Capture session ID early from system messages
+                if let Some(ref sid) = sys_msg.session_id {
+                    Self::log_op(
+                        work_log,
+                        event_tx,
+                        WorkOp::StatusChange {
+                            status: format!("session_id:{}", sid),
+                        },
+                    )
+                    .await;
+                }
                 info!("{} system message: {}", ancillary_id, sys_msg.subtype);
             }
             _ => {

@@ -7,7 +7,7 @@ use toren_lib::{
     AssignmentManager, AssignmentRef, AssignmentStatus, Config, Segment, SegmentManager,
     WorkspaceManager,
 };
-use tracing::{debug, info};
+use tracing::info;
 use tracing_subscriber::fmt::time::FormatTime;
 
 /// Custom time formatter that displays only HH:MM:SS (UTC)
@@ -617,57 +617,43 @@ fn cmd_resume(
         assignments[0].clone()
     };
 
-    let ws_path = &assignment.workspace_path;
-
-    // Recreate workspace if missing
-    if !ws_path.exists() {
-        println!("Workspace missing, recreating...");
-        let ws_name = ws_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .context("Invalid workspace path")?;
-        let ancillary_num = toren_lib::ancillary_number(&assignment.ancillary_id);
-
-        workspace_mgr.create_workspace_with_setup(
-            &segment.path,
-            &segment.name,
-            ws_name,
-            ancillary_num,
-        )?;
-        println!("Workspace recreated: {}", ws_path.display());
-    }
-
-    // Update status to active
-    assignment_mgr.update_status(&assignment.id, AssignmentStatus::Active)?;
-
-    // Ensure bead is in_progress and assigned to claude
-    let task_title = match toren_lib::tasks::fetch_task(&assignment.bead_id, &segment.path) {
-        Ok(task) => {
-            println!("Resuming work on {} - {}", task.id, task.title);
-            task.title
-        }
-        Err(_) => {
-            // Bead might be closed or not found, try to reopen
-            println!("Reopening bead...");
-            toren_lib::tasks::beads::claim_bead(&assignment.bead_id, "claude", &segment.path)?;
-            assignment.bead_id.clone()
-        }
+    // Use shared resume logic
+    let opts = toren_lib::ResumeOptions {
+        instruction,
+        segment_path: &segment.path,
+        segment_name: &segment.name,
     };
 
-    let prompt = instruction.map(|s| s.to_string()).unwrap_or_else(|| {
-        format!(
-            "Continue working on bead {}: {}. Review progress and complete remaining work.",
-            assignment.bead_id, task_title
-        )
-    });
+    let result =
+        toren_lib::prepare_resume(&assignment, &mut assignment_mgr, &workspace_mgr, &opts)?;
 
-    println!("Resuming session in workspace: {}\n", ws_path.display());
+    if result.workspace_recreated {
+        println!(
+            "Workspace recreated: {}",
+            assignment.workspace_path.display()
+        );
+    }
+
+    println!(
+        "Resuming session in workspace: {}\n",
+        assignment.workspace_path.display()
+    );
+
+    // Check if we have a session_id for --resume handoff
+    let session_id = assignment_mgr
+        .get(&assignment.id)
+        .and_then(|a| a.session_id.clone());
 
     let mut cmd = Command::new("claude");
     if danger {
         cmd.arg("--dangerously-skip-permissions");
     }
-    cmd.arg(&prompt).current_dir(ws_path);
+    if let Some(sid) = session_id {
+        cmd.arg("--resume").arg(&sid);
+    } else {
+        cmd.arg(&result.prompt);
+    }
+    cmd.current_dir(&assignment.workspace_path);
 
     let err = cmd.exec();
     Err(err).context("Failed to exec claude")
@@ -729,43 +715,27 @@ fn cmd_abort(config: &Config, reference: &str, close: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Process each assignment
+    // Process each assignment using shared abort logic
+    let opts = toren_lib::AbortOptions {
+        close_bead: close,
+        segment_path: &segment.path,
+    };
+
     for assignment in &assignments {
         println!(
             "Aborting: {} -> {}",
             assignment.ancillary_id, assignment.bead_id
         );
 
-        // Cleanup workspace if it exists
-        if assignment.workspace_path.exists() {
-            let ws_name = assignment
-                .workspace_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
+        toren_lib::abort_assignment(assignment, &mut assignment_mgr, &workspace_mgr, &opts)?;
 
-            workspace_mgr.cleanup_workspace(&segment.path, &segment.name, ws_name)?;
-            println!("  Workspace removed.");
-        } else {
-            println!("  (Workspace already gone)");
-        }
-
-        // Remove assignment completely
-        assignment_mgr.remove(&assignment.id)?;
-    }
-
-    // Handle bead status
-    let bead_ids: std::collections::HashSet<_> = assignments.iter().map(|a| &a.bead_id).collect();
-
-    for bead_id in bead_ids {
         if close {
-            println!("Closing bead {}...", bead_id);
-            toren_lib::tasks::beads::update_bead_status(bead_id, "closed", &segment.path)?;
+            println!("Bead {} closed.", assignment.bead_id);
         } else {
-            // Unassign and reopen
-            let _ = toren_lib::tasks::beads::update_bead_assignee(bead_id, "", &segment.path);
-            toren_lib::tasks::beads::update_bead_status(bead_id, "open", &segment.path)?;
-            println!("Bead {} unassigned and returned to open.", bead_id);
+            println!(
+                "Bead {} unassigned and returned to open.",
+                assignment.bead_id
+            );
         }
     }
 
@@ -826,21 +796,8 @@ fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool) -
         assignment.ancillary_id, assignment.bead_id
     );
 
-    // Get the current revision before cleanup (if workspace exists)
-    let revision = if assignment.workspace_path.exists() {
-        // Get the working copy commit
-        let output = Command::new("jj")
-            .args(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
-            .current_dir(&assignment.workspace_path)
-            .output()
-            .ok();
-
-        let rev = output
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        // Show the changes (suppress stale working copy warnings since we're about to delete)
+    // Show changes before cleanup (interactive output for CLI)
+    if assignment.workspace_path.exists() {
         println!("\nChanges:");
         let output = Command::new("jj")
             .args(["log", "-r", "@"])
@@ -848,11 +805,9 @@ fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool) -
             .output();
 
         if let Ok(output) = output {
-            // Print stdout (the actual log output)
             if !output.stdout.is_empty() {
                 print!("{}", String::from_utf8_lossy(&output.stdout));
             }
-            // Filter stderr: suppress "working copy is stale" messages
             let stderr = String::from_utf8_lossy(&output.stderr);
             for line in stderr.lines() {
                 if !line.contains("working copy is stale")
@@ -862,57 +817,34 @@ fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool) -
                 }
             }
         }
-
-        // Push if requested
-        if push {
-            if let Some(ref rev) = rev {
-                println!("\nPushing...");
-                let status = Command::new("jj")
-                    .args(["git", "push", "-c", rev])
-                    .current_dir(&assignment.workspace_path)
-                    .status()?;
-                if !status.success() {
-                    anyhow::bail!("Failed to push changes");
-                }
-                println!("Pushed.");
-            }
-        }
-
-        rev
     } else {
         println!("(Workspace already cleaned up)");
-        None
-    };
-
-    // Cleanup workspace if it exists
-    if assignment.workspace_path.exists() {
-        let ws_name = assignment
-            .workspace_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-
-        workspace_mgr.cleanup_workspace(&segment.path, &segment.name, ws_name)?;
-        debug!("Workspace cleaned up.");
     }
 
-    // Remove assignment
-    assignment_mgr.remove(&assignment.id)?;
+    // Use shared complete logic
+    let opts = toren_lib::CompleteOptions {
+        push,
+        keep_open,
+        segment_path: &segment.path,
+    };
 
-    // Close bead unless --keep-open
+    let result =
+        toren_lib::complete_assignment(&assignment, &mut assignment_mgr, &workspace_mgr, &opts)?;
+
     if !keep_open {
-        toren_lib::tasks::beads::update_bead_status(&assignment.bead_id, "closed", &segment.path)?;
         println!("Bead closed.");
     }
 
     // Print integration instructions
-    if let Some(rev) = revision {
-        if !push {
+    if let Some(rev) = result.revision {
+        if !result.pushed {
             println!("\nCommit preserved at: {}", &rev[..12.min(rev.len())]);
             println!(
                 "To integrate: jj rebase -r {} -d main",
                 &rev[..12.min(rev.len())]
             );
+        } else {
+            println!("Pushed.");
         }
     }
 

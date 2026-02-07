@@ -151,6 +151,68 @@ function handleInterrupt() {
 	ancillaryWs.send(JSON.stringify({ type: 'interrupt' }));
 }
 
+let lifecycleLoading = false;
+let lifecycleError: string | null = null;
+
+async function handleComplete() {
+	if (!currentAssignment || lifecycleLoading) return;
+	lifecycleLoading = true;
+	lifecycleError = null;
+	try {
+		const result = await torenStore.completeAssignment($torenStore.shipUrl, currentAssignment.id);
+		if (result.revision) {
+			// Show the revision in a status message
+			events = [
+				...events,
+				{
+					seq: Date.now(),
+					timestamp: new Date().toISOString(),
+					op: {
+						type: 'status_change',
+						status: `Completed. Revision: ${result.revision.slice(0, 12)}`,
+					},
+				},
+			];
+		}
+		goto(`/a/${$page.params.segment}`);
+	} catch (err) {
+		lifecycleError = err instanceof Error ? err.message : 'Failed to complete';
+	} finally {
+		lifecycleLoading = false;
+	}
+}
+
+async function handleAbort() {
+	if (!currentAssignment || lifecycleLoading) return;
+	lifecycleLoading = true;
+	lifecycleError = null;
+	try {
+		await torenStore.abortAssignment($torenStore.shipUrl, currentAssignment.id);
+		goto(`/a/${$page.params.segment}`);
+	} catch (err) {
+		lifecycleError = err instanceof Error ? err.message : 'Failed to abort';
+	} finally {
+		lifecycleLoading = false;
+	}
+}
+
+async function handleResume() {
+	if (!currentAssignment || lifecycleLoading) return;
+	lifecycleLoading = true;
+	lifecycleError = null;
+	try {
+		await torenStore.resumeAssignment($torenStore.shipUrl, currentAssignment.id);
+		// Reconnect to the ancillary WebSocket to see new work events
+		if (ancillaryId) {
+			connectToAncillary(ancillaryId);
+		}
+	} catch (err) {
+		lifecycleError = err instanceof Error ? err.message : 'Failed to resume';
+	} finally {
+		lifecycleLoading = false;
+	}
+}
+
 function toggleMobilePanel() {
 	showMobilePanel = !showMobilePanel;
 }
@@ -303,9 +365,18 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 				<BeadStatusIcon status={beadDisplayStatus} />
 			{/if}
 			<span class="bead-label">{stripBeadPrefix(currentAssignment.bead_id)}{#if currentAssignment.bead_title}: {currentAssignment.bead_title}{/if}</span>
-			<span class="ancillary-display-badge" class:busy={ancillaryDisplayStatus === 'busy'} class:ready={ancillaryDisplayStatus === 'ready'}>
-				{ancillaryDisplayStatus}
-			</span>
+			<div class="indicator-actions">
+				{#if isDone || currentAssignment.status === 'completed' || currentAssignment.status === 'aborted'}
+					<button class="action-btn resume" on:click={handleResume} disabled={lifecycleLoading} title="Resume work">Resume</button>
+					<button class="action-btn complete" on:click={handleComplete} disabled={lifecycleLoading} title="Complete and cleanup">Complete</button>
+				{:else if !isWorking}
+					<button class="action-btn complete" on:click={handleComplete} disabled={lifecycleLoading} title="Complete and cleanup">Complete</button>
+				{/if}
+				<button class="action-btn abort" on:click={handleAbort} disabled={lifecycleLoading} title="Abort and discard">Abort</button>
+				{#if lifecycleError}
+					<span class="lifecycle-error">{lifecycleError}</span>
+				{/if}
+			</div>
 		</div>
 	{:else}
 		<div class="ancillary-indicator not-found">
@@ -608,23 +679,60 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 		white-space: nowrap;
 	}
 
-	.ancillary-display-badge {
+	.indicator-actions {
 		margin-left: auto;
-		padding: 2px 8px;
+		display: flex;
+		align-items: center;
+		gap: var(--spacing-xs);
+	}
+
+	.action-btn {
+		padding: 2px 10px;
 		border-radius: var(--radius-sm);
 		font-size: 0.7rem;
 		font-weight: 600;
 		text-transform: uppercase;
+		cursor: pointer;
+		border: 1px solid transparent;
 	}
 
-	.ancillary-display-badge.busy {
-		background: var(--color-warning);
-		color: var(--color-bg);
+	.action-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
-	.ancillary-display-badge.ready {
+	.action-btn.complete {
 		background: var(--color-success);
 		color: var(--color-bg);
+	}
+
+	.action-btn.complete:hover:not(:disabled) {
+		opacity: 0.85;
+	}
+
+	.action-btn.abort {
+		background: none;
+		color: var(--color-error);
+		border-color: var(--color-error);
+	}
+
+	.action-btn.abort:hover:not(:disabled) {
+		background: var(--color-error);
+		color: white;
+	}
+
+	.action-btn.resume {
+		background: var(--color-primary);
+		color: white;
+	}
+
+	.action-btn.resume:hover:not(:disabled) {
+		opacity: 0.85;
+	}
+
+	.lifecycle-error {
+		font-size: 0.7rem;
+		color: var(--color-error);
 	}
 
 	.ancillary-indicator .hint {
