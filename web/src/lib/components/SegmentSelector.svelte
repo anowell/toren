@@ -156,8 +156,9 @@ function getSegmentIcon(source: string) {
 </div>
 
 {#if showCreateModal}
+	<!-- svelte-ignore a11y_click_events_have_key_events -->
 	<div class="modal-overlay" on:click={closeCreateModal} role="presentation">
-		<div class="modal" on:click|stopPropagation role="dialog" aria-labelledby="create-segment-title">
+		<div class="modal" on:click|stopPropagation role="dialog" aria-labelledby="create-segment-title" tabindex="-1">
 			<h3 id="create-segment-title">Create New Project</h3>
 
 			<form on:submit|preventDefault={handleCreateSegment}>
@@ -185,7 +186,7 @@ function getSegmentIcon(source: string) {
 					</div>
 				{:else if ($torenStore.segmentRoots ?? []).length === 1}
 					<div class="form-group">
-						<label>Root Directory</label>
+						<span>Root Directory</span>
 						<div class="read-only">{($torenStore.segmentRoots ?? [])[0]}</div>
 					</div>
 				{/if}

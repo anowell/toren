@@ -29,8 +29,9 @@ function toggleSegmentSelector() {
 
 {#if $torenStore.authenticated}
 	{#if showSegmentSelector || !$torenStore.selectedSegment}
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
 		<div class="overlay" on:click={toggleSegmentSelector} role="presentation">
-			<div class="selector-container" on:click|stopPropagation role="dialog">
+			<div class="selector-container" on:click|stopPropagation role="dialog" tabindex="-1">
 				<SegmentSelector />
 			</div>
 		</div>

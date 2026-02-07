@@ -421,8 +421,9 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 
 <!-- Mobile panel overlay -->
 {#if showMobilePanel}
+	<!-- svelte-ignore a11y_click_events_have_key_events -->
 	<div class="mobile-overlay" on:click={closeMobilePanel} role="presentation">
-		<div class="mobile-panel" on:click|stopPropagation role="dialog">
+		<div class="mobile-panel" on:click|stopPropagation role="dialog" tabindex="-1">
 			<div class="mobile-panel-header">
 				<h3>Ancillaries</h3>
 				<button class="close-btn" on:click={closeMobilePanel} aria-label="Close">
