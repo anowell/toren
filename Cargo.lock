@@ -1718,6 +1718,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "clap",
  "claude-agent-sdk-rs",
  "dirs",
  "futures",

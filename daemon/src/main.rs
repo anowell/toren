@@ -1,4 +1,6 @@
 use anyhow::Result;
+use clap::Parser;
+use std::path::PathBuf;
 use tracing::{info, Level};
 
 mod ancillary;
@@ -10,6 +12,15 @@ mod services;
 // Re-export from toren-lib for internal use
 use toren_lib::{AssignmentManager, Config, SegmentManager, WorkspaceManager};
 
+#[derive(Parser)]
+#[command(name = "toren-daemon")]
+#[command(about = "Toren daemon - API server for bead-driven development")]
+struct Cli {
+    /// Path to config file (default: auto-discovered toren.toml)
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -17,10 +28,12 @@ async fn main() -> Result<()> {
         .with_max_level(Level::INFO)
         .init();
 
+    let cli = Cli::parse();
+
     info!("Toren initializing, version {}", env!("CARGO_PKG_VERSION"));
 
     // Load configuration
-    let config = Config::load()?;
+    let config = Config::load_from(cli.config.as_deref())?;
     info!("Loaded configuration from: {}", config.config_path);
 
     // Initialize security context

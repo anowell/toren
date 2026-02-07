@@ -112,7 +112,15 @@ fn expand_path(path: &Path) -> PathBuf {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let config_path = Self::find_config_file()?;
+        Self::load_from(None)
+    }
+
+    pub fn load_from(config_path: Option<&Path>) -> Result<Self> {
+        let config_path = if let Some(path) = config_path {
+            path.to_path_buf()
+        } else {
+            Self::find_config_file()?
+        };
 
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)
@@ -122,11 +130,13 @@ impl Config {
             config.config_path = config_path.display().to_string();
             config.expand_paths();
             Ok(config)
-        } else {
-            // Create default config
+        } else if config_path == Self::find_config_file().unwrap_or_default() {
+            // Only create default config for auto-discovered paths
             let config = Self::default();
             config.save(&config_path)?;
             Ok(config)
+        } else {
+            anyhow::bail!("Config file not found: {}", config_path.display())
         }
     }
 

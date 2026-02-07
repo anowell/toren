@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 use toren_lib::{
     AssignmentManager, AssignmentRef, AssignmentStatus, Config, Segment, SegmentManager,
@@ -37,6 +38,10 @@ struct Cli {
     /// Increase verbosity (-v for DEBUG, -vv for TRACE)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
+
+    /// Path to config file (default: auto-discovered toren.toml)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -212,6 +217,9 @@ fn main() -> Result<()> {
         .with_timer(ShortTime)
         .init();
 
+    // Load config once, shared across all commands
+    let config = Config::load_from(cli.config.as_deref())?;
+
     match cli.command {
         Commands::Assign {
             bead,
@@ -220,28 +228,28 @@ fn main() -> Result<()> {
             intent,
             segment,
             danger,
-        } => cmd_assign(bead, prompt, title, intent, segment.as_deref(), danger),
-        Commands::List { all, segment } => cmd_list(all, segment),
-        Commands::Show { reference } => cmd_show(&reference),
+        } => cmd_assign(&config, bead, prompt, title, intent, segment.as_deref(), danger),
+        Commands::List { all, segment } => cmd_list(&config, all, segment),
+        Commands::Show { reference } => cmd_show(&config, &reference),
         Commands::Resume {
             reference,
             instruction,
             danger,
-        } => cmd_resume(&reference, instruction.as_deref(), danger),
-        Commands::Abort { reference, close } => cmd_abort(&reference, close),
+        } => cmd_resume(&config, &reference, instruction.as_deref(), danger),
+        Commands::Abort { reference, close } => cmd_abort(&config, &reference, close),
         Commands::Complete {
             reference,
             push,
             keep_open,
-        } => cmd_complete(&reference, push, keep_open),
+        } => cmd_complete(&config, &reference, push, keep_open),
         Commands::Go {
             workspace,
             segment,
             cmd,
-        } => cmd_go(&workspace, segment.as_deref(), cmd),
+        } => cmd_go(&config, &workspace, segment.as_deref(), cmd),
         Commands::Workspace { command } => match command {
-            WorkspaceCommands::Setup => cmd_ws_setup(),
-            WorkspaceCommands::Destroy => cmd_ws_destroy(),
+            WorkspaceCommands::Setup => cmd_ws_setup(&config),
+            WorkspaceCommands::Destroy => cmd_ws_destroy(&config),
         },
         Commands::Init { stealth } => cmd_init(stealth),
     }
@@ -273,6 +281,7 @@ fn workspace_name_for_assignment(ancillary_number: u32) -> String {
 }
 
 fn cmd_assign(
+    config: &Config,
     bead: Option<String>,
     prompt: Option<String>,
     title: Option<String>,
@@ -280,8 +289,6 @@ fn cmd_assign(
     segment_name: Option<&str>,
     danger: bool,
 ) -> Result<()> {
-    let config = Config::load()?;
-
     let workspace_root = config
         .ancillary
         .workspace_root
@@ -289,7 +296,7 @@ fn cmd_assign(
         .context("workspace_root not configured in toren.toml")?;
 
     let workspace_mgr = WorkspaceManager::new(workspace_root);
-    let segment_mgr = SegmentManager::new(&config)?;
+    let segment_mgr = SegmentManager::new(config)?;
     let mut assignment_mgr = AssignmentManager::new()?;
 
     let segment = resolve_segment(&segment_mgr, segment_name)?;
@@ -374,9 +381,8 @@ fn cmd_assign(
     Err(err).context("Failed to exec claude")
 }
 
-fn cmd_list(all_segments: bool, segment_name: Option<String>) -> Result<()> {
-    let config = Config::load()?;
-    let segment_mgr = SegmentManager::new(&config)?;
+fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -> Result<()> {
+    let segment_mgr = SegmentManager::new(config)?;
     let assignment_mgr = AssignmentManager::new()?;
 
     // Determine which segment(s) to list
@@ -459,9 +465,8 @@ fn truncate_title(title: &str, max_len: usize) -> String {
     }
 }
 
-fn cmd_show(reference: &str) -> Result<()> {
-    let config = Config::load()?;
-    let segment_mgr = SegmentManager::new(&config)?;
+fn cmd_show(config: &Config, reference: &str) -> Result<()> {
+    let segment_mgr = SegmentManager::new(config)?;
     let assignment_mgr = AssignmentManager::new()?;
 
     let segment = resolve_segment(&segment_mgr, None)?;
@@ -528,16 +533,14 @@ fn cmd_show(reference: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_resume(reference: &str, instruction: Option<&str>, danger: bool) -> Result<()> {
-    let config = Config::load()?;
-
+fn cmd_resume(config: &Config, reference: &str, instruction: Option<&str>, danger: bool) -> Result<()> {
     let workspace_root = config
         .ancillary
         .workspace_root
         .clone()
         .context("workspace_root not configured")?;
 
-    let segment_mgr = SegmentManager::new(&config)?;
+    let segment_mgr = SegmentManager::new(config)?;
     let workspace_mgr = WorkspaceManager::new(workspace_root);
     let mut assignment_mgr = AssignmentManager::new()?;
 
@@ -628,16 +631,14 @@ fn cmd_resume(reference: &str, instruction: Option<&str>, danger: bool) -> Resul
     Err(err).context("Failed to exec claude")
 }
 
-fn cmd_abort(reference: &str, close: bool) -> Result<()> {
-    let config = Config::load()?;
-
+fn cmd_abort(config: &Config, reference: &str, close: bool) -> Result<()> {
     let workspace_root = config
         .ancillary
         .workspace_root
         .clone()
         .context("workspace_root not configured")?;
 
-    let segment_mgr = SegmentManager::new(&config)?;
+    let segment_mgr = SegmentManager::new(config)?;
     let workspace_mgr = WorkspaceManager::new(workspace_root);
     let mut assignment_mgr = AssignmentManager::new()?;
 
@@ -729,16 +730,14 @@ fn cmd_abort(reference: &str, close: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_complete(reference: &str, push: bool, keep_open: bool) -> Result<()> {
-    let config = Config::load()?;
-
+fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool) -> Result<()> {
     let workspace_root = config
         .ancillary
         .workspace_root
         .clone()
         .context("workspace_root not configured")?;
 
-    let segment_mgr = SegmentManager::new(&config)?;
+    let segment_mgr = SegmentManager::new(config)?;
     let workspace_mgr = WorkspaceManager::new(workspace_root);
     let mut assignment_mgr = AssignmentManager::new()?;
 
@@ -932,9 +931,7 @@ fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf,
     Ok((segment_path, workspace_path, workspace_name))
 }
 
-fn cmd_go(workspace: &str, segment_name: Option<&str>, cmd: Vec<String>) -> Result<()> {
-    let config = Config::load()?;
-
+fn cmd_go(config: &Config, workspace: &str, segment_name: Option<&str>, cmd: Vec<String>) -> Result<()> {
     let workspace_root = config
         .ancillary
         .workspace_root
@@ -942,7 +939,7 @@ fn cmd_go(workspace: &str, segment_name: Option<&str>, cmd: Vec<String>) -> Resu
         .context("workspace_root not configured in toren.toml")?;
 
     let workspace_mgr = WorkspaceManager::new(workspace_root);
-    let segment_mgr = SegmentManager::new(&config)?;
+    let segment_mgr = SegmentManager::new(config)?;
     let segment = resolve_segment(&segment_mgr, segment_name)?;
 
     // Resolve workspace name: could be a word like "one" or an ancillary reference
@@ -973,8 +970,7 @@ fn cmd_go(workspace: &str, segment_name: Option<&str>, cmd: Vec<String>) -> Resu
     Err(err).with_context(|| format!("Failed to exec: {}", program))
 }
 
-fn cmd_ws_setup() -> Result<()> {
-    let config = Config::load()?;
+fn cmd_ws_setup(config: &Config) -> Result<()> {
     let workspace_root = config
         .ancillary
         .workspace_root
@@ -1152,8 +1148,7 @@ fn cmd_init(stealth: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ws_destroy() -> Result<()> {
-    let config = Config::load()?;
+fn cmd_ws_destroy(config: &Config) -> Result<()> {
     let workspace_root = config
         .ancillary
         .workspace_root

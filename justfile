@@ -11,29 +11,25 @@ default:
 build:
     cargo build
 
-# Build release binaries
-build-release:
-    cargo build --release
-
-# Start the Toren daemon (dev mode)
+# Start the Toren daemon (dev mode, uses toren-test.toml)
 daemon:
-    bacon run -- --bin toren-daemon
+    bacon run -- --bin toren-daemon -- --config toren-test.toml
 
 # Start the web UI (dev mode)
 web:
     cd web && pnpm dev
 
-# Run the breq CLI (dev mode)
-cli *ARGS:
-    cargo run --bin breq -- {{ARGS}}
+# Run the breq CLI in an example segment directory (dev mode)
+cli SEGMENT *ARGS:
+    cd examples/{{SEGMENT}} && cargo run --manifest-path {{justfile_directory()}}/Cargo.toml --bin breq -- --config {{justfile_directory()}}/toren-test.toml {{ARGS}}
 
 # Check daemon health
 health:
-    curl -s http://localhost:8787/health | jq .
+    curl -s http://localhost:8788/health | jq .
 
 # List available plugins/commands
 plugins:
-    curl -s http://localhost:8787/api/plugins/commands | jq .
+    curl -s http://localhost:8788/api/plugins/commands | jq .
 
 # Run tests
 test:
@@ -48,12 +44,8 @@ clean:
     cargo clean
     rm -rf target
 
-# Install dependencies (web)
-install-web:
-    cd web && pnpm install
-
 # Get a session token (requires pairing token from daemon)
 pair PAIRING_TOKEN:
-    curl -X POST http://localhost:8787/pair \
+    curl -X POST http://localhost:8788/pair \
         -H "Content-Type: application/json" \
         -d '{"pairing_token": "{{PAIRING_TOKEN}}"}'
