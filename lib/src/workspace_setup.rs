@@ -62,11 +62,18 @@ pub enum Action {
     /// Copy and render a template with workspace context
     Template { src: String, dest: String },
     /// Copy a file or directory using CoW when available, with fallback to regular copy
-    Copy { src: String, dest: String, from: Option<String> },
+    Copy {
+        src: String,
+        dest: String,
+        from: Option<String>,
+    },
     /// Create a symlink for truly shared content
     Share { src: String, from: Option<String> },
     /// Execute a shell command
-    Run { command: String, cwd: Option<String> },
+    Run {
+        command: String,
+        cwd: Option<String>,
+    },
 }
 
 /// Configuration parsed from .toren.kdl
@@ -87,7 +94,11 @@ impl BreqConfig {
         let config_path = repo_root.join(TOREN_CONFIG_FILE);
 
         if !config_path.exists() {
-            trace!("No {} found at {}", TOREN_CONFIG_FILE, config_path.display());
+            trace!(
+                "No {} found at {}",
+                TOREN_CONFIG_FILE,
+                config_path.display()
+            );
             return Ok(Self::default());
         }
 
@@ -342,7 +353,13 @@ impl WorkspaceSetup {
         Ok(())
     }
 
-    fn execute_copy(&self, src: &str, dest: &str, from: Option<&str>, ctx: &WorkspaceContext) -> Result<()> {
+    fn execute_copy(
+        &self,
+        src: &str,
+        dest: &str,
+        from: Option<&str>,
+        ctx: &WorkspaceContext,
+    ) -> Result<()> {
         // Resolve source: from attribute (with template rendering) or repo root
         let src_path = if let Some(from_template) = from {
             let rendered_from = self.render_string(from_template, ctx)?;
@@ -359,8 +376,13 @@ impl WorkspaceSetup {
         }
 
         // Use clonetree for CoW with automatic fallback
-        clonetree::clone_tree(&src_path, &dest_path, &CloneOptions::new())
-            .with_context(|| format!("Failed to copy {} to {}", src_path.display(), dest_path.display()))?;
+        clonetree::clone_tree(&src_path, &dest_path, &CloneOptions::new()).with_context(|| {
+            format!(
+                "Failed to copy {} to {}",
+                src_path.display(),
+                dest_path.display()
+            )
+        })?;
 
         info!("  copy: {} -> {}", src_path.display(), dest);
         Ok(())
@@ -383,8 +405,13 @@ impl WorkspaceSetup {
 
         // Create symlink
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&src_path, &dest_path)
-            .with_context(|| format!("Failed to symlink {} -> {}", dest_path.display(), src_path.display()))?;
+        std::os::unix::fs::symlink(&src_path, &dest_path).with_context(|| {
+            format!(
+                "Failed to symlink {} -> {}",
+                dest_path.display(),
+                src_path.display()
+            )
+        })?;
 
         #[cfg(windows)]
         {
@@ -393,7 +420,13 @@ impl WorkspaceSetup {
             } else {
                 std::os::windows::fs::symlink_file(&src_path, &dest_path)
             }
-            .with_context(|| format!("Failed to symlink {} -> {}", dest_path.display(), src_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "Failed to symlink {} -> {}",
+                    dest_path.display(),
+                    src_path.display()
+                )
+            })?;
         }
 
         info!("  share: {} -> {}", dest_path.display(), src_path.display());

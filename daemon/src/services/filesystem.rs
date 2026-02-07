@@ -41,8 +41,7 @@ impl FilesystemService {
 
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create parent directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create parent directory")?;
         }
 
         std::fs::write(path, content)
@@ -90,7 +89,8 @@ impl FilesystemService {
             Err(_) => {
                 // If path doesn't exist, try to canonicalize parent
                 if let Some(parent) = path.parent() {
-                    parent.canonicalize()
+                    parent
+                        .canonicalize()
                         .context("Failed to canonicalize parent directory")?
                 } else {
                     return Err(anyhow!("Invalid path"));

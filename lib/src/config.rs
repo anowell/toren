@@ -123,10 +123,10 @@ impl Config {
         };
 
         if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)
-                .context("Failed to read config file")?;
-            let mut config: Config = toml::from_str(&content)
-                .context("Failed to parse config file")?;
+            let content =
+                std::fs::read_to_string(&config_path).context("Failed to read config file")?;
+            let mut config: Config =
+                toml::from_str(&content).context("Failed to parse config file")?;
             config.config_path = config_path.display().to_string();
             config.expand_paths();
             Ok(config)
@@ -143,12 +143,7 @@ impl Config {
     /// Expand shell-style paths in all path fields
     fn expand_paths(&mut self) {
         // Expand segment roots
-        self.segments.roots = self
-            .segments
-            .roots
-            .iter()
-            .map(|p| expand_path(p))
-            .collect();
+        self.segments.roots = self.segments.roots.iter().map(|p| expand_path(p)).collect();
 
         // Expand approved directories
         self.approved_directories = self
@@ -164,16 +159,13 @@ impl Config {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let content = toml::to_string_pretty(self)
-            .context("Failed to serialize config")?;
+        let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create config directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create config directory")?;
         }
 
-        std::fs::write(path, content)
-            .context("Failed to write config file")?;
+        std::fs::write(path, content).context("Failed to write config file")?;
 
         Ok(())
     }
@@ -208,8 +200,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let current_dir = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."));
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         Self {
             config_path: String::new(),

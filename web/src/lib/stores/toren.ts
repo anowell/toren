@@ -1,7 +1,5 @@
-import { derived, writable } from 'svelte/store';
+import { derived, get, writable } from 'svelte/store';
 import type {
-	AncillaryWsRequest,
-	AncillaryWsResponse,
 	Ancillary,
 	AncillaryDisplayStatus,
 	AncillaryStatus,
@@ -11,7 +9,6 @@ import type {
 	CommandOutput,
 	CreateAssignmentRequest,
 	Segment,
-	WorkEvent,
 	WsRequest,
 	WsResponse,
 } from '$lib/types/toren';
@@ -44,12 +41,11 @@ export interface ChatMessage {
 
 class TorenClient {
 	private ws: WebSocket | null = null;
-
-	constructor() {}
+	private _authHandler: ((message: WsResponse) => void) | null = null;
 
 	async connect(shipUrl: string): Promise<void> {
 		return new Promise((resolve, reject) => {
-			const wsUrl = shipUrl.replace(/^http/, 'ws') + '/ws';
+			const wsUrl = `${shipUrl.replace(/^http/, 'ws')}/ws`;
 
 			try {
 				this.ws = new WebSocket(wsUrl);
@@ -138,7 +134,7 @@ class TorenClient {
 			};
 
 			// Subscribe once to the next message
-			const unsubscribe = torenStore.subscribe((state) => {
+			const _unsubscribe = torenStore.subscribe((_state) => {
 				// This is a hack - we should use proper event emitter
 				// For now, messages are handled in handleMessage
 			});
@@ -146,7 +142,7 @@ class TorenClient {
 			this.send({ type: 'Auth', token });
 
 			// Store handler for later
-			(this as any)._authHandler = handler;
+			this._authHandler = handler;
 		});
 	}
 
@@ -154,9 +150,9 @@ class TorenClient {
 		console.log('Received message:', message);
 
 		// Handle auth responses
-		if ((this as any)._authHandler) {
-			(this as any)._authHandler(message);
-			delete (this as any)._authHandler;
+		if (this._authHandler) {
+			this._authHandler(message);
+			this._authHandler = null;
 			return;
 		}
 
@@ -261,11 +257,7 @@ function createTorenStore() {
 		subscribe,
 		set,
 		update,
-		get: () => {
-			let state: TorenState;
-			subscribe((s) => (state = s))();
-			return state!;
-		},
+		get: () => get({ subscribe }),
 		reset: () => set(initialState),
 		async loadSegments(shipUrl: string) {
 			update((state) => ({ ...state, loadingSegments: true }));
@@ -350,10 +342,7 @@ function createTorenStore() {
 		selectAncillary(assignment: Assignment | null) {
 			update((state) => ({ ...state, selectedAncillary: assignment }));
 		},
-		async createAssignment(
-			shipUrl: string,
-			request: CreateAssignmentRequest,
-		): Promise<Assignment> {
+		async createAssignment(shipUrl: string, request: CreateAssignmentRequest): Promise<Assignment> {
 			const response = await fetch(`${shipUrl}/api/assignments`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },

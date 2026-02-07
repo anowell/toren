@@ -114,9 +114,7 @@ export type WorkOp =
 	| { type: 'client_disconnected'; client_id: string };
 
 // Ancillary WebSocket Request Types
-export type AncillaryWsRequest =
-	| { type: 'message'; content: string }
-	| { type: 'interrupt' };
+export type AncillaryWsRequest = { type: 'message'; content: string } | { type: 'interrupt' };
 
 // Ancillary WebSocket Response Types
 export type AncillaryWsResponse =

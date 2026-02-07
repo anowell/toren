@@ -1,7 +1,12 @@
-import { writable, derived, get } from 'svelte/store';
+import { derived, get, writable } from 'svelte/store';
 import { client, torenStore } from './toren';
 
-export type ConnectionPhase = 'idle' | 'connecting' | 'authenticating' | 'connected' | 'disconnected';
+export type ConnectionPhase =
+	| 'idle'
+	| 'connecting'
+	| 'authenticating'
+	| 'connected'
+	| 'disconnected';
 
 export interface ConnectionState {
 	phase: ConnectionPhase;
@@ -41,7 +46,10 @@ export interface ConnectionManagerDeps {
 const defaultDeps: ConnectionManagerDeps = {
 	createWebSocket: (url) => new WebSocket(url),
 	fetch: globalThis.fetch?.bind(globalThis),
-	storage: typeof localStorage !== 'undefined' ? localStorage : { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+	storage:
+		typeof localStorage !== 'undefined'
+			? localStorage
+			: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
 	setTimeout: globalThis.setTimeout.bind(globalThis),
 	clearTimeout: globalThis.clearTimeout.bind(globalThis),
 	addVisibilityListener: (fn) => {
@@ -176,7 +184,11 @@ export class ConnectionManager {
 		const state = get(connectionStore);
 
 		// Auth failure: clear credentials and go to idle
-		if (state.phase === 'authenticating' || message.includes('Auth failed') || message.includes('Invalid token')) {
+		if (
+			state.phase === 'authenticating' ||
+			message.includes('Auth failed') ||
+			message.includes('Invalid token')
+		) {
 			this.clearCredentials();
 			connectionStore.update((s) => ({
 				...s,
@@ -231,7 +243,7 @@ export class ConnectionManager {
 
 	private scheduleReconnect(shipUrl: string, sessionToken: string, attempt: number): void {
 		this.clearReconnectTimer();
-		const delay = Math.min(BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1), MAX_RETRY_DELAY_MS);
+		const delay = Math.min(BASE_RETRY_DELAY_MS * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
 
 		this.reconnectTimer = this.deps.setTimeout(() => {
 			this.reconnectTimer = null;
@@ -243,7 +255,10 @@ export class ConnectionManager {
 
 	private startHeartbeat(shipUrl: string): void {
 		this.stopHeartbeat();
-		this.heartbeatTimer = this.deps.setTimeout(() => this.heartbeatTick(shipUrl), HEARTBEAT_INTERVAL_MS);
+		this.heartbeatTimer = this.deps.setTimeout(
+			() => this.heartbeatTick(shipUrl),
+			HEARTBEAT_INTERVAL_MS,
+		);
 	}
 
 	private async heartbeatTick(shipUrl: string): Promise<void> {
@@ -253,7 +268,9 @@ export class ConnectionManager {
 		if (state.phase !== 'connected') return;
 
 		try {
-			const resp = await this.deps.fetch(`${shipUrl}/health`, { signal: AbortSignal.timeout(5000) });
+			const resp = await this.deps.fetch(`${shipUrl}/health`, {
+				signal: AbortSignal.timeout(5000),
+			});
 			if (!resp.ok) throw new Error(`Health check returned ${resp.status}`);
 
 			if (this.destroyed) return;
@@ -265,7 +282,10 @@ export class ConnectionManager {
 
 			if (this.destroyed) return;
 			// Schedule next tick
-			this.heartbeatTimer = this.deps.setTimeout(() => this.heartbeatTick(shipUrl), HEARTBEAT_INTERVAL_MS);
+			this.heartbeatTimer = this.deps.setTimeout(
+				() => this.heartbeatTick(shipUrl),
+				HEARTBEAT_INTERVAL_MS,
+			);
 		} catch {
 			if (this.destroyed) return;
 			// Health check failed — trigger reconnect
@@ -273,7 +293,11 @@ export class ConnectionManager {
 			if (!token) return;
 
 			client.disconnect();
-			connectionStore.update((s) => ({ ...s, phase: 'disconnected', lastError: 'Health check failed' }));
+			connectionStore.update((s) => ({
+				...s,
+				phase: 'disconnected',
+				lastError: 'Health check failed',
+			}));
 			torenStore.update((s) => ({ ...s, connected: false, authenticated: false }));
 			this.connectFull(shipUrl, token);
 		}
@@ -341,6 +365,6 @@ export class ConnectionManager {
 
 	/** Compute backoff delay for a given attempt (exported for testing) */
 	static backoffDelay(attempt: number): number {
-		return Math.min(BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1), MAX_RETRY_DELAY_MS);
+		return Math.min(BASE_RETRY_DELAY_MS * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
 	}
 }

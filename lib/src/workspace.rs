@@ -46,8 +46,12 @@ impl WorkspaceManager {
 
         // Ensure parent directory exists
         if let Some(parent) = ws_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create workspace parent directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create workspace parent directory: {}",
+                    parent.display()
+                )
+            })?;
         }
 
         // Check if workspace already exists
@@ -57,7 +61,10 @@ impl WorkspaceManager {
             if ws_path.join(".jj").exists() {
                 return Ok(ws_path);
             }
-            anyhow::bail!("Directory exists but is not a valid jj workspace: {}", ws_path.display());
+            anyhow::bail!(
+                "Directory exists but is not a valid jj workspace: {}",
+                ws_path.display()
+            );
         }
 
         // Create workspace using jj workspace add
@@ -113,8 +120,12 @@ impl WorkspaceManager {
 
         if ws_path.exists() {
             info!("Deleting workspace directory: {}", ws_path.display());
-            std::fs::remove_dir_all(&ws_path)
-                .with_context(|| format!("Failed to delete workspace directory: {}", ws_path.display()))?;
+            std::fs::remove_dir_all(&ws_path).with_context(|| {
+                format!(
+                    "Failed to delete workspace directory: {}",
+                    ws_path.display()
+                )
+            })?;
         }
 
         Ok(())
@@ -237,5 +248,4 @@ impl WorkspaceManager {
 
         Ok(ws_path)
     }
-
 }

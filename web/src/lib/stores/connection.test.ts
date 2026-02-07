@@ -1,14 +1,14 @@
 import { get } from 'svelte/store';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+	BASE_RETRY_DELAY_MS,
 	ConnectionManager,
-	connectionStore,
 	type ConnectionManagerDeps,
 	type ConnectionState,
-	BASE_RETRY_DELAY_MS,
-	MAX_RETRY_DELAY_MS,
-	MAX_RECONNECT_ATTEMPTS,
+	connectionStore,
 	HEARTBEAT_INTERVAL_MS,
+	MAX_RECONNECT_ATTEMPTS,
+	MAX_RETRY_DELAY_MS,
 } from './connection';
 import { client, torenStore } from './toren';
 
@@ -41,11 +41,7 @@ vi.mock('./toren', async () => {
 		subscribe,
 		set,
 		update,
-		get: () => {
-			let state: any;
-			subscribe((s: any) => (state = s))();
-			return state;
-		},
+		get: () => svelteStore.get({ subscribe }),
 		reset: () => set({ ...initialState }),
 		loadSegments: vi.fn().mockResolvedValue(undefined),
 		loadAssignments: vi.fn().mockResolvedValue(undefined),
@@ -61,8 +57,8 @@ vi.mock('./toren', async () => {
 			authenticate: vi.fn().mockResolvedValue(undefined),
 			isConnected: vi.fn().mockReturnValue(false),
 		},
-		isConnected: svelteStore.derived(store, ($s: any) => $s.connected),
-		isAuthenticated: svelteStore.derived(store, ($s: any) => $s.authenticated),
+		isConnected: svelteStore.derived(store, ($s: typeof initialState) => $s.connected),
+		isAuthenticated: svelteStore.derived(store, ($s: typeof initialState) => $s.authenticated),
 	};
 });
 
@@ -72,8 +68,12 @@ function createMockStorage(initial: Record<string, string> = {}): ConnectionMana
 	const data = new Map(Object.entries(initial));
 	return {
 		getItem: vi.fn((key: string) => data.get(key) ?? null),
-		setItem: vi.fn((key: string, value: string) => { data.set(key, value); }),
-		removeItem: vi.fn((key: string) => { data.delete(key); }),
+		setItem: vi.fn((key: string, value: string) => {
+			data.set(key, value);
+		}),
+		removeItem: vi.fn((key: string) => {
+			data.delete(key);
+		}),
 	};
 }
 
@@ -129,7 +129,7 @@ describe('ConnectionManager', () => {
 		// client.connect resolves → phase becomes authenticating
 		// client.authenticate resolves → phase becomes connected
 		vi.mocked(client.connect).mockImplementation(async () => {
-			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+			torenStore.update((s) => ({ ...s, connected: true, connecting: false }));
 		});
 		vi.mocked(client.authenticate).mockResolvedValue(undefined);
 
@@ -197,7 +197,7 @@ describe('ConnectionManager', () => {
 		let connectCount = 0;
 		vi.mocked(client.connect).mockImplementation(async () => {
 			connectCount++;
-			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+			torenStore.update((s) => ({ ...s, connected: true, connecting: false }));
 		});
 		vi.mocked(client.authenticate).mockResolvedValue(undefined);
 
@@ -233,7 +233,7 @@ describe('ConnectionManager', () => {
 		});
 
 		vi.mocked(client.connect).mockImplementation(async () => {
-			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+			torenStore.update((s) => ({ ...s, connected: true, connecting: false }));
 		});
 		vi.mocked(client.authenticate).mockResolvedValue(undefined);
 
@@ -242,7 +242,7 @@ describe('ConnectionManager', () => {
 		const mockSetTimeout = vi.fn((fn: () => void, ms: number) => {
 			const id = timeoutCallbacks.length;
 			timeoutCallbacks.push({ fn, ms });
-			return id as any;
+			return id as unknown as ReturnType<typeof setTimeout>;
 		});
 
 		let fetchCallCount = 0;
@@ -271,7 +271,7 @@ describe('ConnectionManager', () => {
 		// Find and fire the heartbeat timeout
 		const heartbeatEntry = timeoutCallbacks.find((e) => e.ms === HEARTBEAT_INTERVAL_MS);
 		expect(heartbeatEntry).toBeDefined();
-		heartbeatEntry!.fn();
+		heartbeatEntry?.fn();
 
 		await vi.waitFor(() => {
 			// Should have detected failure and started reconnecting
@@ -300,7 +300,7 @@ describe('ConnectionManager', () => {
 		});
 
 		vi.mocked(client.connect).mockImplementation(async () => {
-			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+			torenStore.update((s) => ({ ...s, connected: true, connecting: false }));
 		});
 		vi.mocked(client.authenticate).mockResolvedValue(undefined);
 
@@ -360,7 +360,7 @@ describe('ConnectionManager', () => {
 		});
 
 		vi.mocked(client.connect).mockImplementation(async () => {
-			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+			torenStore.update((s) => ({ ...s, connected: true, connecting: false }));
 		});
 		vi.mocked(client.authenticate).mockResolvedValue(undefined);
 
@@ -372,7 +372,9 @@ describe('ConnectionManager', () => {
 			fetch: mockFetch,
 			addVisibilityListener: vi.fn((fn) => {
 				visibilityCallback = fn;
-				return () => { visibilityCallback = null; };
+				return () => {
+					visibilityCallback = null;
+				};
 			}),
 		});
 
@@ -389,7 +391,7 @@ describe('ConnectionManager', () => {
 
 		// Simulate tab becoming visible
 		expect(visibilityCallback).not.toBeNull();
-		visibilityCallback!();
+		(visibilityCallback as unknown as () => void)();
 
 		// Should have called fetch for health check
 		await vi.waitFor(() => {
@@ -413,10 +415,10 @@ describe('ConnectionManager', () => {
 		});
 
 		vi.mocked(client.connect).mockImplementation(async () => {
-			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+			torenStore.update((s) => ({ ...s, connected: true, connecting: false }));
 		});
 		vi.mocked(client.authenticate).mockImplementation(async () => {
-			torenStore.update((s: any) => ({ ...s, authenticated: true }));
+			torenStore.update((s) => ({ ...s, authenticated: true }));
 		});
 
 		const deps = createTestDeps({ storage });
@@ -460,7 +462,7 @@ describe('ConnectionManager', () => {
 		let connectCount = 0;
 		vi.mocked(client.connect).mockImplementation(async () => {
 			connectCount++;
-			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+			torenStore.update((s) => ({ ...s, connected: true, connecting: false }));
 		});
 		vi.mocked(client.authenticate).mockResolvedValue(undefined);
 
@@ -498,7 +500,7 @@ describe('ConnectionManager', () => {
 		const storage = createMockStorage();
 
 		vi.mocked(client.connect).mockImplementation(async () => {
-			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+			torenStore.update((s) => ({ ...s, connected: true, connecting: false }));
 		});
 		vi.mocked(client.authenticate).mockResolvedValue(undefined);
 
@@ -531,7 +533,7 @@ describe('ConnectionManager', () => {
 		});
 
 		vi.mocked(client.connect).mockImplementation(async () => {
-			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+			torenStore.update((s) => ({ ...s, connected: true, connecting: false }));
 		});
 		vi.mocked(client.authenticate).mockResolvedValue(undefined);
 
@@ -564,7 +566,7 @@ describe('ConnectionManager', () => {
 		});
 
 		vi.mocked(client.connect).mockImplementation(async () => {
-			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+			torenStore.update((s) => ({ ...s, connected: true, connecting: false }));
 		});
 		vi.mocked(client.authenticate).mockResolvedValue(undefined);
 
@@ -573,7 +575,7 @@ describe('ConnectionManager', () => {
 		const mockSetTimeout = vi.fn((fn: () => void, ms: number) => {
 			const id = timeoutCallbacks.length;
 			timeoutCallbacks.push({ fn, ms });
-			return id as any;
+			return id as unknown as ReturnType<typeof setTimeout>;
 		});
 
 		const mockFetch = vi.fn().mockResolvedValue({ ok: true } as Response);
@@ -596,7 +598,7 @@ describe('ConnectionManager', () => {
 		// Find and fire the heartbeat timeout
 		const heartbeatEntry = timeoutCallbacks.find((e) => e.ms === HEARTBEAT_INTERVAL_MS);
 		expect(heartbeatEntry).toBeDefined();
-		heartbeatEntry!.fn();
+		heartbeatEntry?.fn();
 
 		await vi.waitFor(() => {
 			expect(onHeartbeat).toHaveBeenCalledTimes(1);
@@ -612,7 +614,7 @@ describe('ConnectionManager', () => {
 		});
 
 		vi.mocked(client.connect).mockImplementation(async () => {
-			torenStore.update((s: any) => ({ ...s, connected: true, connecting: false }));
+			torenStore.update((s) => ({ ...s, connected: true, connecting: false }));
 		});
 		vi.mocked(client.authenticate).mockResolvedValue(undefined);
 

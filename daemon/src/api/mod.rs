@@ -1,9 +1,6 @@
 use anyhow::Result;
 use axum::{
-    extract::{
-        ws::WebSocketUpgrade,
-        Path, Query, State,
-    },
+    extract::{ws::WebSocketUpgrade, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -40,6 +37,7 @@ pub struct AppState {
     pub work_manager: Arc<WorkManager>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     addr: &str,
     config: Config,
@@ -82,8 +80,14 @@ pub async fn serve(
         .route("/api/assignments", get(assignments_list))
         .route("/api/assignments", post(assignments_create))
         .route("/api/assignments/:id", get(assignments_get))
-        .route("/api/assignments/:id", axum::routing::delete(assignments_delete))
-        .route("/api/assignments/:id/status", post(assignments_update_status))
+        .route(
+            "/api/assignments/:id",
+            axum::routing::delete(assignments_delete),
+        )
+        .route(
+            "/api/assignments/:id/status",
+            post(assignments_update_status),
+        )
         .route("/api/segments/list", get(segments_list))
         .route("/api/segments/create", post(segments_create))
         .route("/api/workspaces/list/:segment", get(workspaces_list))
@@ -119,7 +123,10 @@ async fn pair_device(
     State(state): State<AppState>,
     Json(request): Json<PairRequest>,
 ) -> Result<Json<PairResponse>, StatusCode> {
-    if !state.security.validate_pairing_token(&request.pairing_token) {
+    if !state
+        .security
+        .validate_pairing_token(&request.pairing_token)
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -134,10 +141,7 @@ async fn pair_device(
     }))
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(|socket| ws_handler::handle_websocket(socket, state))
 }
 
@@ -200,7 +204,11 @@ async fn ancillary_start_work(
     }
 
     // Start work
-    match state.work_manager.start_work(ancillary_id.clone(), assignment).await {
+    match state
+        .work_manager
+        .start_work(ancillary_id.clone(), assignment)
+        .await
+    {
         Ok(work) => {
             let status = work.status().await;
             Ok(Json(serde_json::json!({
@@ -234,9 +242,7 @@ async fn ancillary_stop_work(
     }
 }
 
-async fn ancillaries_list(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn ancillaries_list(State(state): State<AppState>) -> impl IntoResponse {
     let ancillaries = state.ancillaries.list();
     Json(serde_json::json!({
         "ancillaries": ancillaries,
@@ -244,9 +250,7 @@ async fn ancillaries_list(
     }))
 }
 
-async fn segments_list(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn segments_list(State(state): State<AppState>) -> impl IntoResponse {
     let segments = state.segments.read().unwrap();
     let roots = segments.roots();
     let all_segments = segments.list_all();
@@ -286,7 +290,10 @@ async fn workspaces_list(
     State(state): State<AppState>,
     Path(segment): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let ws_mgr = state.workspaces.as_ref().ok_or(StatusCode::NOT_IMPLEMENTED)?;
+    let ws_mgr = state
+        .workspaces
+        .as_ref()
+        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
 
     let segment_path = {
         let segments = state.segments.read().unwrap();
@@ -318,11 +325,16 @@ async fn workspaces_cleanup(
     State(state): State<AppState>,
     Json(request): Json<WorkspaceCleanupRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let ws_mgr = state.workspaces.as_ref().ok_or(StatusCode::NOT_IMPLEMENTED)?;
+    let ws_mgr = state
+        .workspaces
+        .as_ref()
+        .ok_or(StatusCode::NOT_IMPLEMENTED)?;
 
     let segment_path = {
         let segments = state.segments.read().unwrap();
-        segments.find_by_name(&request.segment).map(|s| s.path.clone())
+        segments
+            .find_by_name(&request.segment)
+            .map(|s| s.path.clone())
     };
 
     let segment_path = segment_path.ok_or(StatusCode::NOT_FOUND)?;
@@ -405,10 +417,12 @@ async fn assignments_get(
 
     // Try to find by bead ID (return first active)
     let by_bead = assignments.get_by_bead(&id);
-    if let Some(assignment) = by_bead
-        .into_iter()
-        .find(|a| matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
-    {
+    if let Some(assignment) = by_bead.into_iter().find(|a| {
+        matches!(
+            a.status,
+            AssignmentStatus::Pending | AssignmentStatus::Active
+        )
+    }) {
         return Ok(Json(AssignmentResponse {
             assignment: assignment.clone(),
         }));
@@ -421,15 +435,17 @@ async fn assignments_create(
     State(state): State<AppState>,
     Json(request): Json<CreateAssignmentRequest>,
 ) -> Result<Json<AssignmentResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let ws_mgr = state
-        .workspaces
-        .as_ref()
-        .ok_or((StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({"error": "workspace_root not configured"}))))?;
+    let ws_mgr = state.workspaces.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "workspace_root not configured"})),
+    ))?;
 
     // Get segment path
     let segment_path = {
         let segments = state.segments.read().unwrap();
-        segments.find_by_name(&request.segment).map(|s| s.path.clone())
+        segments
+            .find_by_name(&request.segment)
+            .map(|s| s.path.clone())
     };
 
     let segment_path = segment_path.ok_or((
@@ -443,7 +459,13 @@ async fn assignments_create(
     let (bead_id, original_prompt, bead_title) = if let Some(ref prompt) = request.prompt {
         // Create bead from prompt
         let title = request.title.clone().unwrap_or_else(|| {
-            prompt.lines().next().unwrap_or(prompt).chars().take(80).collect()
+            prompt
+                .lines()
+                .next()
+                .unwrap_or(prompt)
+                .chars()
+                .take(80)
+                .collect()
         });
 
         let new_bead_id = toren_lib::tasks::beads::create_and_claim_bead(
@@ -492,7 +514,12 @@ async fn assignments_create(
 
     // Create workspace (with setup hooks)
     let ws_path = ws_mgr
-        .create_workspace_with_setup(&segment_path, &request.segment, &ws_name, Some(ancillary_num))
+        .create_workspace_with_setup(
+            &segment_path,
+            &request.segment,
+            &ws_name,
+            Some(ancillary_num),
+        )
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -503,20 +530,37 @@ async fn assignments_create(
     // Create assignment
     let assignment = if let Some(prompt) = original_prompt {
         assignments
-            .create_from_prompt(&ancillary_id, &bead_id, &prompt, &request.segment, ws_path, bead_title)
+            .create_from_prompt(
+                &ancillary_id,
+                &bead_id,
+                &prompt,
+                &request.segment,
+                ws_path,
+                bead_title,
+            )
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Failed to create assignment: {}", e)})),
+                    Json(
+                        serde_json::json!({"error": format!("Failed to create assignment: {}", e)}),
+                    ),
                 )
             })?
     } else {
         assignments
-            .create_from_bead(&ancillary_id, &bead_id, &request.segment, ws_path, bead_title)
+            .create_from_bead(
+                &ancillary_id,
+                &bead_id,
+                &request.segment,
+                ws_path,
+                bead_title,
+            )
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Failed to create assignment: {}", e)})),
+                    Json(
+                        serde_json::json!({"error": format!("Failed to create assignment: {}", e)}),
+                    ),
                 )
             })?
     };

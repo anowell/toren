@@ -1,11 +1,11 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use toren_lib::Config;
 use crate::security::SecurityContext;
+use toren_lib::Config;
 
-pub mod filesystem;
 pub mod command;
+pub mod filesystem;
 pub mod vcs;
 
 #[derive(Clone)]

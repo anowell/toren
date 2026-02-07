@@ -23,8 +23,13 @@ pub struct WorkEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkOp {
     // Claude conversation
-    AssistantMessage { content: String },
-    UserMessage { content: String, client_id: String },
+    AssistantMessage {
+        content: String,
+    },
+    UserMessage {
+        content: String,
+        client_id: String,
+    },
     ThinkingStart,
     ThinkingEnd,
 
@@ -41,8 +46,12 @@ pub enum WorkOp {
     },
 
     // File operations
-    FileRead { path: PathBuf },
-    FileWrite { path: PathBuf },
+    FileRead {
+        path: PathBuf,
+    },
+    FileWrite {
+        path: PathBuf,
+    },
 
     // Command execution
     CommandStart {
@@ -53,17 +62,29 @@ pub enum WorkOp {
         stdout: Option<String>,
         stderr: Option<String>,
     },
-    CommandExit { code: i32 },
+    CommandExit {
+        code: i32,
+    },
 
     // Lifecycle
-    AssignmentStarted { bead_id: String },
+    AssignmentStarted {
+        bead_id: String,
+    },
     AssignmentCompleted,
-    AssignmentFailed { error: String },
-    StatusChange { status: String },
+    AssignmentFailed {
+        error: String,
+    },
+    StatusChange {
+        status: String,
+    },
 
     // Observability
-    ClientConnected { client_id: String },
-    ClientDisconnected { client_id: String },
+    ClientConnected {
+        client_id: String,
+    },
+    ClientDisconnected {
+        client_id: String,
+    },
 }
 
 /// Persistent work log for an ancillary assignment.
@@ -142,7 +163,7 @@ impl WorkLog {
 
         let events: Vec<WorkEvent> = reader
             .lines()
-            .filter_map(|line| line.ok())
+            .map_while(Result::ok)
             .filter_map(|line| serde_json::from_str(&line).ok())
             .collect();
 
@@ -201,7 +222,7 @@ impl WorkLog {
 
         let events: Vec<WorkEvent> = reader
             .lines()
-            .filter_map(|line| line.ok())
+            .map_while(Result::ok)
             .filter_map(|line| serde_json::from_str(&line).ok())
             .filter(|e: &WorkEvent| e.seq >= from_seq)
             .collect();
@@ -210,6 +231,7 @@ impl WorkLog {
     }
 
     /// Get the path to the log file
+    #[allow(dead_code)]
     pub fn path(&self) -> &PathBuf {
         &self.log_path
     }

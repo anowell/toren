@@ -6,8 +6,8 @@ pub mod workspace;
 pub mod workspace_setup;
 
 pub use assignment::{
-    ancillary_id, ancillary_number, ancillary_segment, number_to_word, word_to_number,
-    Assignment, AssignmentManager, AssignmentRef, AssignmentSource, AssignmentStatus,
+    ancillary_id, ancillary_number, ancillary_segment, number_to_word, word_to_number, Assignment,
+    AssignmentManager, AssignmentRef, AssignmentSource, AssignmentStatus,
 };
 pub use config::Config;
 pub use segments::{Segment, SegmentManager};

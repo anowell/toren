@@ -58,9 +58,26 @@ pub struct Assignment {
 
 /// Number words for ancillary naming (One through Twenty)
 const NUMBER_WORDS: &[&str] = &[
-    "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
-    "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen",
-    "Eighteen", "Nineteen", "Twenty",
+    "One",
+    "Two",
+    "Three",
+    "Four",
+    "Five",
+    "Six",
+    "Seven",
+    "Eight",
+    "Nine",
+    "Ten",
+    "Eleven",
+    "Twelve",
+    "Thirteen",
+    "Fourteen",
+    "Fifteen",
+    "Sixteen",
+    "Seventeen",
+    "Eighteen",
+    "Nineteen",
+    "Twenty",
 ];
 
 /// Convert a number to its word form (1 -> "One", 2 -> "Two", etc.)
@@ -101,12 +118,18 @@ pub fn ancillary_id(segment: &str, number: u32) -> String {
 
 /// Extract the number from an ancillary ID
 pub fn ancillary_number(ancillary_id: &str) -> Option<u32> {
-    ancillary_id.split_whitespace().last().and_then(word_to_number)
+    ancillary_id
+        .split_whitespace()
+        .last()
+        .and_then(word_to_number)
 }
 
 /// Extract the segment from an ancillary ID (lowercased)
 pub fn ancillary_segment(ancillary_id: &str) -> Option<String> {
-    ancillary_id.split_whitespace().next().map(|s| s.to_lowercase())
+    ancillary_id
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_lowercase())
 }
 
 fn capitalize(s: &str) -> String {
@@ -179,15 +202,18 @@ impl AssignmentManager {
     /// Load assignments from disk
     fn load(&mut self) -> Result<()> {
         if !self.storage_path.exists() {
-            debug!("No existing assignments file at {}", self.storage_path.display());
+            debug!(
+                "No existing assignments file at {}",
+                self.storage_path.display()
+            );
             return Ok(());
         }
 
         let content = std::fs::read_to_string(&self.storage_path)
             .with_context(|| format!("Failed to read {}", self.storage_path.display()))?;
 
-        let assignments: Vec<Assignment> = serde_json::from_str(&content)
-            .with_context(|| "Failed to parse assignments.json")?;
+        let assignments: Vec<Assignment> =
+            serde_json::from_str(&content).with_context(|| "Failed to parse assignments.json")?;
 
         self.assignments.clear();
         for a in assignments {
@@ -241,10 +267,14 @@ impl AssignmentManager {
             bead_title,
         };
 
-        self.assignments.insert(assignment.id.clone(), assignment.clone());
+        self.assignments
+            .insert(assignment.id.clone(), assignment.clone());
         self.save()?;
 
-        info!("Created assignment from bead: {} -> {}", ancillary_id, bead_id);
+        info!(
+            "Created assignment from bead: {} -> {}",
+            ancillary_id, bead_id
+        );
         Ok(assignment)
     }
 
@@ -276,10 +306,14 @@ impl AssignmentManager {
             bead_title,
         };
 
-        self.assignments.insert(assignment.id.clone(), assignment.clone());
+        self.assignments
+            .insert(assignment.id.clone(), assignment.clone());
         self.save()?;
 
-        info!("Created assignment from prompt: {} -> {}", ancillary_id, bead_id);
+        info!(
+            "Created assignment from prompt: {} -> {}",
+            ancillary_id, bead_id
+        );
         Ok(assignment)
     }
 
@@ -318,12 +352,13 @@ impl AssignmentManager {
 
     /// Get active assignment for an ancillary (should be at most one)
     pub fn get_active_for_ancillary(&self, ancillary_id: &str) -> Option<&Assignment> {
-        self.assignments
-            .values()
-            .find(|a| {
-                a.ancillary_id.to_lowercase() == ancillary_id.to_lowercase()
-                    && matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active)
-            })
+        self.assignments.values().find(|a| {
+            a.ancillary_id.to_lowercase() == ancillary_id.to_lowercase()
+                && matches!(
+                    a.status,
+                    AssignmentStatus::Pending | AssignmentStatus::Active
+                )
+        })
     }
 
     /// Remove assignment by ID
@@ -337,7 +372,8 @@ impl AssignmentManager {
 
     /// Remove all assignments for an ancillary
     pub fn dismiss_ancillary(&mut self, ancillary_id: &str) -> Result<Vec<Assignment>> {
-        let ids: Vec<_> = self.assignments
+        let ids: Vec<_> = self
+            .assignments
             .values()
             .filter(|a| a.ancillary_id.to_lowercase() == ancillary_id.to_lowercase())
             .map(|a| a.id.clone())
@@ -350,7 +386,11 @@ impl AssignmentManager {
 
         if !removed.is_empty() {
             self.save()?;
-            info!("Dismissed {} assignment(s) for ancillary {}", removed.len(), ancillary_id);
+            info!(
+                "Dismissed {} assignment(s) for ancillary {}",
+                removed.len(),
+                ancillary_id
+            );
         }
 
         Ok(removed)
@@ -358,7 +398,8 @@ impl AssignmentManager {
 
     /// Remove all assignments for a bead
     pub fn dismiss_bead(&mut self, bead_id: &str) -> Result<Vec<Assignment>> {
-        let ids: Vec<_> = self.assignments
+        let ids: Vec<_> = self
+            .assignments
             .values()
             .filter(|a| a.bead_id == bead_id)
             .map(|a| a.id.clone())
@@ -371,7 +412,11 @@ impl AssignmentManager {
 
         if !removed.is_empty() {
             self.save()?;
-            info!("Dismissed {} assignment(s) for bead {}", removed.len(), bead_id);
+            info!(
+                "Dismissed {} assignment(s) for bead {}",
+                removed.len(),
+                bead_id
+            );
         }
 
         Ok(removed)
@@ -394,7 +439,12 @@ impl AssignmentManager {
     pub fn list_active(&self) -> Vec<&Assignment> {
         self.assignments
             .values()
-            .filter(|a| matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
+            .filter(|a| {
+                matches!(
+                    a.status,
+                    AssignmentStatus::Pending | AssignmentStatus::Active
+                )
+            })
             .collect()
     }
 
@@ -404,7 +454,10 @@ impl AssignmentManager {
             .values()
             .filter(|a| {
                 a.segment.to_lowercase() == segment.to_lowercase()
-                    && matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active)
+                    && matches!(
+                        a.status,
+                        AssignmentStatus::Pending | AssignmentStatus::Active
+                    )
             })
             .collect()
     }
@@ -417,7 +470,12 @@ impl AssignmentManager {
         // Get ancillary numbers with active assignments
         let assigned_numbers: std::collections::HashSet<u32> = active_assignments
             .iter()
-            .filter(|a| matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
+            .filter(|a| {
+                matches!(
+                    a.status,
+                    AssignmentStatus::Pending | AssignmentStatus::Active
+                )
+            })
             .filter_map(|a| ancillary_number(&a.ancillary_id))
             .collect();
 
@@ -445,7 +503,12 @@ impl AssignmentManager {
     pub fn resolve_active(&self, ref_: &AssignmentRef) -> Vec<&Assignment> {
         self.resolve(ref_)
             .into_iter()
-            .filter(|a| matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
+            .filter(|a| {
+                matches!(
+                    a.status,
+                    AssignmentStatus::Pending | AssignmentStatus::Active
+                )
+            })
             .collect()
     }
 }

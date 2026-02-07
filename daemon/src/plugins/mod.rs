@@ -58,8 +58,7 @@ impl PluginManager {
     pub fn load_all(&mut self) -> Result<()> {
         for dir in &self.plugin_dirs.clone() {
             if !dir.exists() {
-                std::fs::create_dir_all(dir)
-                    .context("Failed to create plugin directory")?;
+                std::fs::create_dir_all(dir).context("Failed to create plugin directory")?;
                 continue;
             }
 
@@ -80,8 +79,13 @@ impl PluginManager {
             {
                 match self.load_command_set(&path) {
                     Ok(command_set) => {
-                        info!("Loaded command set: {} from {}", command_set.name, path.display());
-                        self.command_sets.insert(command_set.id.clone(), command_set);
+                        info!(
+                            "Loaded command set: {} from {}",
+                            command_set.name,
+                            path.display()
+                        );
+                        self.command_sets
+                            .insert(command_set.id.clone(), command_set);
                     }
                     Err(e) => {
                         warn!("Failed to load command set from {}: {}", path.display(), e);
@@ -94,15 +98,15 @@ impl PluginManager {
     }
 
     fn load_command_set(&self, path: &Path) -> Result<CommandSet> {
-        let content = std::fs::read_to_string(path)
-            .context("Failed to read command set file")?;
+        let content = std::fs::read_to_string(path).context("Failed to read command set file")?;
 
-        let command_set: CommandSet = serde_yaml::from_str(&content)
-            .context("Failed to parse command set YAML")?;
+        let command_set: CommandSet =
+            serde_yaml::from_str(&content).context("Failed to parse command set YAML")?;
 
         Ok(command_set)
     }
 
+    #[allow(dead_code)]
     pub fn get_command_set(&self, id: &str) -> Option<&CommandSet> {
         self.command_sets.get(id)
     }
@@ -120,11 +124,7 @@ impl PluginManager {
         None
     }
 
-    pub fn interpolate_command(
-        &self,
-        command: &str,
-        params: &HashMap<String, String>,
-    ) -> String {
+    pub fn interpolate_command(&self, command: &str, params: &HashMap<String, String>) -> String {
         let mut result = command.to_string();
 
         for (key, value) in params {

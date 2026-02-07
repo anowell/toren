@@ -1,8 +1,10 @@
 <script lang="ts">
-import { client, torenStore } from '$lib/stores/toren';
 import { connectionStore } from '$lib/stores/connection';
+import { client, torenStore } from '$lib/stores/toren';
 
+// biome-ignore lint/style/useConst: svelte bind:value requires let
 let pairingToken = '';
+// biome-ignore lint/style/useConst: svelte bind:value requires let
 let shipUrl = 'http://localhost:8787';
 let pairing = false;
 let error = '';
@@ -44,10 +46,7 @@ async function handlePair() {
 		}));
 
 		// Load segments and assignments
-		await Promise.all([
-			torenStore.loadSegments(shipUrl),
-			torenStore.loadAssignments(shipUrl),
-		]);
+		await Promise.all([torenStore.loadSegments(shipUrl), torenStore.loadAssignments(shipUrl)]);
 
 		// Restore selected segment from localStorage
 		const savedSegment = localStorage.getItem('toren_selected_segment');

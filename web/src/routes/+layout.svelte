@@ -1,6 +1,6 @@
 <script lang="ts">
 import '../app.css';
-import { onMount, onDestroy } from 'svelte';
+import { onDestroy, onMount } from 'svelte';
 import { ConnectionManager, connectionStore } from '$lib/stores/connection';
 import { client, torenStore } from '$lib/stores/toren';
 

@@ -4,14 +4,14 @@ pub mod work_log;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::RwLock as TokioRwLock;
 use tracing::info;
 
 pub use runtime::{AncillaryWork, ClientInput, WorkStatus};
-pub use work_log::WorkEvent;
 use toren_lib::Assignment;
+pub use work_log::WorkEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -91,20 +91,21 @@ impl AncillaryManager {
     }
 
     /// Check if a workspace is already in use by another ancillary
-    pub fn is_workspace_in_use(&self, working_dir: &PathBuf) -> Option<String> {
+    pub fn is_workspace_in_use(&self, working_dir: &Path) -> Option<String> {
         let ancillaries = self.ancillaries.read().unwrap();
         ancillaries
             .values()
-            .find(|a| &a.working_dir == working_dir)
+            .find(|a| a.working_dir == working_dir)
             .map(|a| a.id.clone())
     }
 
     /// Release an ancillary from its workspace (but don't delete the workspace)
+    #[allow(dead_code)]
     pub fn release_workspace(&self, id: &str) -> Option<(String, PathBuf)> {
         let ancillaries = self.ancillaries.read().unwrap();
-        ancillaries.get(id).and_then(|a| {
-            a.workspace.clone().map(|ws| (ws, a.working_dir.clone()))
-        })
+        ancillaries
+            .get(id)
+            .and_then(|a| a.workspace.clone().map(|ws| (ws, a.working_dir.clone())))
     }
 
     pub fn unregister(&self, id: &str) {
@@ -140,6 +141,7 @@ impl AncillaryManager {
         ancillaries.values().cloned().collect()
     }
 
+    #[allow(dead_code)]
     pub fn find_by_session(&self, session_token: &str) -> Option<Ancillary> {
         let ancillaries = self.ancillaries.read().unwrap();
         ancillaries
@@ -170,8 +172,15 @@ impl WorkManager {
     }
 
     /// Start work for an ancillary on an assignment
-    pub async fn start_work(&self, ancillary_id: String, assignment: Assignment) -> Result<Arc<AncillaryWork>> {
-        info!("Starting work for {} on {}", ancillary_id, assignment.bead_id);
+    pub async fn start_work(
+        &self,
+        ancillary_id: String,
+        assignment: Assignment,
+    ) -> Result<Arc<AncillaryWork>> {
+        info!(
+            "Starting work for {} on {}",
+            ancillary_id, assignment.bead_id
+        );
 
         let work = AncillaryWork::start(ancillary_id.clone(), assignment).await?;
         let work = Arc::new(work);
@@ -201,6 +210,7 @@ impl WorkManager {
     }
 
     /// List all active work
+    #[allow(dead_code)]
     pub async fn list_active(&self) -> Vec<(String, WorkStatus)> {
         let active = self.active_work.read().await;
         let mut result = Vec::new();

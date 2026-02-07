@@ -24,7 +24,10 @@ enum WsResponse {
     /// Replay complete, now streaming live
     ReplayComplete { current_seq: u64 },
     /// Current status of the ancillary
-    Status { status: String, ancillary_id: String },
+    Status {
+        status: String,
+        ancillary_id: String,
+    },
     /// Error message
     Error { message: String },
 }

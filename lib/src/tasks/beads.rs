@@ -29,7 +29,9 @@ pub fn fetch_bead(bead_id: &str, working_dir: &Path) -> Result<Task> {
     let beads: Vec<BeadResponse> =
         serde_json::from_str(&stdout).context("Failed to parse bd output")?;
 
-    let bead = beads.into_iter().next()
+    let bead = beads
+        .into_iter()
+        .next()
         .ok_or_else(|| anyhow!("No bead found with id: {}", bead_id))?;
 
     Ok(Task {
@@ -75,7 +77,14 @@ pub fn update_bead_assignee(bead_id: &str, assignee: &str, working_dir: &Path) -
 /// Claim a bead (set status to in_progress and assignee)
 pub fn claim_bead(bead_id: &str, assignee: &str, working_dir: &Path) -> Result<()> {
     let output = Command::new("bd")
-        .args(["update", bead_id, "--status", "in_progress", "--assignee", assignee])
+        .args([
+            "update",
+            bead_id,
+            "--status",
+            "in_progress",
+            "--assignee",
+            assignee,
+        ])
         .current_dir(working_dir)
         .output()
         .context("Failed to execute bd update")?;
@@ -90,11 +99,7 @@ pub fn claim_bead(bead_id: &str, assignee: &str, working_dir: &Path) -> Result<(
 
 /// Create a new bead from a prompt/description.
 /// Returns the created bead ID.
-pub fn create_bead(
-    title: &str,
-    description: Option<&str>,
-    working_dir: &Path,
-) -> Result<String> {
+pub fn create_bead(title: &str, description: Option<&str>, working_dir: &Path) -> Result<String> {
     let mut args = vec!["create", "--silent", "--title", title];
 
     if let Some(desc) = description {

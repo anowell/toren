@@ -31,13 +31,22 @@ health:
 plugins:
     curl -s http://localhost:8788/api/plugins/commands | jq .
 
+# Run all checks (cargo check, clippy, biome, svelte-check)
+check:
+    cargo check
+    cargo clippy -- -D warnings
+    cd web && pnpm check
+    cd web && pnpm lint
+
 # Run tests
 test:
     cargo test
+    cd web && pnpm test
 
 # Format code
 fmt:
     cargo fmt
+    cd web && pnpm format
 
 # Clean build artifacts
 clean:

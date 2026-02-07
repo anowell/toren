@@ -12,7 +12,7 @@ $: selectedRoot = ($torenStore.segmentRoots ?? [])[0] || '';
 
 // Get set of segment names that have assignments
 $: segmentsWithAssignments = new Set(
-	($torenStore.assignments ?? []).map((a) => a.segment.toLowerCase())
+	($torenStore.assignments ?? []).map((a) => a.segment.toLowerCase()),
 );
 
 // Sort segments: those with assignments first, then alphabetically within each group

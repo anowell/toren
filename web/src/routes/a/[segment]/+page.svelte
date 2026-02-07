@@ -1,10 +1,16 @@
 <script lang="ts">
-import { page } from '$app/stores';
 import { goto } from '$app/navigation';
-import { torenStore, segmentAssignments, getAncillaryDisplayStatus, getBeadDisplayStatus, stripBeadPrefix } from '$lib/stores/toren';
+import { page } from '$app/stores';
 import BeadStatusIcon from '$lib/components/BeadStatusIcon.svelte';
-import { connectionStore } from '$lib/stores/connection';
 import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
+import { connectionStore } from '$lib/stores/connection';
+import {
+	getAncillaryDisplayStatus,
+	getBeadDisplayStatus,
+	segmentAssignments,
+	stripBeadPrefix,
+	torenStore,
+} from '$lib/stores/toren';
 
 let messageInput = '';
 let showMobilePanel = false;

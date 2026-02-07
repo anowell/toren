@@ -1,8 +1,14 @@
 <script lang="ts">
-import { page } from '$app/stores';
 import { goto } from '$app/navigation';
-import { torenStore, segmentAssignments, getAncillaryDisplayStatus, getBeadDisplayStatus, stripBeadPrefix } from '$lib/stores/toren';
+import { page } from '$app/stores';
 import BeadStatusIcon from '$lib/components/BeadStatusIcon.svelte';
+import {
+	getAncillaryDisplayStatus,
+	getBeadDisplayStatus,
+	segmentAssignments,
+	stripBeadPrefix,
+	torenStore,
+} from '$lib/stores/toren';
 
 // Load assignments when authenticated
 let assignmentsLoaded = false;

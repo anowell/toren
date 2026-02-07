@@ -1,11 +1,17 @@
 <script lang="ts">
-import { page } from '$app/stores';
+import { afterUpdate, onDestroy, tick } from 'svelte';
 import { goto } from '$app/navigation';
-import { onDestroy, afterUpdate, tick } from 'svelte';
-import { torenStore, segmentAssignments, getAncillaryDisplayStatus, getBeadDisplayStatus, stripBeadPrefix } from '$lib/stores/toren';
+import { page } from '$app/stores';
 import BeadStatusIcon from '$lib/components/BeadStatusIcon.svelte';
-import { connectionStore } from '$lib/stores/connection';
 import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
+import { connectionStore } from '$lib/stores/connection';
+import {
+	getAncillaryDisplayStatus,
+	getBeadDisplayStatus,
+	segmentAssignments,
+	stripBeadPrefix,
+	torenStore,
+} from '$lib/stores/toren';
 import type { AncillaryWsResponse, WorkEvent, WorkOp } from '$lib/types/toren';
 
 let messageInput = '';
@@ -194,7 +200,7 @@ function buildDisplayItems(events: WorkEvent[]): DisplayItem[] {
 			case 'assistant_message':
 				// Merge consecutive assistant messages
 				if (items.length > 0 && items[items.length - 1].type === 'assistant') {
-					items[items.length - 1].content += '\n' + op.content;
+					items[items.length - 1].content += `\n${op.content}`;
 				} else {
 					items.push({ type: 'assistant', content: op.content, seq: event.seq });
 				}
@@ -206,7 +212,8 @@ function buildDisplayItems(events: WorkEvent[]): DisplayItem[] {
 				items.push({
 					type: 'tool',
 					content: op.name,
-					detail: typeof op.input === 'object' ? summarizeToolInput(op.name, op.input) : String(op.input),
+					detail:
+						typeof op.input === 'object' ? summarizeToolInput(op.name, op.input) : String(op.input),
 					seq: event.seq,
 				});
 				break;
@@ -232,7 +239,7 @@ function buildDisplayItems(events: WorkEvent[]): DisplayItem[] {
 	return items;
 }
 
-function summarizeToolInput(name: string, input: unknown): string {
+function summarizeToolInput(_name: string, input: unknown): string {
 	if (!input || typeof input !== 'object') return '';
 	const obj = input as Record<string, unknown>;
 

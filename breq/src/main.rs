@@ -228,7 +228,15 @@ fn main() -> Result<()> {
             intent,
             segment,
             danger,
-        } => cmd_assign(&config, bead, prompt, title, intent, segment.as_deref(), danger),
+        } => cmd_assign(
+            &config,
+            bead,
+            prompt,
+            title,
+            intent,
+            segment.as_deref(),
+            danger,
+        ),
         Commands::List { all, segment } => cmd_list(&config, all, segment),
         Commands::Show { reference } => cmd_show(&config, &reference),
         Commands::Resume {
@@ -272,7 +280,6 @@ fn resolve_segment(segment_mgr: &SegmentManager, segment_name: Option<&str>) -> 
         })
     }
 }
-
 
 /// Generate workspace name for a bead assignment.
 /// Uses the ancillary number word (e.g. "one", "two") so workspaces can be reused.
@@ -348,7 +355,12 @@ fn cmd_assign(
     let ws_name = workspace_name_for_assignment(ancillary_num);
 
     // Create workspace and run setup hooks
-    let ws_path = workspace_mgr.create_workspace_with_setup(&segment.path, &segment.name, &ws_name, Some(ancillary_num))?;
+    let ws_path = workspace_mgr.create_workspace_with_setup(
+        &segment.path,
+        &segment.name,
+        &ws_name,
+        Some(ancillary_num),
+    )?;
     println!("Workspace: {}", ws_path.display());
 
     // Record assignment
@@ -362,7 +374,13 @@ fn cmd_assign(
             Some(task_title.clone()),
         )?;
     } else {
-        assignment_mgr.create_from_bead(&ancillary_id, &bead_id, &segment.name, ws_path.clone(), Some(task_title.clone()))?;
+        assignment_mgr.create_from_bead(
+            &ancillary_id,
+            &bead_id,
+            &segment.name,
+            ws_path.clone(),
+            Some(task_title.clone()),
+        )?;
     }
 
     // Build prompt for Claude
@@ -387,10 +405,16 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
 
     // Determine which segment(s) to list
     let (assignments, scope_label): (Vec<_>, &str) = if all_segments {
-        (assignment_mgr.list_active().into_iter().collect(), "all segments")
+        (
+            assignment_mgr.list_active().into_iter().collect(),
+            "all segments",
+        )
     } else if let Some(ref name) = segment_name {
         (
-            assignment_mgr.list_active_segment(name).into_iter().collect(),
+            assignment_mgr
+                .list_active_segment(name)
+                .into_iter()
+                .collect(),
             name.as_str(),
         )
     } else {
@@ -413,10 +437,7 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
         return Ok(());
     }
 
-    println!(
-        "{:<18} {:<15} {:<12} TITLE",
-        "ANCILLARY", "BEAD", "STATUS"
-    );
+    println!("{:<18} {:<15} {:<12} TITLE", "ANCILLARY", "BEAD", "STATUS");
     println!("{}", "-".repeat(70));
 
     for assignment in assignments {
@@ -533,7 +554,12 @@ fn cmd_show(config: &Config, reference: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_resume(config: &Config, reference: &str, instruction: Option<&str>, danger: bool) -> Result<()> {
+fn cmd_resume(
+    config: &Config,
+    reference: &str,
+    instruction: Option<&str>,
+    danger: bool,
+) -> Result<()> {
     let workspace_root = config
         .ancillary
         .workspace_root
@@ -558,15 +584,26 @@ fn cmd_resume(config: &Config, reference: &str, instruction: Option<&str>, dange
 
         // Prefer active assignments, but fall back to any assignment
         assignments.sort_by(|a, b| {
-            let a_active = matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active);
-            let b_active = matches!(b.status, AssignmentStatus::Pending | AssignmentStatus::Active);
+            let a_active = matches!(
+                a.status,
+                AssignmentStatus::Pending | AssignmentStatus::Active
+            );
+            let b_active = matches!(
+                b.status,
+                AssignmentStatus::Pending | AssignmentStatus::Active
+            );
             b_active.cmp(&a_active)
         });
 
         if assignments.len() > 1 {
             let active_count = assignments
                 .iter()
-                .filter(|a| matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
+                .filter(|a| {
+                    matches!(
+                        a.status,
+                        AssignmentStatus::Pending | AssignmentStatus::Active
+                    )
+                })
                 .count();
             if active_count > 1 {
                 println!("Multiple active assignments found:");
@@ -591,7 +628,12 @@ fn cmd_resume(config: &Config, reference: &str, instruction: Option<&str>, dange
             .context("Invalid workspace path")?;
         let ancillary_num = toren_lib::ancillary_number(&assignment.ancillary_id);
 
-        workspace_mgr.create_workspace_with_setup(&segment.path, &segment.name, ws_name, ancillary_num)?;
+        workspace_mgr.create_workspace_with_setup(
+            &segment.path,
+            &segment.name,
+            ws_name,
+            ancillary_num,
+        )?;
         println!("Workspace recreated: {}", ws_path.display());
     }
 
@@ -867,7 +909,10 @@ fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool) -
     if let Some(rev) = revision {
         if !push {
             println!("\nCommit preserved at: {}", &rev[..12.min(rev.len())]);
-            println!("To integrate: jj rebase -r {} -d main", &rev[..12.min(rev.len())]);
+            println!(
+                "To integrate: jj rebase -r {} -d main",
+                &rev[..12.min(rev.len())]
+            );
         }
     }
 
@@ -880,9 +925,7 @@ fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf,
 
     // Check if we're in a jj workspace
     if !cwd.join(".jj").exists() {
-        anyhow::bail!(
-            "Not in a jj workspace. Run this command from within a workspace directory."
-        );
+        anyhow::bail!("Not in a jj workspace. Run this command from within a workspace directory.");
     }
 
     // Get the workspace name from jj
@@ -896,9 +939,8 @@ fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf,
         anyhow::bail!("Failed to determine workspace root");
     }
 
-    let workspace_path = std::path::PathBuf::from(
-        String::from_utf8_lossy(&output.stdout).trim().to_string(),
-    );
+    let workspace_path =
+        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
 
     // Extract workspace name from path (last component)
     let workspace_name = workspace_path
@@ -924,14 +966,18 @@ fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf,
         check_path = parent.parent();
     }
 
-    let segment_path = segment_path.context(
-        "Could not find segment root. Ensure you're in a breq-managed workspace.",
-    )?;
+    let segment_path = segment_path
+        .context("Could not find segment root. Ensure you're in a breq-managed workspace.")?;
 
     Ok((segment_path, workspace_path, workspace_name))
 }
 
-fn cmd_go(config: &Config, workspace: &str, segment_name: Option<&str>, cmd: Vec<String>) -> Result<()> {
+fn cmd_go(
+    config: &Config,
+    workspace: &str,
+    segment_name: Option<&str>,
+    cmd: Vec<String>,
+) -> Result<()> {
     let workspace_root = config
         .ancillary
         .workspace_root
@@ -947,11 +993,7 @@ fn cmd_go(config: &Config, workspace: &str, segment_name: Option<&str>, cmd: Vec
     let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name);
 
     if !ws_path.exists() {
-        anyhow::bail!(
-            "Workspace '{}' not found at {}",
-            ws_name,
-            ws_path.display()
-        );
+        anyhow::bail!("Workspace '{}' not found at {}", ws_name, ws_path.display());
     }
 
     let (program, args): (String, Vec<String>) = if cmd.is_empty() {
@@ -989,7 +1031,12 @@ fn cmd_ws_setup(config: &Config) -> Result<()> {
         workspace_path.display()
     );
 
-    workspace_mgr.run_setup(&segment_path, &workspace_path, &workspace_name, ancillary_num)?;
+    workspace_mgr.run_setup(
+        &segment_path,
+        &workspace_path,
+        &workspace_name,
+        ancillary_num,
+    )?;
 
     println!("Setup complete.");
     Ok(())
@@ -1014,9 +1061,8 @@ fn cmd_init(stealth: bool) -> Result<()> {
         anyhow::bail!("Failed to determine jj workspace root");
     }
 
-    let jj_root = std::path::PathBuf::from(
-        String::from_utf8_lossy(&output.stdout).trim().to_string(),
-    );
+    let jj_root =
+        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
 
     if jj_root != cwd {
         anyhow::bail!(
@@ -1066,8 +1112,8 @@ fn cmd_init(stealth: bool) -> Result<()> {
 
     let gitignore_path = cwd.join(".gitignore");
     if gitignore_path.exists() {
-        let gitignore = std::fs::read_to_string(&gitignore_path)
-            .context("Failed to read .gitignore")?;
+        let gitignore =
+            std::fs::read_to_string(&gitignore_path).context("Failed to read .gitignore")?;
 
         for line in gitignore.lines() {
             let line = line.trim().trim_end_matches('/');

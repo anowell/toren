@@ -28,9 +28,15 @@ enum WsRequest {
         #[serde(default)]
         task_id: Option<String>,
     },
-    Command { request: CommandRequest },
-    FileRead { path: String },
-    VcsStatus { path: String },
+    Command {
+        request: CommandRequest,
+    },
+    FileRead {
+        path: String,
+    },
+    VcsStatus {
+        path: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -49,11 +55,21 @@ enum WsResponse {
         #[serde(skip_serializing_if = "Option::is_none")]
         instruction: Option<String>,
     },
-    AuthFailure { reason: String },
-    CommandOutput { output: crate::services::command::CommandOutput },
-    FileContent { content: String },
-    VcsStatus { status: crate::services::vcs::VcsStatus },
-    Error { message: String },
+    AuthFailure {
+        reason: String,
+    },
+    CommandOutput {
+        output: crate::services::command::CommandOutput,
+    },
+    FileContent {
+        content: String,
+    },
+    VcsStatus {
+        status: crate::services::vcs::VcsStatus,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub async fn handle_websocket(socket: WebSocket, state: AppState) {
@@ -77,7 +93,13 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
             let request: Result<WsRequest, _> = serde_json::from_str(&text);
 
             match request {
-                Ok(WsRequest::Auth { token, ancillary_id: aid, segment, workspace, task_id }) => {
+                Ok(WsRequest::Auth {
+                    token,
+                    ancillary_id: aid,
+                    segment,
+                    workspace,
+                    task_id,
+                }) => {
                     if !state.security.validate_session(&token) {
                         let response = WsResponse::AuthFailure {
                             reason: "Invalid token".to_string(),
@@ -132,7 +154,9 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 if let Some(ref ws_mgr) = state.workspaces {
                                     match ws_mgr.create_workspace(seg_path, &seg, ws) {
                                         Ok(ws_path) => {
-                                            if let Some(other_id) = state.ancillaries.is_workspace_in_use(&ws_path) {
+                                            if let Some(other_id) =
+                                                state.ancillaries.is_workspace_in_use(&ws_path)
+                                            {
                                                 let response = WsResponse::AuthFailure {
                                                     reason: format!("Workspace {} is already in use by ancillary {}", ws, other_id),
                                                 };
@@ -141,12 +165,16 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
                                                 }
                                                 break;
                                             }
-                                            working_dir_response = Some(ws_path.display().to_string());
+                                            working_dir_response =
+                                                Some(ws_path.display().to_string());
                                             (Some(ws.clone()), ws_path)
                                         }
                                         Err(e) => {
                                             let response = WsResponse::AuthFailure {
-                                                reason: format!("Failed to create workspace: {}", e),
+                                                reason: format!(
+                                                    "Failed to create workspace: {}",
+                                                    e
+                                                ),
                                             };
                                             if let Ok(json) = serde_json::to_string(&response) {
                                                 let _ = sender.send(Message::Text(json)).await;
@@ -156,7 +184,9 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
                                     }
                                 } else {
                                     let response = WsResponse::AuthFailure {
-                                        reason: "Workspace requested but workspace_root not configured".to_string(),
+                                        reason:
+                                            "Workspace requested but workspace_root not configured"
+                                                .to_string(),
                                     };
                                     if let Ok(json) = serde_json::to_string(&response) {
                                         let _ = sender.send(Message::Text(json)).await;
@@ -165,9 +195,14 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 }
                             }
                             (None, Some(seg_path)) => {
-                                if let Some(other_id) = state.ancillaries.is_workspace_in_use(seg_path) {
+                                if let Some(other_id) =
+                                    state.ancillaries.is_workspace_in_use(seg_path)
+                                {
                                     let response = WsResponse::AuthFailure {
-                                        reason: format!("Segment {} is already in use by ancillary {}", seg, other_id),
+                                        reason: format!(
+                                            "Segment {} is already in use by ancillary {}",
+                                            seg, other_id
+                                        ),
                                     };
                                     if let Ok(json) = serde_json::to_string(&response) {
                                         let _ = sender.send(Message::Text(json)).await;
@@ -218,7 +253,10 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
 
                     // Get the instruction if it was set
                     let instruction = ancillary_id.as_ref().and_then(|id| {
-                        state.ancillaries.get(id).and_then(|a| a.current_instruction.clone())
+                        state
+                            .ancillaries
+                            .get(id)
+                            .and_then(|a| a.current_instruction.clone())
                     });
 
                     let response = WsResponse::AuthSuccess {
@@ -237,7 +275,8 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
                     info!("WebSocket authenticated (legacy mode)");
                 }
                 Ok(req) if authenticated => {
-                    handle_authenticated_request(req, &state, &mut sender, ancillary_id.as_deref()).await;
+                    handle_authenticated_request(req, &state, &mut sender, ancillary_id.as_deref())
+                        .await;
                 }
                 Ok(_) => {
                     let response = WsResponse::Error {
@@ -334,8 +373,11 @@ async fn connect_via_assignment(
     // Generate instruction from bead
     let instruction = match tasks::fetch_task(&assignment.bead_id, working_dir) {
         Ok(task) => {
-            let prompt = tasks::generate_prompt(&task, &state.config.ancillary.task_prompt_template);
-            state.ancillaries.set_instruction(ancillary_id, Some(prompt.clone()));
+            let prompt =
+                tasks::generate_prompt(&task, &state.config.ancillary.task_prompt_template);
+            state
+                .ancillaries
+                .set_instruction(ancillary_id, Some(prompt.clone()));
             Some(prompt)
         }
         Err(e) => {
@@ -371,7 +413,9 @@ async fn handle_authenticated_request(
         WsRequest::Command { request } => {
             // Update status to Executing
             if let Some(id) = ancillary_id {
-                state.ancillaries.update_status(id, AncillaryStatus::Executing);
+                state
+                    .ancillaries
+                    .update_status(id, AncillaryStatus::Executing);
             }
 
             match state.services.command.execute(request).await {

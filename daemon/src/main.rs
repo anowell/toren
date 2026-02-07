@@ -24,9 +24,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .init();
+    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
     let cli = Cli::parse();
 
@@ -41,9 +39,15 @@ async fn main() -> Result<()> {
 
     // Log pairing token (indicate if it's from env var)
     if std::env::var("PAIRING_TOKEN").is_ok() {
-        info!("Security initialized. Using fixed pairing token: {}", security_ctx.pairing_token());
+        info!(
+            "Security initialized. Using fixed pairing token: {}",
+            security_ctx.pairing_token()
+        );
     } else {
-        info!("Security initialized. Pairing token: {}", security_ctx.pairing_token());
+        info!(
+            "Security initialized. Pairing token: {}",
+            security_ctx.pairing_token()
+        );
     }
 
     // Initialize plugin manager
@@ -73,7 +77,10 @@ async fn main() -> Result<()> {
 
     // Initialize workspace manager (if workspace_root is configured)
     let workspace_manager = config.ancillary.workspace_root.clone().map(|root| {
-        info!("Workspace manager initialized with root: {}", root.display());
+        info!(
+            "Workspace manager initialized with root: {}",
+            root.display()
+        );
         WorkspaceManager::new(root)
     });
 
@@ -85,7 +92,19 @@ async fn main() -> Result<()> {
     let addr = format!("{}:{}", config.host(), config.port());
     info!("Starting API server on {}", addr);
 
-    api::serve(&addr, config, services, security_ctx, plugin_manager, ancillary_manager, assignment_manager, segment_manager, workspace_manager, work_manager).await?;
+    api::serve(
+        &addr,
+        config,
+        services,
+        security_ctx,
+        plugin_manager,
+        ancillary_manager,
+        assignment_manager,
+        segment_manager,
+        workspace_manager,
+        work_manager,
+    )
+    .await?;
 
     Ok(())
 }

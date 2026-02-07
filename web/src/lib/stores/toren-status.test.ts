@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import type { AncillaryStatus } from '$lib/types/toren';
 import { getAncillaryDisplayStatus, getBeadDisplayStatus, stripBeadPrefix } from './toren';
-import type { AncillaryStatus, AssignmentStatus } from '$lib/types/toren';
 
 describe('getAncillaryDisplayStatus', () => {
 	it('maps busy statuses correctly', () => {

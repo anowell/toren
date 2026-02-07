@@ -28,7 +28,7 @@ impl SecurityContext {
         // Check for PAIRING_TOKEN env var, otherwise generate random
         let pairing_token = std::env::var("PAIRING_TOKEN")
             .ok()
-            .unwrap_or_else(|| Self::generate_pairing_token());
+            .unwrap_or_else(Self::generate_pairing_token);
 
         // Determine session file path
         let session_file = dirs::home_dir()
@@ -91,11 +91,11 @@ impl SecurityContext {
             return Ok(());
         }
 
-        let content = fs::read_to_string(&self.session_file)
-            .context("Failed to read session file")?;
+        let content =
+            fs::read_to_string(&self.session_file).context("Failed to read session file")?;
 
-        let sessions: HashMap<String, Session> = serde_json::from_str(&content)
-            .context("Failed to parse session file")?;
+        let sessions: HashMap<String, Session> =
+            serde_json::from_str(&content).context("Failed to parse session file")?;
 
         let mut guard = self.sessions.write().unwrap();
         *guard = sessions;
@@ -108,16 +108,14 @@ impl SecurityContext {
     fn save_sessions(&self) -> Result<()> {
         // Create parent directory if it doesn't exist
         if let Some(parent) = self.session_file.parent() {
-            fs::create_dir_all(parent)
-                .context("Failed to create session directory")?;
+            fs::create_dir_all(parent).context("Failed to create session directory")?;
         }
 
         let sessions = self.sessions.read().unwrap();
-        let content = serde_json::to_string_pretty(&*sessions)
-            .context("Failed to serialize sessions")?;
+        let content =
+            serde_json::to_string_pretty(&*sessions).context("Failed to serialize sessions")?;
 
-        fs::write(&self.session_file, content)
-            .context("Failed to write session file")?;
+        fs::write(&self.session_file, content).context("Failed to write session file")?;
 
         Ok(())
     }

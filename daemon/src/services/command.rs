@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -35,10 +35,7 @@ impl CommandService {
         })
     }
 
-    pub async fn execute(
-        &self,
-        request: CommandRequest,
-    ) -> Result<mpsc::Receiver<CommandOutput>> {
+    pub async fn execute(&self, request: CommandRequest) -> Result<mpsc::Receiver<CommandOutput>> {
         let cwd = if let Some(cwd_str) = request.cwd {
             PathBuf::from(cwd_str)
         } else {
@@ -124,7 +121,7 @@ impl CommandService {
         Ok(())
     }
 
-    fn validate_directory(&self, path: &PathBuf) -> Result<()> {
+    fn validate_directory(&self, path: &Path) -> Result<()> {
         let canonical = path.canonicalize().context("Invalid directory")?;
 
         for approved in &self.approved_directories {

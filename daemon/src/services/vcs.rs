@@ -155,12 +155,12 @@ impl VcsService {
 
         for line in stdout.lines() {
             let line = line.trim();
-            if line.starts_with("M ") {
-                modified.push(line[2..].to_string());
-            } else if line.starts_with("A ") {
-                added.push(line[2..].to_string());
-            } else if line.starts_with("D ") {
-                deleted.push(line[2..].to_string());
+            if let Some(rest) = line.strip_prefix("M ") {
+                modified.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("A ") {
+                added.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("D ") {
+                deleted.push(rest.to_string());
             }
         }
 

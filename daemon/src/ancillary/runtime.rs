@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use claude_agent_sdk_rs::{query_stream, ClaudeAgentOptions, ContentBlock, Message, PermissionMode};
+use claude_agent_sdk_rs::{
+    query_stream, ClaudeAgentOptions, ContentBlock, Message, PermissionMode,
+};
 use futures::StreamExt;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -16,6 +18,7 @@ pub enum WorkStatus {
     /// Actively working
     Working,
     /// Waiting for user input/approval
+    #[allow(dead_code)]
     AwaitingInput,
     /// Work completed successfully
     Completed,
@@ -47,8 +50,10 @@ pub enum ClientInput {
 /// An ancillary work execution context
 pub struct AncillaryWork {
     /// Ancillary identifier (e.g., "Toren One")
+    #[allow(dead_code)]
     pub ancillary_id: String,
     /// The assignment being worked on
+    #[allow(dead_code)]
     pub assignment: Assignment,
     /// Current work status
     status: Arc<RwLock<WorkStatus>>,
@@ -65,8 +70,8 @@ pub struct AncillaryWork {
 impl AncillaryWork {
     /// Start work on an assignment
     pub async fn start(ancillary_id: String, assignment: Assignment) -> Result<Self> {
-        let work_log = WorkLog::open(&ancillary_id, &assignment.id)
-            .context("Failed to open work log")?;
+        let work_log =
+            WorkLog::open(&ancillary_id, &assignment.id).context("Failed to open work log")?;
 
         let (event_tx, _) = broadcast::channel(1000);
         let (input_tx, input_rx) = mpsc::channel(100);
@@ -146,7 +151,8 @@ impl AncillaryWork {
                 while let Some(result) = stream.next().await {
                     match result {
                         Ok(message) => {
-                            Self::handle_message(&ancillary_id, message, &work_log, &event_tx).await;
+                            Self::handle_message(&ancillary_id, message, &work_log, &event_tx)
+                                .await;
                         }
                         Err(e) => {
                             error!("{} stream error: {}", ancillary_id, e);
@@ -247,8 +253,12 @@ impl AncillaryWork {
                     .join("\n");
 
                 if !text.is_empty() {
-                    Self::log_op(work_log, event_tx, WorkOp::AssistantMessage { content: text })
-                        .await;
+                    Self::log_op(
+                        work_log,
+                        event_tx,
+                        WorkOp::AssistantMessage { content: text },
+                    )
+                    .await;
                 }
 
                 // Also log tool uses
@@ -314,9 +324,7 @@ impl AncillaryWork {
     /// Subscribe to work events (returns receiver and current seq)
     pub fn subscribe(&self) -> (broadcast::Receiver<super::work_log::WorkEvent>, u64) {
         let rx = self.event_tx.subscribe();
-        let seq = futures::executor::block_on(async {
-            self.work_log.read().await.current_seq()
-        });
+        let seq = futures::executor::block_on(async { self.work_log.read().await.current_seq() });
         (rx, seq)
     }
 
