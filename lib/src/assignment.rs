@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 use tracing::{debug, info};
 
 /// How the assignment was created
@@ -179,11 +180,16 @@ impl AssignmentRef {
 /// Manages assignments between ancillaries and beads.
 /// Persistent storage in ~/.toren/assignments.json.
 /// Used by both CLI (breq) and daemon (toren).
+///
+/// Automatically reloads from disk when the file has been modified externally
+/// (e.g., by breq while the daemon is running).
 pub struct AssignmentManager {
     /// Path to the assignments.json file
     storage_path: PathBuf,
     /// Assignments keyed by assignment ID
     assignments: HashMap<String, Assignment>,
+    /// Last known modification time of the assignments file
+    last_mtime: Option<SystemTime>,
 }
 
 impl AssignmentManager {
@@ -197,6 +203,7 @@ impl AssignmentManager {
         let mut mgr = Self {
             storage_path,
             assignments: HashMap::new(),
+            last_mtime: None,
         };
         mgr.load()?;
         Ok(mgr)
@@ -209,8 +216,13 @@ impl AssignmentManager {
                 "No existing assignments file at {}",
                 self.storage_path.display()
             );
+            self.last_mtime = None;
             return Ok(());
         }
+
+        let metadata = std::fs::metadata(&self.storage_path)
+            .with_context(|| format!("Failed to stat {}", self.storage_path.display()))?;
+        let mtime = metadata.modified().ok();
 
         let content = std::fs::read_to_string(&self.storage_path)
             .with_context(|| format!("Failed to read {}", self.storage_path.display()))?;
@@ -222,13 +234,32 @@ impl AssignmentManager {
         for a in assignments {
             self.assignments.insert(a.id.clone(), a);
         }
+        self.last_mtime = mtime;
 
         info!("Loaded {} assignments from disk", self.assignments.len());
         Ok(())
     }
 
+    /// Reload from disk if the file has been modified externally.
+    /// Called automatically before read operations to stay in sync
+    /// when another process (e.g., breq) modifies assignments.json.
+    fn reload_if_changed(&mut self) {
+        let current_mtime = self
+            .storage_path
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok());
+
+        if current_mtime != self.last_mtime {
+            debug!("assignments.json changed on disk, reloading");
+            if let Err(e) = self.load() {
+                tracing::warn!("Failed to reload assignments from disk: {}", e);
+            }
+        }
+    }
+
     /// Save assignments to disk
-    pub fn save(&self) -> Result<()> {
+    pub fn save(&mut self) -> Result<()> {
         let assignments: Vec<&Assignment> = self.assignments.values().collect();
         let content = serde_json::to_string_pretty(&assignments)
             .with_context(|| "Failed to serialize assignments")?;
@@ -240,6 +271,13 @@ impl AssignmentManager {
 
         std::fs::write(&self.storage_path, content)
             .with_context(|| format!("Failed to write {}", self.storage_path.display()))?;
+
+        // Update tracked mtime so we don't reload our own writes
+        self.last_mtime = self
+            .storage_path
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok());
 
         debug!("Saved {} assignments to disk", self.assignments.len());
         Ok(())
@@ -351,12 +389,14 @@ impl AssignmentManager {
     }
 
     /// Get assignment by ID
-    pub fn get(&self, assignment_id: &str) -> Option<&Assignment> {
+    pub fn get(&mut self, assignment_id: &str) -> Option<&Assignment> {
+        self.reload_if_changed();
         self.assignments.get(assignment_id)
     }
 
     /// Get all assignments for a bead
-    pub fn get_by_bead(&self, bead_id: &str) -> Vec<&Assignment> {
+    pub fn get_by_bead(&mut self, bead_id: &str) -> Vec<&Assignment> {
+        self.reload_if_changed();
         self.assignments
             .values()
             .filter(|a| a.bead_id == bead_id)
@@ -364,7 +404,8 @@ impl AssignmentManager {
     }
 
     /// Get all assignments for an ancillary
-    pub fn get_by_ancillary(&self, ancillary_id: &str) -> Vec<&Assignment> {
+    pub fn get_by_ancillary(&mut self, ancillary_id: &str) -> Vec<&Assignment> {
+        self.reload_if_changed();
         self.assignments
             .values()
             .filter(|a| a.ancillary_id.to_lowercase() == ancillary_id.to_lowercase())
@@ -372,7 +413,8 @@ impl AssignmentManager {
     }
 
     /// Get active assignment for an ancillary (should be at most one)
-    pub fn get_active_for_ancillary(&self, ancillary_id: &str) -> Option<&Assignment> {
+    pub fn get_active_for_ancillary(&mut self, ancillary_id: &str) -> Option<&Assignment> {
+        self.reload_if_changed();
         self.assignments.values().find(|a| {
             a.ancillary_id.to_lowercase() == ancillary_id.to_lowercase()
                 && matches!(
@@ -444,12 +486,14 @@ impl AssignmentManager {
     }
 
     /// List all assignments
-    pub fn list(&self) -> Vec<&Assignment> {
+    pub fn list(&mut self) -> Vec<&Assignment> {
+        self.reload_if_changed();
         self.assignments.values().collect()
     }
 
     /// List assignments for a specific segment
-    pub fn list_segment(&self, segment: &str) -> Vec<&Assignment> {
+    pub fn list_segment(&mut self, segment: &str) -> Vec<&Assignment> {
+        self.reload_if_changed();
         self.assignments
             .values()
             .filter(|a| a.segment.to_lowercase() == segment.to_lowercase())
@@ -457,7 +501,8 @@ impl AssignmentManager {
     }
 
     /// List active (pending or active) assignments
-    pub fn list_active(&self) -> Vec<&Assignment> {
+    pub fn list_active(&mut self) -> Vec<&Assignment> {
+        self.reload_if_changed();
         self.assignments
             .values()
             .filter(|a| {
@@ -470,7 +515,8 @@ impl AssignmentManager {
     }
 
     /// List active assignments for a specific segment
-    pub fn list_active_segment(&self, segment: &str) -> Vec<&Assignment> {
+    pub fn list_active_segment(&mut self, segment: &str) -> Vec<&Assignment> {
+        self.reload_if_changed();
         self.assignments
             .values()
             .filter(|a| {
@@ -485,8 +531,12 @@ impl AssignmentManager {
 
     /// Find the next available ancillary for a segment.
     /// Implements round-robin selection, skipping ancillaries with active assignments.
-    pub fn next_available_ancillary(&self, segment: &str, pool_size: u32) -> String {
-        let active_assignments = self.list_segment(segment);
+    pub fn next_available_ancillary(&mut self, segment: &str, pool_size: u32) -> String {
+        self.reload_if_changed();
+        let active_assignments: Vec<&Assignment> = self.assignments
+            .values()
+            .filter(|a| a.segment.to_lowercase() == segment.to_lowercase())
+            .collect();
 
         // Get ancillary numbers with active assignments
         let assigned_numbers: std::collections::HashSet<u32> = active_assignments
@@ -512,25 +562,34 @@ impl AssignmentManager {
         ancillary_id(segment, max_assigned + 1)
     }
 
-    /// Resolve an AssignmentRef to matching active assignments
-    pub fn resolve(&self, ref_: &AssignmentRef) -> Vec<&Assignment> {
+    /// Resolve an AssignmentRef to matching assignments
+    pub fn resolve(&mut self, ref_: &AssignmentRef) -> Vec<&Assignment> {
+        self.reload_if_changed();
         match ref_ {
-            AssignmentRef::Bead(bead_id) => self.get_by_bead(bead_id),
-            AssignmentRef::Ancillary(ancillary_id) => self.get_by_ancillary(ancillary_id),
+            AssignmentRef::Bead(bead_id) => self.assignments
+                .values()
+                .filter(|a| a.bead_id == *bead_id)
+                .collect(),
+            AssignmentRef::Ancillary(ancillary_id) => self.assignments
+                .values()
+                .filter(|a| a.ancillary_id.to_lowercase() == ancillary_id.to_lowercase())
+                .collect(),
         }
     }
 
     /// Resolve to active assignments only
-    pub fn resolve_active(&self, ref_: &AssignmentRef) -> Vec<&Assignment> {
-        self.resolve(ref_)
-            .into_iter()
-            .filter(|a| {
-                matches!(
-                    a.status,
-                    AssignmentStatus::Pending | AssignmentStatus::Active
-                )
-            })
-            .collect()
+    pub fn resolve_active(&mut self, ref_: &AssignmentRef) -> Vec<&Assignment> {
+        self.reload_if_changed();
+        match ref_ {
+            AssignmentRef::Bead(bead_id) => self.assignments
+                .values()
+                .filter(|a| a.bead_id == *bead_id && matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
+                .collect(),
+            AssignmentRef::Ancillary(ancillary_id) => self.assignments
+                .values()
+                .filter(|a| a.ancillary_id.to_lowercase() == ancillary_id.to_lowercase() && matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
+                .collect(),
+        }
     }
 }
 

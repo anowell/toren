@@ -11,9 +11,9 @@ default:
 build:
     cargo build
 
-# Start the Toren daemon (dev mode, uses toren-test.toml)
+# Start the Toren daemon
 daemon:
-    bacon run -- --bin toren-daemon -- --config toren-test.toml
+    bacon run -- --bin toren-daemon
 
 # Start the web UI (dev mode)
 web:

@@ -401,7 +401,7 @@ fn cmd_assign(
 
 fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -> Result<()> {
     let segment_mgr = SegmentManager::new(config)?;
-    let assignment_mgr = AssignmentManager::new()?;
+    let mut assignment_mgr = AssignmentManager::new()?;
 
     // Determine which segment(s) to list
     let (assignments, scope_label): (Vec<_>, &str) = if all_segments {
@@ -488,7 +488,7 @@ fn truncate_title(title: &str, max_len: usize) -> String {
 
 fn cmd_show(config: &Config, reference: &str) -> Result<()> {
     let segment_mgr = SegmentManager::new(config)?;
-    let assignment_mgr = AssignmentManager::new()?;
+    let mut assignment_mgr = AssignmentManager::new()?;
 
     let segment = resolve_segment(&segment_mgr, None)?;
     let ref_ = AssignmentRef::parse(reference, &segment.name);

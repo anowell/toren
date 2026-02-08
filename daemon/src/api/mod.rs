@@ -195,7 +195,7 @@ async fn ancillary_start_work(
 
     // Get the assignment
     let assignment = {
-        let assignments = state.assignments.read().await;
+        let mut assignments = state.assignments.write().await;
         assignments.get(&request.assignment_id).cloned()
     };
 
@@ -397,7 +397,7 @@ struct AssignmentResponse {
 }
 
 async fn assignments_list(State(state): State<AppState>) -> impl IntoResponse {
-    let assignments = state.assignments.read().await;
+    let mut assignments = state.assignments.write().await;
     let all = assignments.list();
 
     Json(serde_json::json!({
@@ -410,7 +410,7 @@ async fn assignments_get(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<AssignmentResponse>, StatusCode> {
-    let assignments = state.assignments.read().await;
+    let mut assignments = state.assignments.write().await;
 
     // Try to find by assignment ID first
     if let Some(assignment) = assignments.get(&id) {
@@ -657,7 +657,7 @@ async fn assignments_delete(
 // ==================== Assignment Lifecycle Endpoints ====================
 
 /// Helper to resolve an assignment by ID, ancillary ID, or bead ID
-fn resolve_assignment(assignments: &AssignmentManager, id: &str) -> Option<Assignment> {
+fn resolve_assignment(assignments: &mut AssignmentManager, id: &str) -> Option<Assignment> {
     // Try by assignment ID
     if let Some(a) = assignments.get(id) {
         return Some(a.clone());
@@ -696,7 +696,7 @@ async fn assignments_complete(
 
     let mut assignments = state.assignments.write().await;
 
-    let assignment = resolve_assignment(&assignments, &id).ok_or((
+    let assignment = resolve_assignment(&mut assignments, &id).ok_or((
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({"error": "Assignment not found"})),
     ))?;
@@ -764,7 +764,7 @@ async fn assignments_abort(
 
     let mut assignments = state.assignments.write().await;
 
-    let assignment = resolve_assignment(&assignments, &id).ok_or((
+    let assignment = resolve_assignment(&mut assignments, &id).ok_or((
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({"error": "Assignment not found"})),
     ))?;
@@ -834,7 +834,7 @@ async fn assignments_resume(
 
     let mut assignments = state.assignments.write().await;
 
-    let assignment = resolve_assignment(&assignments, &id).ok_or((
+    let assignment = resolve_assignment(&mut assignments, &id).ok_or((
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({"error": "Assignment not found"})),
     ))?;
