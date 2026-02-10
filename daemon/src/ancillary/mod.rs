@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::RwLock as TokioRwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 pub use runtime::{AncillaryWork, ClientInput, WorkStatus};
-use toren_lib::{Assignment, AssignmentManager, AssignmentStatus};
+use toren_lib::{Assignment, AssignmentManager};
 pub use work_log::WorkEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -201,7 +201,6 @@ impl WorkManager {
         if let Some(ref assignments) = self.assignments {
             let assignments = assignments.clone();
             let (mut event_rx, _) = work.subscribe();
-            let monitor_work = work.clone();
             tokio::spawn(async move {
                 let mut session_id_captured = false;
 
@@ -223,24 +222,14 @@ impl WorkManager {
                                         }
                                     }
 
-                                    // Check for terminal events
+                                    // Check for terminal events.
+                                    // NOTE: session completion does NOT change assignment status.
+                                    // "complete" and "abort" are explicit user actions via the
+                                    // lifecycle endpoints, not automatic on session end.
                                     match ev.op {
-                                        work_log::WorkOp::AssignmentCompleted => {
-                                            let mut mgr = assignments.write().await;
-                                            if let Err(e) = mgr.update_status(&assignment_id, AssignmentStatus::Completed) {
-                                                warn!("Failed to persist completed status for {}: {}", assignment_id, e);
-                                            } else {
-                                                info!("Persisted completed status for assignment {}", assignment_id);
-                                            }
-                                            break;
-                                        }
-                                        work_log::WorkOp::AssignmentFailed { .. } => {
-                                            let mut mgr = assignments.write().await;
-                                            if let Err(e) = mgr.update_status(&assignment_id, AssignmentStatus::Aborted) {
-                                                warn!("Failed to persist aborted status for {}: {}", assignment_id, e);
-                                            } else {
-                                                info!("Persisted aborted status for assignment {}", assignment_id);
-                                            }
+                                        work_log::WorkOp::AssignmentCompleted
+                                        | work_log::WorkOp::AssignmentFailed { .. } => {
+                                            info!("Work session ended for assignment {}", assignment_id);
                                             break;
                                         }
                                         _ => {}
@@ -251,18 +240,9 @@ impl WorkManager {
                                     continue;
                                 }
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    // Channel closed, fall back to polling
-                                    let status = monitor_work.status().await;
-                                    let mut mgr = assignments.write().await;
-                                    match status {
-                                        WorkStatus::Completed => {
-                                            let _ = mgr.update_status(&assignment_id, AssignmentStatus::Completed);
-                                        }
-                                        WorkStatus::Failed { .. } => {
-                                            let _ = mgr.update_status(&assignment_id, AssignmentStatus::Aborted);
-                                        }
-                                        _ => {}
-                                    }
+                                    // Channel closed — session ended, but assignment
+                                    // status is NOT changed (complete/abort are explicit).
+                                    info!("Work monitor channel closed for assignment {}", assignment_id);
                                     break;
                                 }
                             }

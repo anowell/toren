@@ -515,9 +515,15 @@ async fn assignments_create(
         ));
     };
 
-    // Find next available ancillary
-    let ancillary_id =
-        assignments.next_available_ancillary(&request.segment, state.config.ancillary.pool_size);
+    // Find next available ancillary, accounting for existing workspaces on disk
+    let existing_workspaces = ws_mgr
+        .list_workspaces(&segment_path)
+        .unwrap_or_default();
+    let ancillary_id = assignments.next_available_ancillary(
+        &request.segment,
+        state.config.ancillary.pool_size,
+        &existing_workspaces,
+    );
     let ancillary_num = toren_lib::ancillary_number(&ancillary_id).unwrap_or(1);
 
     // Generate workspace name from ancillary number word

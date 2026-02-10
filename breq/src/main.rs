@@ -345,9 +345,15 @@ fn cmd_assign(
         anyhow::bail!("Either <BEAD> or --prompt must be specified");
     };
 
-    // Find next available ancillary
-    let ancillary_id =
-        assignment_mgr.next_available_ancillary(&segment.name, config.ancillary.pool_size);
+    // Find next available ancillary, accounting for existing workspaces on disk
+    let existing_workspaces = workspace_mgr
+        .list_workspaces(&segment.path)
+        .unwrap_or_default();
+    let ancillary_id = assignment_mgr.next_available_ancillary(
+        &segment.name,
+        config.ancillary.pool_size,
+        &existing_workspaces,
+    );
     let ancillary_num = toren_lib::ancillary_number(&ancillary_id).unwrap_or(1);
     println!("Ancillary: {}", ancillary_id);
 

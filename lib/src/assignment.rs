@@ -530,36 +530,49 @@ impl AssignmentManager {
     }
 
     /// Find the next available ancillary for a segment.
-    /// Implements round-robin selection, skipping ancillaries with active assignments.
-    pub fn next_available_ancillary(&mut self, segment: &str, pool_size: u32) -> String {
+    /// Implements round-robin selection, skipping ancillaries that have assignment
+    /// records or existing workspaces.
+    ///
+    /// `existing_workspaces` should contain workspace names (e.g. "one", "two") that
+    /// already exist on disk, so we avoid colliding with workspaces that outlived
+    /// their assignment records.
+    pub fn next_available_ancillary(
+        &mut self,
+        segment: &str,
+        pool_size: u32,
+        existing_workspaces: &[String],
+    ) -> String {
         self.reload_if_changed();
-        let active_assignments: Vec<&Assignment> = self.assignments
+
+        // Any assignment record (regardless of status) means the number is occupied.
+        // Records are removed by complete_assignment/abort_assignment when the
+        // workspace is cleaned up, so a lingering record means the workspace may
+        // still exist.
+        let mut occupied: std::collections::HashSet<u32> = self
+            .assignments
             .values()
             .filter(|a| a.segment.to_lowercase() == segment.to_lowercase())
-            .collect();
-
-        // Get ancillary numbers with active assignments
-        let assigned_numbers: std::collections::HashSet<u32> = active_assignments
-            .iter()
-            .filter(|a| {
-                matches!(
-                    a.status,
-                    AssignmentStatus::Pending | AssignmentStatus::Active
-                )
-            })
             .filter_map(|a| ancillary_number(&a.ancillary_id))
             .collect();
 
+        // Also mark numbers for workspaces that exist on disk (e.g. a workspace
+        // kept after its assignment was manually dismissed).
+        for ws_name in existing_workspaces {
+            if let Some(n) = word_to_number(ws_name) {
+                occupied.insert(n);
+            }
+        }
+
         // Find first available in pool
         for n in 1..=pool_size {
-            if !assigned_numbers.contains(&n) {
+            if !occupied.contains(&n) {
                 return ancillary_id(segment, n);
             }
         }
 
         // All pool slots used, find next available beyond pool
-        let max_assigned = assigned_numbers.iter().max().copied().unwrap_or(0);
-        ancillary_id(segment, max_assigned + 1)
+        let max = occupied.iter().max().copied().unwrap_or(0);
+        ancillary_id(segment, max + 1)
     }
 
     /// Resolve an AssignmentRef to matching assignments
