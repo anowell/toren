@@ -498,7 +498,7 @@ impl AssignmentManager {
     /// List active (pending or active) assignments
     pub fn list_active(&mut self) -> Vec<&Assignment> {
         self.reload_if_changed();
-        self.assignments
+        let mut assignments: Vec<&Assignment> = self.assignments
             .values()
             .filter(|a| {
                 matches!(
@@ -506,13 +506,17 @@ impl AssignmentManager {
                     AssignmentStatus::Pending | AssignmentStatus::Active
                 )
             })
-            .collect()
+            .collect();
+
+        // Sort by ancillary number (One, Two, Three, etc.)
+        assignments.sort_by_key(|a| ancillary_number(&a.ancillary_id).unwrap_or(u32::MAX));
+        assignments
     }
 
     /// List active assignments for a specific segment
     pub fn list_active_segment(&mut self, segment: &str) -> Vec<&Assignment> {
         self.reload_if_changed();
-        self.assignments
+        let mut assignments: Vec<&Assignment> = self.assignments
             .values()
             .filter(|a| {
                 a.segment.to_lowercase() == segment.to_lowercase()
@@ -521,7 +525,11 @@ impl AssignmentManager {
                         AssignmentStatus::Pending | AssignmentStatus::Active
                     )
             })
-            .collect()
+            .collect();
+
+        // Sort by ancillary number (One, Two, Three, etc.)
+        assignments.sort_by_key(|a| ancillary_number(&a.ancillary_id).unwrap_or(u32::MAX));
+        assignments
     }
 
     /// Find the next available ancillary for a segment.
