@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 use tracing::{debug, info};
 
@@ -58,60 +59,48 @@ pub struct Assignment {
     /// Claude session ID for cross-interface handoff (breq <-> toren)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Numeric ancillary number, derived from ancillary_id (e.g., "Toren One" -> 1)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ancillary_num: Option<u32>,
 }
 
-/// Number words for ancillary naming (One through Twenty)
-const NUMBER_WORDS: &[&str] = &[
-    "One",
-    "Two",
-    "Three",
-    "Four",
-    "Five",
-    "Six",
-    "Seven",
-    "Eight",
-    "Nine",
-    "Ten",
-    "Eleven",
-    "Twelve",
-    "Thirteen",
-    "Fourteen",
-    "Fifteen",
-    "Sixteen",
-    "Seventeen",
-    "Eighteen",
-    "Nineteen",
-    "Twenty",
-];
+/// Max number that gets a word name (1-99 use English words, 100+ use digits)
+const MAX_WORD_NUMBER: u32 = 99;
 
-/// Convert a number to its word form (1 -> "One", 2 -> "Two", etc.)
+/// Convert a number to its word form (1 -> "One", 21 -> "Twenty-One", etc.)
 pub fn number_to_word(n: u32) -> String {
     if n == 0 {
         return "Zero".to_string();
     }
-    let idx = (n - 1) as usize;
-    if idx < NUMBER_WORDS.len() {
-        NUMBER_WORDS[idx].to_string()
+    if n <= MAX_WORD_NUMBER {
+        english_numbers::convert(n as i64, english_numbers::Formatting::all())
     } else {
-        // For numbers beyond Twenty, use numeric suffix
-        format!("N{}", n)
+        n.to_string()
     }
 }
 
-/// Convert a word to its number form ("One" -> 1, "Two" -> 2, etc.)
-pub fn word_to_number(word: &str) -> Option<u32> {
-    // Check for numeric suffix (N21, N22, etc.)
-    if let Some(stripped) = word.strip_prefix('N') {
-        if let Ok(n) = stripped.parse::<u32>() {
-            return Some(n);
+/// Lazily-built reverse map from lowercase word form to number
+fn word_to_number_map() -> &'static HashMap<String, u32> {
+    static MAP: OnceLock<HashMap<String, u32>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m = HashMap::new();
+        m.insert("zero".to_string(), 0);
+        for n in 1..=MAX_WORD_NUMBER {
+            let word = english_numbers::convert(n as i64, english_numbers::Formatting::all());
+            m.insert(word.to_lowercase(), n);
         }
-    }
+        m
+    })
+}
 
-    let lower = word.to_lowercase();
-    NUMBER_WORDS
-        .iter()
-        .position(|w| w.to_lowercase() == lower)
-        .map(|i| (i + 1) as u32)
+/// Convert a word to its number form ("One" -> 1, "Twenty-One" -> 21, etc.)
+pub fn word_to_number(word: &str) -> Option<u32> {
+    // Try the word map first (handles "One", "Twenty-One", etc.)
+    if let Some(&n) = word_to_number_map().get(&word.to_lowercase()) {
+        return Some(n);
+    }
+    // Fall back to plain number parsing (handles "100", "101", etc.)
+    word.parse::<u32>().ok()
 }
 
 /// Generate an ancillary ID from segment name and number
@@ -231,7 +220,11 @@ impl AssignmentManager {
             serde_json::from_str(&content).with_context(|| "Failed to parse assignments.json")?;
 
         self.assignments.clear();
-        for a in assignments {
+        for mut a in assignments {
+            // Backfill ancillary_num for assignments created before this field existed
+            if a.ancillary_num.is_none() {
+                a.ancillary_num = ancillary_number(&a.ancillary_id);
+            }
             self.assignments.insert(a.id.clone(), a);
         }
         self.last_mtime = mtime;
@@ -296,6 +289,7 @@ impl AssignmentManager {
         let id = uuid::Uuid::new_v4().to_string();
 
         let assignment = Assignment {
+            ancillary_num: ancillary_number(ancillary_id),
             id,
             ancillary_id: ancillary_id.to_string(),
             bead_id: bead_id.to_string(),
@@ -334,6 +328,7 @@ impl AssignmentManager {
         let id = uuid::Uuid::new_v4().to_string();
 
         let assignment = Assignment {
+            ancillary_num: ancillary_number(ancillary_id),
             id,
             ancillary_id: ancillary_id.to_string(),
             bead_id: bead_id.to_string(),
@@ -615,7 +610,10 @@ mod tests {
         assert_eq!(number_to_word(1), "One");
         assert_eq!(number_to_word(10), "Ten");
         assert_eq!(number_to_word(20), "Twenty");
-        assert_eq!(number_to_word(21), "N21");
+        assert_eq!(number_to_word(21), "Twenty-One");
+        assert_eq!(number_to_word(42), "Forty-Two");
+        assert_eq!(number_to_word(99), "Ninety-Nine");
+        assert_eq!(number_to_word(100), "100");
     }
 
     #[test]
@@ -623,7 +621,10 @@ mod tests {
         assert_eq!(word_to_number("One"), Some(1));
         assert_eq!(word_to_number("one"), Some(1));
         assert_eq!(word_to_number("TEN"), Some(10));
-        assert_eq!(word_to_number("N21"), Some(21));
+        assert_eq!(word_to_number("Twenty-One"), Some(21));
+        assert_eq!(word_to_number("twenty-one"), Some(21));
+        assert_eq!(word_to_number("Ninety-Nine"), Some(99));
+        assert_eq!(word_to_number("100"), Some(100));
         assert_eq!(word_to_number("invalid"), None);
     }
 
@@ -631,13 +632,15 @@ mod tests {
     fn test_ancillary_id() {
         assert_eq!(ancillary_id("toren", 1), "Toren One");
         assert_eq!(ancillary_id("toren", 5), "Toren Five");
+        assert_eq!(ancillary_id("toren", 21), "Toren Twenty-One");
     }
 
     #[test]
     fn test_ancillary_number() {
         assert_eq!(ancillary_number("Toren One"), Some(1));
         assert_eq!(ancillary_number("Toren Five"), Some(5));
-        assert_eq!(ancillary_number("Toren N21"), Some(21));
+        assert_eq!(ancillary_number("Toren Twenty-One"), Some(21));
+        assert_eq!(ancillary_number("Toren 100"), Some(100));
     }
 
     #[test]

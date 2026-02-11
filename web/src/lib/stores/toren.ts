@@ -456,9 +456,11 @@ export const isAuthenticated = derived(torenStore, ($toren) => $toren.authentica
 export const messages = derived(torenStore, ($toren) => $toren.messages);
 export const assignments = derived(torenStore, ($toren) => $toren.assignments);
 
-// Filter assignments for current segment
+// Filter assignments for current segment and sort by ancillary number
 export const segmentAssignments = derived(torenStore, ($toren) => {
 	if (!$toren.selectedSegment) return [];
 	const segmentName = $toren.selectedSegment.name.toLowerCase();
-	return $toren.assignments.filter((a) => a.segment.toLowerCase() === segmentName);
+	return $toren.assignments
+		.filter((a) => a.segment.toLowerCase() === segmentName)
+		.sort((a, b) => (a.ancillary_num ?? Infinity) - (b.ancillary_num ?? Infinity));
 });
