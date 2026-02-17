@@ -22,6 +22,9 @@ pub struct Config {
 
     #[serde(default)]
     pub ancillary: AncillaryConfig,
+
+    #[serde(default)]
+    pub intents: IntentsConfig,
 }
 
 fn default_server() -> ServerConfig {
@@ -73,6 +76,46 @@ fn default_pool_size() -> u32 {
 
 fn default_task_prompt_template() -> String {
     "implement bead {{task_id}}".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentsConfig {
+    #[serde(default = "default_intent_act")]
+    pub act: String,
+    #[serde(default = "default_intent_plan")]
+    pub plan: String,
+    #[serde(default = "default_intent_review")]
+    pub review: String,
+}
+
+impl Default for IntentsConfig {
+    fn default() -> Self {
+        Self {
+            act: default_intent_act(),
+            plan: default_intent_plan(),
+            review: default_intent_review(),
+        }
+    }
+}
+
+fn default_intent_act() -> String {
+    "Implement bead {{ task.id }}: {{ task.title }}\n\n\
+     Complete the task as specified. When done, summarize changes in a bead comment."
+        .to_string()
+}
+
+fn default_intent_plan() -> String {
+    "Design an approach for bead {{ task.id }}: {{ task.title }}\n\n\
+     Investigate the codebase, explore options, and propose a design. \
+     Update the bead's design field with your proposal."
+        .to_string()
+}
+
+fn default_intent_review() -> String {
+    "Review the implementation of bead {{ task.id }}: {{ task.title }}\n\n\
+     Verify completeness, check for issues, and assess confidence. \
+     Add review comments to the bead."
+        .to_string()
 }
 
 impl Default for AncillaryConfig {
@@ -209,6 +252,7 @@ impl Default for Config {
             approved_directories: vec![current_dir],
             auto_approve: AutoApproveConfig::default(),
             ancillary: AncillaryConfig::default(),
+            intents: IntentsConfig::default(),
         }
     }
 }

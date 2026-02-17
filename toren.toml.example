@@ -35,6 +35,27 @@ max_concurrent = 5
 # Default model for new ancillaries
 default_model = "claude-sonnet-4-5-20250929"
 
+# Workspace root for ancillary workspaces
+# workspace_root = "~/.toren/workspaces"
+
+# Pool size for ancillaries per segment
+pool_size = 10
+
+# Intent-specific prompt templates (rendered with minijinja)
+# Available template variables: task.id, task.title, ws.name, ws.num, ws.path, repo.root, repo.name
+[intents]
+act = """Implement bead {{ task.id }}: {{ task.title }}
+
+Complete the task as specified. When done, summarize changes in a bead comment."""
+
+plan = """Design an approach for bead {{ task.id }}: {{ task.title }}
+
+Investigate the codebase, explore options, and propose a design. Update the bead's design field with your proposal."""
+
+review = """Review the implementation of bead {{ task.id }}: {{ task.title }}
+
+Verify completeness, check for issues, and assess confidence. Add review comments to the bead."""
+
 [security]
 # Whether to require authentication
 require_auth = true

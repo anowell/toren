@@ -134,7 +134,35 @@ impl AncillaryWork {
         let prompt = match &assignment.source {
             toren_lib::AssignmentSource::Prompt { original_prompt } => original_prompt.clone(),
             toren_lib::AssignmentSource::Bead => {
-                format!("implement bead {}", assignment.bead_id)
+                // Fetch task info and render using the act intent template
+                let task_title = assignment
+                    .bead_title
+                    .clone()
+                    .unwrap_or_else(|| assignment.bead_id.clone());
+                let ctx = toren_lib::WorkspaceContext {
+                    ws: toren_lib::WorkspaceInfo {
+                        name: assignment
+                            .workspace_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        num: assignment.ancillary_num,
+                        path: assignment.workspace_path.display().to_string(),
+                    },
+                    repo: toren_lib::RepoInfo {
+                        root: String::new(),
+                        name: assignment.segment.clone(),
+                    },
+                    task: Some(toren_lib::TaskInfo {
+                        id: assignment.bead_id.clone(),
+                        title: task_title,
+                    }),
+                };
+                // TODO: read intent template from config (requires passing config to work loop)
+                let template = toren_lib::config::IntentsConfig::default().act;
+                toren_lib::render_template(&template, &ctx)
+                    .unwrap_or_else(|_| format!("implement bead {}", assignment.bead_id))
             }
         };
 

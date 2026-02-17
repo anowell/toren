@@ -32,9 +32,29 @@ pub fn fetch_task(task_id: &str, working_dir: &std::path::Path) -> Result<Task> 
     beads::fetch_bead(task_id, working_dir)
 }
 
-/// Generate a prompt from a task using the provided template
+/// Generate a prompt from a task using the provided template.
+/// Supports minijinja variables: task.id, task.title, plus any ws/repo context if provided.
+/// Falls back to simple string replacement for backwards compatibility with {{task_id}}.
 pub fn generate_prompt(task: &Task, template: &str) -> String {
-    template
-        .replace("{{task_id}}", &task.id)
-        .replace("{{task_provider}}", &task.provider.to_string())
+    let ctx = crate::workspace_setup::WorkspaceContext {
+        ws: crate::workspace_setup::WorkspaceInfo {
+            name: String::new(),
+            num: None,
+            path: String::new(),
+        },
+        repo: crate::workspace_setup::RepoInfo {
+            root: String::new(),
+            name: String::new(),
+        },
+        task: Some(crate::workspace_setup::TaskInfo {
+            id: task.id.clone(),
+            title: task.title.clone(),
+        }),
+    };
+    crate::workspace_setup::render_template(template, &ctx).unwrap_or_else(|_| {
+        // Fallback to simple replacement for backwards compatibility
+        template
+            .replace("{{task_id}}", &task.id)
+            .replace("{{task_provider}}", &task.provider.to_string())
+    })
 }

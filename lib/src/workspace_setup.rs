@@ -18,6 +18,20 @@ use tracing::{debug, info, trace, warn};
 
 const TOREN_CONFIG_FILE: &str = ".toren.kdl";
 
+/// Render a template string with workspace context using minijinja.
+/// Available variables: ws.name, ws.num, ws.path, repo.root, repo.name, task.id, task.title
+pub fn render_template(template: &str, ctx: &WorkspaceContext) -> Result<String> {
+    let mut env = Environment::new();
+    env.add_template("inline", template)?;
+    let tmpl = env.get_template("inline")?;
+    let rendered = tmpl.render(context! {
+        ws => ctx.ws,
+        repo => ctx.repo,
+        task => ctx.task,
+    })?;
+    Ok(rendered)
+}
+
 /// Derive default dest from src: if src is relative, use it as-is; if absolute, use basename.
 fn default_dest(src: &str) -> String {
     let path = Path::new(src);
@@ -31,11 +45,22 @@ fn default_dest(src: &str) -> String {
     }
 }
 
+/// Task context available to templates
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskInfo {
+    /// Task/bead ID (e.g., "breq-a1b2")
+    pub id: String,
+    /// Task title
+    pub title: String,
+}
+
 /// Workspace context available to templates
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceContext {
     pub ws: WorkspaceInfo,
     pub repo: RepoInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -257,6 +282,7 @@ impl WorkspaceSetup {
                 root: self.repo_root.display().to_string(),
                 name: repo_name,
             },
+            task: None,
         }
     }
 
@@ -339,6 +365,7 @@ impl WorkspaceSetup {
         let rendered = template.render(context! {
             ws => ctx.ws,
             repo => ctx.repo,
+            task => ctx.task,
         })?;
 
         // Ensure parent directory exists
@@ -435,14 +462,7 @@ impl WorkspaceSetup {
 
     /// Render a string template with workspace context
     fn render_string(&self, template: &str, ctx: &WorkspaceContext) -> Result<String> {
-        let mut env = Environment::new();
-        env.add_template("inline", template)?;
-        let tmpl = env.get_template("inline")?;
-        let rendered = tmpl.render(context! {
-            ws => ctx.ws,
-            repo => ctx.repo,
-        })?;
-        Ok(rendered)
+        render_template(template, ctx)
     }
 
     fn execute_run(&self, command: &str, cwd: Option<&str>) -> Result<()> {

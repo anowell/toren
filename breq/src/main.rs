@@ -182,22 +182,11 @@ enum Intent {
 }
 
 impl Intent {
-    fn prompt_template(&self, bead_id: &str, title: &str) -> String {
+    fn template<'a>(&self, intents: &'a toren_lib::IntentsConfig) -> &'a str {
         match self {
-            Intent::Act => format!(
-                "Implement bead {bead_id}: {title}\n\n\
-                Complete the task as specified. When done, summarize changes in a bead comment."
-            ),
-            Intent::Plan => format!(
-                "Design an approach for bead {bead_id}: {title}\n\n\
-                Investigate the codebase, explore options, and propose a design. \
-                Update the bead's design field with your proposal."
-            ),
-            Intent::Review => format!(
-                "Review the implementation of bead {bead_id}: {title}\n\n\
-                Verify completeness, check for issues, and assess confidence. \
-                Add review comments to the bead."
-            ),
+            Intent::Act => &intents.act,
+            Intent::Plan => &intents.plan,
+            Intent::Review => &intents.review,
         }
     }
 }
@@ -389,8 +378,24 @@ fn cmd_assign(
         )?;
     }
 
-    // Build prompt for Claude
-    let claude_prompt = intent.prompt_template(&bead_id, &task_title);
+    // Build prompt for Claude using config template + minijinja rendering
+    let template = intent.template(&config.intents);
+    let ctx = toren_lib::WorkspaceContext {
+        ws: toren_lib::WorkspaceInfo {
+            name: ws_name.clone(),
+            num: Some(ancillary_num),
+            path: ws_path.display().to_string(),
+        },
+        repo: toren_lib::RepoInfo {
+            root: segment.path.display().to_string(),
+            name: segment.name.clone(),
+        },
+        task: Some(toren_lib::TaskInfo {
+            id: bead_id.clone(),
+            title: task_title.clone(),
+        }),
+    };
+    let claude_prompt = toren_lib::render_template(template, &ctx)?;
 
     // Exec into claude
     println!("Starting Claude session in {}\n", ws_path.display());
