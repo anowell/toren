@@ -18,6 +18,7 @@ pub struct Segment {
 #[derive(Debug, Clone)]
 pub struct SegmentManager {
     roots: Vec<PathBuf>,
+    workspace_root: Option<PathBuf>,
 }
 
 impl SegmentManager {
@@ -37,7 +38,23 @@ impl SegmentManager {
 
         info!("Discovered {} segment roots", roots.len());
 
-        Ok(Self { roots })
+        let workspace_root = config
+            .ancillary
+            .workspace_root
+            .as_ref()
+            .and_then(|ws| {
+                let canonical = ws.canonicalize().unwrap_or_else(|_| ws.clone());
+                if canonical.is_dir() {
+                    Some(canonical)
+                } else {
+                    None
+                }
+            });
+
+        Ok(Self {
+            roots,
+            workspace_root,
+        })
     }
 
     fn expand_path(path_str: &str) -> Result<PathBuf> {
@@ -75,6 +92,17 @@ impl SegmentManager {
                         path: segment_path,
                     });
                 }
+            }
+        }
+
+        // Fall back to workspace-aware resolution.
+        // Workspace paths follow: workspace_root/segment_name/workspace_name/...
+        if let Some(ref ws_root) = self.workspace_root {
+            if canonical.starts_with(ws_root) {
+                let relative = canonical.strip_prefix(ws_root).ok()?;
+                let segment_component = relative.components().next()?;
+                let name = segment_component.as_os_str().to_string_lossy().to_string();
+                return self.find_by_name(&name);
             }
         }
 
