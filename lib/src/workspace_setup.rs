@@ -430,6 +430,30 @@ impl WorkspaceSetup {
             fs::create_dir_all(parent)?;
         }
 
+        // Handle existing dest: skip if correct symlink, remove if stale/wrong
+        if dest_path.symlink_metadata().is_ok() {
+            if let Ok(target) = fs::read_link(&dest_path) {
+                if target == src_path {
+                    debug!(
+                        "  share: {} already points to {} (skipping)",
+                        dest_path.display(),
+                        src_path.display()
+                    );
+                    return Ok(());
+                }
+            }
+            // Stale or wrong symlink (or regular file/dir) - remove it
+            info!(
+                "  share: removing stale entry at {}",
+                dest_path.display()
+            );
+            if dest_path.is_dir() && !dest_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                fs::remove_dir_all(&dest_path)?;
+            } else {
+                fs::remove_file(&dest_path)?;
+            }
+        }
+
         // Create symlink
         #[cfg(unix)]
         std::os::unix::fs::symlink(&src_path, &dest_path).with_context(|| {

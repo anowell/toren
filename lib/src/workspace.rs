@@ -36,6 +36,9 @@ impl WorkspaceManager {
 
     /// Create a new jj workspace for a segment
     /// Returns the path to the workspace directory
+    ///
+    /// If the directory exists but is not tracked by jj (orphaned from a previous
+    /// `jj workspace forget`), it is removed before creating the new workspace.
     pub fn create_workspace(
         &self,
         segment_path: &Path,
@@ -57,14 +60,28 @@ impl WorkspaceManager {
         // Check if workspace already exists
         if ws_path.exists() {
             debug!("Workspace directory already exists: {}", ws_path.display());
-            // Verify it's a valid jj workspace by checking for .jj directory
-            if ws_path.join(".jj").exists() {
+
+            // Check if jj still tracks this workspace
+            let jj_workspaces = self.list_workspaces(segment_path).unwrap_or_default();
+            let is_tracked = jj_workspaces.iter().any(|w| w == workspace_name);
+
+            if is_tracked && ws_path.join(".jj").exists() {
+                // Valid, tracked workspace - reuse it
                 return Ok(ws_path);
             }
-            anyhow::bail!(
-                "Directory exists but is not a valid jj workspace: {}",
+
+            // Orphaned directory: exists on disk but not tracked by jj.
+            // Remove it so we can create a fresh workspace.
+            info!(
+                "Removing orphaned workspace directory: {}",
                 ws_path.display()
             );
+            std::fs::remove_dir_all(&ws_path).with_context(|| {
+                format!(
+                    "Failed to remove orphaned workspace directory: {}",
+                    ws_path.display()
+                )
+            })?;
         }
 
         // Create workspace using jj workspace add
@@ -232,7 +249,10 @@ impl WorkspaceManager {
     }
 
     /// Create workspace and run setup hooks
-    /// This is the recommended method for creating workspaces with full initialization
+    /// This is the recommended method for creating workspaces with full initialization.
+    ///
+    /// If setup fails, the workspace is rolled back (forgotten + deleted) so it
+    /// doesn't become an orphaned directory that blocks future assignments.
     pub fn create_workspace_with_setup(
         &self,
         segment_path: &Path,
@@ -243,8 +263,24 @@ impl WorkspaceManager {
         let ws_path = self.create_workspace(segment_path, segment_name, workspace_name)?;
 
         // Run setup hooks if .toren.kdl exists - fail if setup fails
-        self.run_setup(segment_path, &ws_path, workspace_name, ancillary_num)
-            .with_context(|| format!("Workspace setup failed for '{}'", workspace_name))?;
+        if let Err(e) = self.run_setup(segment_path, &ws_path, workspace_name, ancillary_num) {
+            // Rollback: forget + delete the partially-created workspace
+            warn!(
+                "Setup failed for '{}', rolling back workspace: {}",
+                workspace_name, e
+            );
+            if let Err(rollback_err) =
+                self.cleanup_workspace(segment_path, segment_name, workspace_name)
+            {
+                warn!("Rollback cleanup also failed: {}", rollback_err);
+            }
+            return Err(e).with_context(|| {
+                format!(
+                    "Workspace setup failed for '{}' (workspace rolled back)",
+                    workspace_name
+                )
+            });
+        }
 
         Ok(ws_path)
     }

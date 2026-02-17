@@ -131,6 +131,17 @@ enum Commands {
         keep_open: bool,
     },
 
+    /// Remove orphaned workspace directories (exist on disk but not tracked by jj)
+    Cleanup {
+        /// Segment to clean up (defaults to current directory's segment)
+        #[arg(short, long)]
+        segment: Option<String>,
+
+        /// Clean up all segments
+        #[arg(short, long, conflicts_with = "segment")]
+        all: bool,
+    },
+
     /// Workspace management commands
     #[command(visible_alias = "ws")]
     Workspace {
@@ -239,6 +250,7 @@ fn main() -> Result<()> {
             push,
             keep_open,
         } => cmd_complete(&config, &reference, push, keep_open),
+        Commands::Cleanup { segment, all } => cmd_cleanup(&config, all, segment),
         Commands::Go {
             workspace,
             segment,
@@ -411,47 +423,44 @@ fn cmd_assign(
 }
 
 fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -> Result<()> {
+    let workspace_root = config.ancillary.workspace_root.clone();
     let segment_mgr = SegmentManager::new(config)?;
     let mut assignment_mgr = AssignmentManager::new()?;
 
     // Determine which segment(s) to list
-    let (assignments, scope_label): (Vec<_>, &str) = if all_segments {
-        (
-            assignment_mgr.list_active().into_iter().collect(),
-            "all segments",
-        )
+    let (assignments, segments, scope_label): (Vec<_>, Vec<Segment>, String) = if all_segments {
+        let assignments = assignment_mgr.list_active().into_iter().collect::<Vec<_>>();
+        let segments = segment_mgr.list_all();
+        (assignments, segments, "all segments".to_string())
     } else if let Some(ref name) = segment_name {
-        (
-            assignment_mgr
-                .list_active_segment(name)
-                .into_iter()
-                .collect(),
-            name.as_str(),
-        )
+        let assignments = assignment_mgr
+            .list_active_segment(name)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let segments = segment_mgr
+            .find_by_name(name)
+            .map(|s| vec![s])
+            .unwrap_or_default();
+        (assignments, segments, name.clone())
     } else {
         // Default: current segment
         let segment = resolve_segment(&segment_mgr, None)?;
-        (
-            assignment_mgr
-                .list_active_segment(&segment.name)
-                .into_iter()
-                .collect(),
-            "current segment",
-        )
+        let name = segment.name.clone();
+        let assignments = assignment_mgr
+            .list_active_segment(&name)
+            .into_iter()
+            .collect::<Vec<_>>();
+        (assignments, vec![segment], name)
     };
 
-    if assignments.is_empty() {
-        println!("No active assignments in {}.", scope_label);
-        if !all_segments {
-            println!("Use --all to see assignments across all segments.");
-        }
-        return Ok(());
+    let has_assignments = !assignments.is_empty();
+
+    if has_assignments {
+        println!("{:<18} {:<15} {:<12} TITLE", "ANCILLARY", "BEAD", "STATUS");
+        println!("{}", "-".repeat(70));
     }
 
-    println!("{:<18} {:<15} {:<12} TITLE", "ANCILLARY", "BEAD", "STATUS");
-    println!("{}", "-".repeat(70));
-
-    for assignment in assignments {
+    for assignment in &assignments {
         let ws_exists = assignment.workspace_path.exists();
 
         let status_str = match assignment.status {
@@ -484,6 +493,139 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
             "{:<18} {:<15} {:<12} {}",
             assignment.ancillary_id, assignment.bead_id, status_str, title
         );
+    }
+
+    // Detect orphaned workspace directories
+    if let Some(ref ws_root) = workspace_root {
+        let ws_mgr = WorkspaceManager::new(ws_root.clone());
+        let orphans = find_orphaned_workspaces(&ws_mgr, &segments, &assignments);
+
+        if !orphans.is_empty() {
+            if has_assignments {
+                println!();
+            }
+            println!(
+                "{} orphaned workspace dir(s) (will be reclaimed on next assign, or run `breq cleanup`):",
+                orphans.len()
+            );
+            for (segment_name, ws_name, path) in &orphans {
+                println!("  {}/{} ({})", segment_name, ws_name, path.display());
+            }
+        }
+    }
+
+    if !has_assignments && !all_segments {
+        println!("No active assignments in {}.", scope_label);
+        println!("Use --all to see assignments across all segments.");
+    } else if !has_assignments {
+        println!("No active assignments in {}.", scope_label);
+    }
+
+    Ok(())
+}
+
+/// Find workspace directories that exist on disk but are not tracked by jj
+/// and have no assignment record.
+fn find_orphaned_workspaces(
+    ws_mgr: &WorkspaceManager,
+    segments: &[Segment],
+    assignments: &[&toren_lib::Assignment],
+) -> Vec<(String, String, std::path::PathBuf)> {
+    let mut orphans = Vec::new();
+
+    for segment in segments {
+        // Get jj-tracked workspace names
+        let jj_workspaces = ws_mgr.list_workspaces(&segment.path).unwrap_or_default();
+
+        // Get assignment workspace paths for this segment
+        let assigned_paths: std::collections::HashSet<_> = assignments
+            .iter()
+            .filter(|a| a.segment.to_lowercase() == segment.name.to_lowercase())
+            .map(|a| a.workspace_path.clone())
+            .collect();
+
+        // Scan workspace directory for this segment
+        let segment_ws_dir = ws_mgr.workspace_path(&segment.name, "");
+        if let Ok(entries) = std::fs::read_dir(&segment_ws_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let ws_name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+
+                // Skip if tracked by jj
+                if jj_workspaces.contains(&ws_name) {
+                    continue;
+                }
+
+                // Skip if has an assignment record
+                if assigned_paths.contains(&path) {
+                    continue;
+                }
+
+                // This is an orphaned directory
+                orphans.push((segment.name.clone(), ws_name, path));
+            }
+        }
+    }
+
+    orphans
+}
+
+fn cmd_cleanup(config: &Config, all_segments: bool, segment_name: Option<String>) -> Result<()> {
+    let workspace_root = config
+        .ancillary
+        .workspace_root
+        .clone()
+        .context("workspace_root not configured in toren.toml")?;
+
+    let segment_mgr = SegmentManager::new(config)?;
+    let mut assignment_mgr = AssignmentManager::new()?;
+    let ws_mgr = WorkspaceManager::new(workspace_root);
+
+    // Determine which segment(s) to clean up
+    let (assignments, segments): (Vec<_>, Vec<Segment>) = if all_segments {
+        let assignments = assignment_mgr.list_active().into_iter().collect();
+        let segments = segment_mgr.list_all();
+        (assignments, segments)
+    } else if let Some(ref name) = segment_name {
+        let assignments = assignment_mgr
+            .list_active_segment(name)
+            .into_iter()
+            .collect();
+        let segments = segment_mgr
+            .find_by_name(name)
+            .map(|s| vec![s])
+            .unwrap_or_default();
+        (assignments, segments)
+    } else {
+        let segment = resolve_segment(&segment_mgr, None)?;
+        let name = segment.name.clone();
+        let assignments = assignment_mgr
+            .list_active_segment(&name)
+            .into_iter()
+            .collect();
+        (assignments, vec![segment])
+    };
+
+    let orphans = find_orphaned_workspaces(&ws_mgr, &segments, &assignments);
+
+    if orphans.is_empty() {
+        println!("No orphaned workspace directories found.");
+        return Ok(());
+    }
+
+    println!("Removing {} orphaned workspace dir(s):", orphans.len());
+    for (segment_name, ws_name, path) in &orphans {
+        print!("  {}/{}...", segment_name, ws_name);
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => println!(" removed"),
+            Err(e) => println!(" failed: {}", e),
+        }
     }
 
     Ok(())
