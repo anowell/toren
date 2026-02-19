@@ -18,7 +18,7 @@ use crate::security::SecurityContext;
 use crate::services::Services;
 use tokio::sync::RwLock;
 use toren_lib::{
-    Assignment, AssignmentManager, AssignmentStatus, Config, SegmentManager, WorkspaceManager,
+    Assignment, AssignmentManager, CompositeStatus, Config, SegmentManager, WorkspaceManager,
 };
 
 mod ancillary_ws;
@@ -379,6 +379,57 @@ async fn workspaces_cleanup(
     }
 }
 
+// ==================== Composite Status Helper ====================
+
+/// Enriched assignment with composite status signals
+#[derive(Debug, Serialize)]
+struct EnrichedAssignment {
+    #[serde(flatten)]
+    assignment: Assignment,
+    /// Composite status signals derived from observable state
+    #[serde(flatten)]
+    composite: CompositeStatus,
+}
+
+/// Compute composite status for an assignment
+async fn compute_composite_status(
+    assignment: &Assignment,
+    state: &AppState,
+) -> CompositeStatus {
+    // 1. Agent activity — check work manager first, then Claude session logs
+    let agent_activity = if state.work_manager.has_active_work(&assignment.ancillary_id).await {
+        "busy".to_string()
+    } else {
+        // Fall back to Claude session log recency check
+        toren_lib::composite_status::detect_agent_activity(&assignment.workspace_path)
+    };
+
+    // 2. Has changes — from jj workspace
+    let has_changes = toren_lib::composite_status::workspace_has_changes(&assignment.workspace_path);
+
+    // 3. Bead status + assignee — from bd
+    let segment_path = {
+        let segments = state.segments.read().unwrap();
+        segments.find_by_name(&assignment.segment).map(|s| s.path.clone())
+    };
+
+    let (bead_status, bead_assignee) = if let Some(seg_path) = segment_path {
+        match toren_lib::tasks::beads::fetch_bead_info(&assignment.bead_id, &seg_path) {
+            Ok(info) => (info.status, info.assignee),
+            Err(_) => ("unknown".to_string(), String::new()),
+        }
+    } else {
+        ("unknown".to_string(), String::new())
+    };
+
+    CompositeStatus {
+        agent_activity,
+        has_changes,
+        bead_status,
+        bead_assignee,
+    }
+}
+
 // ==================== Assignment API ====================
 
 #[derive(Debug, Deserialize)]
@@ -396,61 +447,54 @@ struct CreateAssignmentRequest {
     segment: String,
 }
 
-#[derive(Debug, Serialize)]
-struct AssignmentResponse {
-    assignment: Assignment,
-}
-
 async fn assignments_list(State(state): State<AppState>) -> impl IntoResponse {
     let mut assignments = state.assignments.write().await;
-    let all = assignments.list();
+    let all: Vec<Assignment> = assignments.list().into_iter().cloned().collect();
+    drop(assignments); // Release lock before async work
+
+    // Enrich each assignment with composite status
+    let mut enriched = Vec::with_capacity(all.len());
+    for assignment in all {
+        let composite = compute_composite_status(&assignment, &state).await;
+        enriched.push(EnrichedAssignment {
+            assignment,
+            composite,
+        });
+    }
 
     Json(serde_json::json!({
-        "assignments": all,
-        "count": all.len()
+        "assignments": enriched,
+        "count": enriched.len()
     }))
 }
 
 async fn assignments_get(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<AssignmentResponse>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let mut assignments = state.assignments.write().await;
 
-    // Try to find by assignment ID first
-    if let Some(assignment) = assignments.get(&id) {
-        return Ok(Json(AssignmentResponse {
-            assignment: assignment.clone(),
-        }));
-    }
+    // Try to find by assignment ID, ancillary ID, or bead ID
+    let assignment = assignments
+        .get(&id)
+        .cloned()
+        .or_else(|| assignments.get_active_for_ancillary(&id).cloned())
+        .or_else(|| assignments.get_by_bead(&id).into_iter().next().cloned());
 
-    // Try to find by ancillary ID
-    if let Some(assignment) = assignments.get_active_for_ancillary(&id) {
-        return Ok(Json(AssignmentResponse {
-            assignment: assignment.clone(),
-        }));
-    }
+    drop(assignments);
 
-    // Try to find by bead ID (return first active)
-    let by_bead = assignments.get_by_bead(&id);
-    if let Some(assignment) = by_bead.into_iter().find(|a| {
-        matches!(
-            a.status,
-            AssignmentStatus::Pending | AssignmentStatus::Active
-        )
-    }) {
-        return Ok(Json(AssignmentResponse {
-            assignment: assignment.clone(),
-        }));
-    }
+    let assignment = assignment.ok_or(StatusCode::NOT_FOUND)?;
+    let composite = compute_composite_status(&assignment, &state).await;
 
-    Err(StatusCode::NOT_FOUND)
+    Ok(Json(serde_json::json!({
+        "assignment": EnrichedAssignment { assignment, composite }
+    })))
 }
 
 async fn assignments_create(
     State(state): State<AppState>,
     Json(request): Json<CreateAssignmentRequest>,
-) -> Result<Json<AssignmentResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<EnrichedAssignment>, (StatusCode, Json<serde_json::Value>)> {
     let ws_mgr = state.workspaces.as_ref().ok_or((
         StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({"error": "workspace_root not configured"})),
@@ -596,41 +640,33 @@ async fn assignments_create(
             })?
     };
 
-    Ok(Json(AssignmentResponse { assignment }))
+    let composite = compute_composite_status(&assignment, &state).await;
+    Ok(Json(EnrichedAssignment { assignment, composite }))
 }
 
 #[derive(Debug, Deserialize)]
 struct UpdateStatusRequest {
+    /// Kept for API compatibility — all assignments are Active now
+    #[allow(dead_code)]
     status: String,
 }
 
 async fn assignments_update_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(request): Json<UpdateStatusRequest>,
+    Json(_request): Json<UpdateStatusRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let status = match request.status.as_str() {
-        "pending" => AssignmentStatus::Pending,
-        "active" => AssignmentStatus::Active,
-        "completed" => AssignmentStatus::Completed,
-        "aborted" => AssignmentStatus::Aborted,
-        _ => return Err(StatusCode::BAD_REQUEST),
-    };
-
+    // All assignments are active — status updates are no-ops.
+    // Terminal transitions happen via complete/abort endpoints.
     let mut assignments = state.assignments.write().await;
 
-    // Try to find by assignment ID first, then by ancillary ID
-    let assignment_id = if assignments.get(&id).is_some() {
-        id.clone()
-    } else if let Some(a) = assignments.get_active_for_ancillary(&id) {
-        a.id.clone()
-    } else {
-        return Err(StatusCode::NOT_FOUND);
-    };
+    // Verify the assignment exists
+    let exists = assignments.get(&id).is_some()
+        || assignments.get_active_for_ancillary(&id).is_some();
 
-    assignments
-        .update_status(&assignment_id, status)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
 
     Ok(Json(serde_json::json!({"success": true})))
 }

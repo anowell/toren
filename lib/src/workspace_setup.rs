@@ -351,10 +351,8 @@ impl BreqConfig {
                             // Support both string and integer literals
                             if let Some(s) = e.value().as_string() {
                                 Some(s.to_string())
-                            } else if let Some(n) = kdl_value_as_i64(e.value()) {
-                                Some(n.to_string())
                             } else {
-                                None
+                                kdl_value_as_i64(e.value()).map(|n| n.to_string())
                             }
                         })
                         .with_context(|| format!("var '{}' requires a value or expr= attribute", name))?;
@@ -442,7 +440,7 @@ impl BreqConfig {
                 // Support both positional (proxy 443 ...) and named (proxy port=443 ...)
                 let port = node
                     .get("port")
-                    .and_then(|v| kdl_value_as_i64(v))
+                    .and_then(kdl_value_as_i64)
                     .or_else(|| {
                         node.entries()
                             .iter()

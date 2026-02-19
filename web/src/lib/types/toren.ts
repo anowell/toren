@@ -32,6 +32,10 @@ export type AncillaryDisplayStatus = 'busy' | 'ready';
 
 export type BeadDisplayStatus = 'open' | 'in_progress' | 'closed';
 
+export type BeadStatus = 'open' | 'in_progress' | 'closed';
+
+export type AgentActivity = 'busy' | 'idle';
+
 export interface Ancillary {
 	id: string;
 	segment: string;
@@ -39,7 +43,7 @@ export interface Ancillary {
 	last_active: string;
 }
 
-export type AssignmentStatus = 'pending' | 'active' | 'completed' | 'aborted';
+export type AssignmentStatus = 'active';
 
 export interface AssignmentSource {
 	type: 'Bead' | 'Prompt';
@@ -59,6 +63,11 @@ export interface Assignment {
 	bead_title?: string;
 	session_id?: string;
 	ancillary_num?: number;
+	// Composite status signals (from API enrichment)
+	agent_activity?: AgentActivity;
+	has_changes?: boolean;
+	bead_status?: BeadStatus;
+	bead_assignee?: string;
 }
 
 export interface Segment {

@@ -39,16 +39,18 @@ $: currentAssignment = $segmentAssignments.find((a) => {
 // Build the ancillary ID for WebSocket connection
 $: ancillaryId = currentAssignment?.ancillary_id ?? null;
 
-// Look up polled ancillary display status
+// Look up agent activity from composite status
 $: ancillaryDisplayStatus = (() => {
-	if (!ancillaryId) return 'ready' as const;
+	if (!currentAssignment) return 'ready' as const;
+	if (currentAssignment.agent_activity === 'busy') return 'busy' as const;
+	if (currentAssignment.agent_activity === 'idle') return 'ready' as const;
 	const ancillary = $torenStore.ancillaries.find((a) => a.id === ancillaryId);
 	if (!ancillary) return 'ready' as const;
 	return getAncillaryDisplayStatus(ancillary.status);
 })();
 
 // Bead display status
-$: beadDisplayStatus = currentAssignment ? getBeadDisplayStatus(currentAssignment.status) : null;
+$: beadDisplayStatus = currentAssignment ? getBeadDisplayStatus(currentAssignment) : null;
 
 // Connect/reconnect when ancillary changes or auth state changes
 // Gate on authenticated — only open ancillary WS when main connection is up
@@ -237,8 +239,10 @@ function capitalizeUnit(unit: string): string {
 	return unit.charAt(0).toUpperCase() + unit.slice(1);
 }
 
-function lookupAncillaryDisplayStatus(ancillaryId: string): 'busy' | 'ready' {
-	const ancillary = $torenStore.ancillaries.find((a) => a.id === ancillaryId);
+function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment): 'busy' | 'ready' {
+	if (assignment.agent_activity === 'busy') return 'busy';
+	if (assignment.agent_activity === 'idle') return 'ready';
+	const ancillary = $torenStore.ancillaries.find((a) => a.id === assignment.ancillary_id);
 	if (!ancillary) return 'ready';
 	return getAncillaryDisplayStatus(ancillary.status);
 }
@@ -366,7 +370,7 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 			{/if}
 			<span class="bead-label">{stripBeadPrefix(currentAssignment.bead_id)}{#if currentAssignment.bead_title}: {currentAssignment.bead_title}{/if}</span>
 			<div class="indicator-actions">
-				{#if isDone || currentAssignment.status === 'completed' || currentAssignment.status === 'aborted'}
+				{#if isDone}
 					<button class="action-btn resume" on:click={handleResume} disabled={lifecycleLoading} title="Resume work">Resume</button>
 					<button class="action-btn complete" on:click={handleComplete} disabled={lifecycleLoading} title="Complete and cleanup">Complete</button>
 				{:else if !isWorking}
@@ -538,15 +542,15 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 
 				{#each $segmentAssignments as assignment (assignment.id)}
 					{@const unitName = assignment.ancillary_id.split(' ').pop()?.toLowerCase()}
-					{@const displayStatus = lookupAncillaryDisplayStatus(assignment.ancillary_id)}
-					{@const beadStatus = getBeadDisplayStatus(assignment.status)}
+					{@const agentStatus = lookupAgentActivity(assignment)}
+					{@const beadStatus = getBeadDisplayStatus(assignment)}
 					<button
 						class="mobile-item"
 						class:selected={unitName === $page.params.unit?.toLowerCase()}
 						on:click={() => navigateToAncillary(assignment.ancillary_id)}
 					>
 						<div class="item-main">
-							<span class="ancillary-status-dot" class:busy={displayStatus === 'busy'} class:ready={displayStatus === 'ready'}></span>
+							<span class="ancillary-status-dot" class:busy={agentStatus === 'busy'} class:ready={agentStatus === 'ready'}></span>
 							<span class="item-name">{assignment.ancillary_id}</span>
 						</div>
 						<span class="item-bead"><BeadStatusIcon status={beadStatus} /> {stripBeadPrefix(assignment.bead_id)}{#if assignment.bead_title}: {assignment.bead_title}{/if}</span>

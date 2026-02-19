@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use tracing::info;
 
-use crate::assignment::{AssignmentManager, AssignmentStatus};
+use crate::assignment::{AssignmentManager, CompletionReason};
 use crate::config::ProxyConfig;
 use crate::workspace::WorkspaceManager;
 use crate::workspace_setup::{ProxyDirective, SetupResult};
@@ -122,7 +122,12 @@ pub fn complete_assignment(
     let destroy_result = cleanup_workspace(assignment, ws_mgr, opts.segment_path, opts.proxy_config)?;
     result.destroy_directives = destroy_result.proxy_directives;
 
-    // Remove assignment from storage
+    // Record completion history and remove assignment from active storage
+    assignment_mgr.record_completion(
+        assignment,
+        CompletionReason::Completed,
+        result.revision.clone(),
+    )?;
     assignment_mgr.remove(&assignment.id)?;
 
     // Close bead unless keep_open
@@ -146,7 +151,8 @@ pub fn abort_assignment(
     // Cleanup workspace if it exists
     let destroy_result = cleanup_workspace(assignment, ws_mgr, opts.segment_path, opts.proxy_config)?;
 
-    // Remove assignment from storage
+    // Record abort history and remove assignment from active storage
+    assignment_mgr.record_completion(assignment, CompletionReason::Aborted, None)?;
     assignment_mgr.remove(&assignment.id)?;
 
     // Handle bead status
@@ -208,8 +214,8 @@ pub fn prepare_resume(
         info!("Workspace recreated: {}", assignment.workspace_path.display());
     }
 
-    // Update status to active
-    assignment_mgr.update_status(&assignment.id, AssignmentStatus::Active)?;
+    // Touch updated_at timestamp (assignment is always Active)
+    assignment_mgr.touch(&assignment.id)?;
 
     // Ensure bead is in_progress and assigned to claude
     let task_title = match crate::tasks::fetch_task(&assignment.bead_id, opts.segment_path) {

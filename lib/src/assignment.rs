@@ -16,18 +16,57 @@ pub enum AssignmentSource {
     Prompt { original_prompt: String },
 }
 
-/// Current status of an assignment
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "snake_case")]
+/// Current status of an assignment.
+/// Assignments are always Active — terminal actions (complete/abort) dissolve the link
+/// and record a CompletionRecord for history.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum AssignmentStatus {
-    /// Assignment created, ancillary not yet connected
     #[default]
-    Pending,
-    /// Ancillary is connected and working
     Active,
-    /// Work approved/finished
+}
+
+// Custom serde: always serializes as "active", deserializes any legacy variant as Active
+impl Serialize for AssignmentStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("active")
+    }
+}
+
+impl<'de> Deserialize<'de> for AssignmentStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        // Accept any legacy status and map to Active
+        match s.as_str() {
+            "pending" | "active" | "completed" | "aborted" => Ok(AssignmentStatus::Active),
+            _ => Ok(AssignmentStatus::Active),
+        }
+    }
+}
+
+/// Record of a completed/aborted assignment for history
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionRecord {
+    /// Original assignment ID
+    pub assignment_id: String,
+    /// Ancillary that worked on it
+    pub ancillary_id: String,
+    /// Bead that was assigned
+    pub bead_id: String,
+    /// Segment name
+    pub segment: String,
+    /// When the assignment was completed/aborted (RFC 3339)
+    pub completed_at: String,
+    /// How it ended
+    pub reason: CompletionReason,
+    /// Final jj revision hash (if available)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionReason {
     Completed,
-    /// Work discarded
     Aborted,
 }
 
@@ -296,7 +335,7 @@ impl AssignmentManager {
             segment: segment.to_string(),
             workspace_path,
             source: AssignmentSource::Bead,
-            status: AssignmentStatus::Pending,
+            status: AssignmentStatus::Active,
             created_at: now.clone(),
             updated_at: now,
             bead_title,
@@ -337,7 +376,7 @@ impl AssignmentManager {
             source: AssignmentSource::Prompt {
                 original_prompt: original_prompt.to_string(),
             },
-            status: AssignmentStatus::Pending,
+            status: AssignmentStatus::Active,
             created_at: now.clone(),
             updated_at: now,
             bead_title,
@@ -355,18 +394,6 @@ impl AssignmentManager {
         Ok(assignment)
     }
 
-    /// Update assignment status
-    pub fn update_status(&mut self, assignment_id: &str, status: AssignmentStatus) -> Result<bool> {
-        if let Some(assignment) = self.assignments.get_mut(assignment_id) {
-            assignment.status = status;
-            assignment.updated_at = chrono::Utc::now().to_rfc3339();
-            self.save()?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
     /// Update assignment session ID (for cross-interface handoff)
     pub fn update_session_id(
         &mut self,
@@ -381,6 +408,66 @@ impl AssignmentManager {
         } else {
             Ok(false)
         }
+    }
+
+    /// Touch the updated_at timestamp for an assignment
+    pub fn touch(&mut self, assignment_id: &str) -> Result<bool> {
+        if let Some(assignment) = self.assignments.get_mut(assignment_id) {
+            assignment.updated_at = chrono::Utc::now().to_rfc3339();
+            self.save()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Record a completion (or abort) and remove the assignment from active storage.
+    /// Appends a CompletionRecord to ~/.toren/completion_history.jsonl.
+    pub fn record_completion(
+        &mut self,
+        assignment: &Assignment,
+        reason: CompletionReason,
+        final_revision: Option<String>,
+    ) -> Result<()> {
+        let record = CompletionRecord {
+            assignment_id: assignment.id.clone(),
+            ancillary_id: assignment.ancillary_id.clone(),
+            bead_id: assignment.bead_id.clone(),
+            segment: assignment.segment.clone(),
+            completed_at: chrono::Utc::now().to_rfc3339(),
+            reason,
+            final_revision,
+        };
+
+        // Append to completion history file
+        let history_path = self
+            .storage_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("completion_history.jsonl");
+
+        let mut line = serde_json::to_string(&record)
+            .with_context(|| "Failed to serialize completion record")?;
+        line.push('\n');
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&history_path)
+            .with_context(|| format!("Failed to open {}", history_path.display()))?;
+        file.write_all(line.as_bytes())?;
+
+        debug!(
+            "Recorded completion for assignment {} ({})",
+            assignment.id,
+            match record.reason {
+                CompletionReason::Completed => "completed",
+                CompletionReason::Aborted => "aborted",
+            }
+        );
+
+        Ok(())
     }
 
     /// Get assignment by ID
@@ -407,16 +494,13 @@ impl AssignmentManager {
             .collect()
     }
 
-    /// Get active assignment for an ancillary (should be at most one)
+    /// Get active assignment for an ancillary (should be at most one).
+    /// All assignments are active (terminal actions remove the record).
     pub fn get_active_for_ancillary(&mut self, ancillary_id: &str) -> Option<&Assignment> {
         self.reload_if_changed();
-        self.assignments.values().find(|a| {
-            a.ancillary_id.to_lowercase() == ancillary_id.to_lowercase()
-                && matches!(
-                    a.status,
-                    AssignmentStatus::Pending | AssignmentStatus::Active
-                )
-        })
+        self.assignments
+            .values()
+            .find(|a| a.ancillary_id.to_lowercase() == ancillary_id.to_lowercase())
     }
 
     /// Remove assignment by ID
@@ -495,39 +579,22 @@ impl AssignmentManager {
             .collect()
     }
 
-    /// List active (pending or active) assignments
+    /// List active assignments (all assignments are active — terminal actions remove them).
+    /// Sorted by ancillary number.
     pub fn list_active(&mut self) -> Vec<&Assignment> {
         self.reload_if_changed();
-        let mut assignments: Vec<&Assignment> = self.assignments
-            .values()
-            .filter(|a| {
-                matches!(
-                    a.status,
-                    AssignmentStatus::Pending | AssignmentStatus::Active
-                )
-            })
-            .collect();
-
-        // Sort by ancillary number (One, Two, Three, etc.)
+        let mut assignments: Vec<&Assignment> = self.assignments.values().collect();
         assignments.sort_by_key(|a| ancillary_number(&a.ancillary_id).unwrap_or(u32::MAX));
         assignments
     }
 
-    /// List active assignments for a specific segment
+    /// List active assignments for a specific segment, sorted by ancillary number.
     pub fn list_active_segment(&mut self, segment: &str) -> Vec<&Assignment> {
         self.reload_if_changed();
         let mut assignments: Vec<&Assignment> = self.assignments
             .values()
-            .filter(|a| {
-                a.segment.to_lowercase() == segment.to_lowercase()
-                    && matches!(
-                        a.status,
-                        AssignmentStatus::Pending | AssignmentStatus::Active
-                    )
-            })
+            .filter(|a| a.segment.to_lowercase() == segment.to_lowercase())
             .collect();
-
-        // Sort by ancillary number (One, Two, Three, etc.)
         assignments.sort_by_key(|a| ancillary_number(&a.ancillary_id).unwrap_or(u32::MAX));
         assignments
     }
@@ -593,19 +660,9 @@ impl AssignmentManager {
         }
     }
 
-    /// Resolve to active assignments only
+    /// Resolve to active assignments only (all assignments are active).
     pub fn resolve_active(&mut self, ref_: &AssignmentRef) -> Vec<&Assignment> {
-        self.reload_if_changed();
-        match ref_ {
-            AssignmentRef::Bead(bead_id) => self.assignments
-                .values()
-                .filter(|a| a.bead_id == *bead_id && matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
-                .collect(),
-            AssignmentRef::Ancillary(ancillary_id) => self.assignments
-                .values()
-                .filter(|a| a.ancillary_id.to_lowercase() == ancillary_id.to_lowercase() && matches!(a.status, AssignmentStatus::Pending | AssignmentStatus::Active))
-                .collect(),
-        }
+        self.resolve(ref_)
     }
 }
 

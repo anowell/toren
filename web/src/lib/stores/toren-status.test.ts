@@ -1,6 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import type { AncillaryStatus } from '$lib/types/toren';
+import type { AncillaryStatus, Assignment } from '$lib/types/toren';
 import { getAncillaryDisplayStatus, getBeadDisplayStatus, stripBeadPrefix } from './toren';
+
+function makeAssignment(overrides: Partial<Assignment> = {}): Assignment {
+	return {
+		id: 'test',
+		ancillary_id: 'Test One',
+		bead_id: 'breq-test',
+		segment: 'test',
+		workspace_path: '/tmp/test',
+		source: { type: 'Prompt' },
+		status: 'active',
+		created_at: '',
+		updated_at: '',
+		...overrides,
+	};
+}
 
 describe('getAncillaryDisplayStatus', () => {
 	it('maps busy statuses correctly', () => {
@@ -26,20 +41,22 @@ describe('getAncillaryDisplayStatus', () => {
 });
 
 describe('getBeadDisplayStatus', () => {
-	it('maps pending to open', () => {
-		expect(getBeadDisplayStatus('pending')).toBe('open');
+	it('maps open bead_status to open', () => {
+		expect(getBeadDisplayStatus(makeAssignment({ bead_status: 'open' }))).toBe('open');
 	});
 
-	it('maps active to in_progress', () => {
-		expect(getBeadDisplayStatus('active')).toBe('in_progress');
+	it('maps in_progress bead_status to in_progress', () => {
+		expect(getBeadDisplayStatus(makeAssignment({ bead_status: 'in_progress' }))).toBe(
+			'in_progress',
+		);
 	});
 
-	it('maps completed to closed', () => {
-		expect(getBeadDisplayStatus('completed')).toBe('closed');
+	it('maps closed bead_status to closed', () => {
+		expect(getBeadDisplayStatus(makeAssignment({ bead_status: 'closed' }))).toBe('closed');
 	});
 
-	it('maps aborted to closed', () => {
-		expect(getBeadDisplayStatus('aborted')).toBe('closed');
+	it('defaults to in_progress when bead_status is undefined', () => {
+		expect(getBeadDisplayStatus(makeAssignment())).toBe('in_progress');
 	});
 });
 

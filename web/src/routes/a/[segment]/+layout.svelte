@@ -47,8 +47,12 @@ function navigateToNewAncillary() {
 	goto(`/a/${$page.params.segment}`);
 }
 
-function lookupAncillaryDisplayStatus(ancillaryId: string): 'busy' | 'ready' {
-	const ancillary = $torenStore.ancillaries.find((a) => a.id === ancillaryId);
+function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment): 'busy' | 'ready' {
+	// Prefer composite signal from API
+	if (assignment.agent_activity === 'busy') return 'busy';
+	if (assignment.agent_activity === 'idle') return 'ready';
+	// Fallback to ancillary status
+	const ancillary = $torenStore.ancillaries.find((a) => a.id === assignment.ancillary_id);
 	if (!ancillary) return 'ready';
 	return getAncillaryDisplayStatus(ancillary.status);
 }
@@ -92,21 +96,27 @@ function lookupAncillaryDisplayStatus(ancillaryId: string): 'busy' | 'ready' {
 
 			{#each $segmentAssignments as assignment (assignment.id)}
 				{@const unitName = assignment.ancillary_id.split(' ').pop()?.toLowerCase()}
-				{@const displayStatus = lookupAncillaryDisplayStatus(assignment.ancillary_id)}
-				{@const beadStatus = getBeadDisplayStatus(assignment.status)}
+				{@const agentStatus = lookupAgentActivity(assignment)}
+				{@const beadStatus = getBeadDisplayStatus(assignment)}
 				<button
 					class="ancillary-card"
 					class:selected={currentUnit === unitName}
 					on:click={() => navigateToAncillary(assignment.ancillary_id)}
 				>
 					<div class="card-header">
-						<span class="ancillary-status-dot" class:busy={displayStatus === 'busy'} class:ready={displayStatus === 'ready'}></span>
+						<span class="ancillary-status-dot" class:busy={agentStatus === 'busy'} class:ready={agentStatus === 'ready'}></span>
 						<span class="ancillary-name">{assignment.ancillary_id}</span>
+						{#if assignment.has_changes}<span class="changes-indicator" title="Has uncommitted changes">*</span>{/if}
 					</div>
 					<div class="card-body">
 						<BeadStatusIcon status={beadStatus} />
 						<span class="bead-label">{stripBeadPrefix(assignment.bead_id)}{#if assignment.bead_title}: {assignment.bead_title}{/if}</span>
 					</div>
+					{#if assignment.bead_assignee}
+						<div class="card-footer">
+							<span class="assignee-badge">@{assignment.bead_assignee}</span>
+						</div>
+					{/if}
 				</button>
 			{/each}
 		</div>
@@ -251,6 +261,26 @@ function lookupAncillaryDisplayStatus(ancillaryId: string): 'busy' | 'ready' {
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.changes-indicator {
+		color: var(--color-warning);
+		font-weight: 700;
+		font-size: 0.9rem;
+		margin-left: auto;
+	}
+
+	.card-footer {
+		display: flex;
+		align-items: center;
+	}
+
+	.assignee-badge {
+		font-size: 0.75rem;
+		color: var(--color-text-secondary);
+		background: var(--color-bg-tertiary);
+		padding: 1px var(--spacing-xs);
+		border-radius: var(--radius-sm);
 	}
 
 	.main-content {

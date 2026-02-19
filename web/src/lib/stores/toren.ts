@@ -4,7 +4,6 @@ import type {
 	AncillaryDisplayStatus,
 	AncillaryStatus,
 	Assignment,
-	AssignmentStatus,
 	BeadDisplayStatus,
 	CommandOutput,
 	CreateAssignmentRequest,
@@ -219,15 +218,18 @@ export function stripBeadPrefix(beadId: string): string {
 	return idx >= 0 ? beadId.slice(idx + 1) : beadId;
 }
 
-export function getBeadDisplayStatus(status: AssignmentStatus): BeadDisplayStatus {
-	switch (status) {
-		case 'pending':
+/** Derive bead display status from the composite bead_status signal (from bd) */
+export function getBeadDisplayStatus(assignment: Assignment): BeadDisplayStatus {
+	switch (assignment.bead_status) {
+		case 'open':
 			return 'open';
-		case 'active':
+		case 'in_progress':
 			return 'in_progress';
-		case 'completed':
-		case 'aborted':
+		case 'closed':
 			return 'closed';
+		default:
+			// Fallback: if composite status not available, default to in_progress
+			return 'in_progress';
 	}
 }
 
@@ -439,9 +441,7 @@ function createTorenStore() {
 			// Update assignment in local state
 			update((state) => ({
 				...state,
-				assignments: state.assignments.map((a) =>
-					a.id === assignmentId ? data.assignment : a,
-				),
+				assignments: state.assignments.map((a) => (a.id === assignmentId ? data.assignment : a)),
 			}));
 			return { assignment: data.assignment, work_started: data.work_started };
 		},

@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 use super::AppState;
 use crate::ancillary::AncillaryStatus;
 use crate::services::command::CommandRequest;
-use toren_lib::{tasks, AssignmentStatus};
+use toren_lib::tasks;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -76,7 +76,7 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let mut authenticated = false;
     let mut ancillary_id: Option<String> = None;
-    let mut assignment_id: Option<String> = None;
+    let mut _assignment_id: Option<String> = None;
 
     info!("New WebSocket connection");
 
@@ -118,7 +118,7 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
                         match connect_via_assignment(&state, id, &token).await {
                             Ok((response, aid_clone, assign_id)) => {
                                 ancillary_id = Some(aid_clone);
-                                assignment_id = Some(assign_id);
+                                _assignment_id = Some(assign_id);
                                 if let Ok(json) = serde_json::to_string(&response) {
                                     let _ = sender.send(Message::Text(json)).await;
                                 }
@@ -304,11 +304,7 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
         state.ancillaries.unregister(id);
     }
 
-    // Update assignment status back to Pending on disconnect
-    if let Some(ref assign_id) = assignment_id {
-        let mut assignments = state.assignments.write().await;
-        let _ = assignments.update_status(assign_id, AssignmentStatus::Pending);
-    }
+    // Assignment stays active on disconnect (status is always Active while assignment exists)
 
     info!("WebSocket connection closed");
 }
@@ -386,8 +382,8 @@ async fn connect_via_assignment(
         }
     };
 
-    // Update assignment status to Active
-    let _ = assignments.update_status(&assignment.id, AssignmentStatus::Active);
+    // Touch assignment timestamp on connect
+    let _ = assignments.touch(&assignment.id);
 
     let response = WsResponse::AuthSuccess {
         session_id: session_token.to_string(),

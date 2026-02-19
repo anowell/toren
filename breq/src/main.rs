@@ -4,7 +4,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use toren_lib::{
-    AssignmentManager, AssignmentRef, AssignmentStatus, Config, Segment, SegmentManager,
+    AssignmentManager, AssignmentRef, Config, Segment, SegmentManager,
     WorkspaceManager,
 };
 use tracing::info;
@@ -458,43 +458,66 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
 
     let has_assignments = !assignments.is_empty();
 
-    if has_assignments {
-        println!("{:<18} {:<15} {:<12} TITLE", "ANCILLARY", "BEAD", "STATUS");
-        println!("{}", "-".repeat(70));
-    }
-
     for assignment in &assignments {
-        let ws_exists = assignment.workspace_path.exists();
+        // Fetch composite status signals
+        let segment_path = segment_mgr
+            .find_by_name(&assignment.segment)
+            .map(|s| s.path.clone());
 
-        let status_str = match assignment.status {
-            AssignmentStatus::Pending => {
-                if ws_exists {
-                    "pending"
-                } else {
-                    "ws-missing"
-                }
-            }
-            AssignmentStatus::Active => {
-                if ws_exists {
-                    "active"
-                } else {
-                    "ws-missing"
-                }
-            }
-            AssignmentStatus::Completed => "completed",
-            AssignmentStatus::Aborted => "aborted",
+        // 1. Bead status + assignee (from bd)
+        let bead_info = segment_path
+            .as_ref()
+            .and_then(|seg_path| {
+                toren_lib::tasks::beads::fetch_bead_info(&assignment.bead_id, seg_path).ok()
+            });
+
+        // 1. Agent activity (from Claude session log last-entry-type)
+        let agent_activity = toren_lib::composite_status::detect_agent_activity(
+            &assignment.workspace_path,
+        );
+
+        // 2. Has changes (from jj workspace)
+        let has_changes = toren_lib::composite_status::workspace_has_changes(&assignment.workspace_path);
+
+        // 3. Assignee
+        let assignee = bead_info
+            .as_ref()
+            .map(|b| b.assignee.as_str())
+            .unwrap_or("");
+        let assignee_display = if assignee.is_empty() {
+            String::new()
+        } else {
+            format!("@{}", assignee)
         };
 
-        // Try to fetch bead title from the segment
-        let title = segment_mgr
-            .find_by_name(&assignment.segment)
-            .and_then(|seg| toren_lib::tasks::fetch_task(&assignment.bead_id, &seg.path).ok())
-            .map(|task| truncate_title(&task.title, 40))
+        // 4. Title
+        let title = bead_info
+            .as_ref()
+            .map(|b| truncate_title(&b.title, 40))
+            .or_else(|| {
+                segment_path
+                    .as_ref()
+                    .and_then(|seg| toren_lib::tasks::fetch_task(&assignment.bead_id, seg).ok())
+                    .map(|task| truncate_title(&task.title, 40))
+            })
             .unwrap_or_else(|| "-".to_string());
 
+        // Extract ancillary short name (e.g., "Toren One" -> "One")
+        // Append * for dirty workspaces (like jj bookmark markers)
+        let ancillary_name = assignment
+            .ancillary_id
+            .split_whitespace()
+            .last()
+            .unwrap_or(&assignment.ancillary_id);
+        let workspace_display = if has_changes {
+            format!("{} *", ancillary_name)
+        } else {
+            ancillary_name.to_string()
+        };
+
         println!(
-            "{:<18} {:<15} {:<12} {}",
-            assignment.ancillary_id, assignment.bead_id, status_str, title
+            "{:<10} {:<15} {:<6} {:<10} {}",
+            workspace_display, assignment.bead_id, agent_activity, assignee_display, title
         );
     }
 
@@ -729,45 +752,20 @@ fn cmd_resume(
     let segment = resolve_segment(&segment_mgr, None)?;
     let ref_ = AssignmentRef::parse(reference, &segment.name);
 
-    // Find assignment - check all assignments, not just active ones
-    // This allows resuming completed/aborted assignments
+    // Find assignment (all assignments are active — terminal actions remove them)
     let assignment = {
-        let mut assignments = assignment_mgr.resolve(&ref_);
+        let assignments = assignment_mgr.resolve(&ref_);
 
         if assignments.is_empty() {
             anyhow::bail!("No assignment found for: {}", reference);
         }
 
-        // Prefer active assignments, but fall back to any assignment
-        assignments.sort_by(|a, b| {
-            let a_active = matches!(
-                a.status,
-                AssignmentStatus::Pending | AssignmentStatus::Active
-            );
-            let b_active = matches!(
-                b.status,
-                AssignmentStatus::Pending | AssignmentStatus::Active
-            );
-            b_active.cmp(&a_active)
-        });
-
         if assignments.len() > 1 {
-            let active_count = assignments
-                .iter()
-                .filter(|a| {
-                    matches!(
-                        a.status,
-                        AssignmentStatus::Pending | AssignmentStatus::Active
-                    )
-                })
-                .count();
-            if active_count > 1 {
-                println!("Multiple active assignments found:");
-                for a in &assignments {
-                    println!("  {} -> {}", a.ancillary_id, a.bead_id);
-                }
-                anyhow::bail!("Please specify a unique ancillary or bead");
+            println!("Multiple assignments found:");
+            for a in &assignments {
+                println!("  {} -> {}", a.ancillary_id, a.bead_id);
             }
+            anyhow::bail!("Please specify a unique ancillary or bead");
         }
 
         assignments[0].clone()

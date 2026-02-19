@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
 
@@ -10,6 +10,21 @@ struct BeadResponse {
     id: String,
     title: String,
     description: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    assignee: Option<String>,
+}
+
+/// Observable bead info for composite status display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadInfo {
+    pub id: String,
+    pub title: String,
+    /// Bead status: "open", "in_progress", "closed"
+    pub status: String,
+    /// Bead assignee: e.g. "claude", "anthony"
+    pub assignee: String,
 }
 
 /// Fetch a bead by ID using the bd CLI
@@ -39,6 +54,36 @@ pub fn fetch_bead(bead_id: &str, working_dir: &Path) -> Result<Task> {
         title: bead.title,
         description: bead.description,
         provider: TaskProvider::Beads,
+    })
+}
+
+/// Fetch bead info (status + assignee) for composite status display
+pub fn fetch_bead_info(bead_id: &str, working_dir: &Path) -> Result<BeadInfo> {
+    let output = Command::new("bd")
+        .args(["show", bead_id, "--json"])
+        .current_dir(working_dir)
+        .output()
+        .context("Failed to execute bd command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("bd show failed: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let beads: Vec<BeadResponse> =
+        serde_json::from_str(&stdout).context("Failed to parse bd output")?;
+
+    let bead = beads
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("No bead found with id: {}", bead_id))?;
+
+    Ok(BeadInfo {
+        id: bead.id,
+        title: bead.title,
+        status: bead.status.unwrap_or_else(|| "open".to_string()),
+        assignee: bead.assignee.unwrap_or_default(),
     })
 }
 

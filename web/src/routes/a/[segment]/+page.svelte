@@ -41,8 +41,10 @@ function navigateToNewAncillary() {
 	closeMobilePanel();
 }
 
-function lookupAncillaryDisplayStatus(ancillaryId: string): 'busy' | 'ready' {
-	const ancillary = $torenStore.ancillaries.find((a) => a.id === ancillaryId);
+function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment): 'busy' | 'ready' {
+	if (assignment.agent_activity === 'busy') return 'busy';
+	if (assignment.agent_activity === 'idle') return 'ready';
+	const ancillary = $torenStore.ancillaries.find((a) => a.id === assignment.ancillary_id);
 	if (!ancillary) return 'ready';
 	return getAncillaryDisplayStatus(ancillary.status);
 }
@@ -251,11 +253,11 @@ async function handleSendMessage() {
 				</button>
 
 				{#each $segmentAssignments as assignment (assignment.id)}
-					{@const displayStatus = lookupAncillaryDisplayStatus(assignment.ancillary_id)}
-					{@const beadStatus = getBeadDisplayStatus(assignment.status)}
+					{@const agentStatus = lookupAgentActivity(assignment)}
+					{@const beadStatus = getBeadDisplayStatus(assignment)}
 					<button class="mobile-item" on:click={() => navigateToAncillary(assignment.ancillary_id)}>
 						<div class="item-main">
-							<span class="ancillary-status-dot" class:busy={displayStatus === 'busy'} class:ready={displayStatus === 'ready'}></span>
+							<span class="ancillary-status-dot" class:busy={agentStatus === 'busy'} class:ready={agentStatus === 'ready'}></span>
 							<span class="item-name">{assignment.ancillary_id}</span>
 						</div>
 						<span class="item-bead"><BeadStatusIcon status={beadStatus} /> {stripBeadPrefix(assignment.bead_id)}{#if assignment.bead_title}: {assignment.bead_title}{/if}</span>
