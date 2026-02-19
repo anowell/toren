@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
 use crate::ancillary::{AncillaryManager, WorkManager};
+use crate::caddy::CaddyManager;
 use crate::plugins::PluginManager;
 use crate::security::SecurityContext;
 use crate::services::Services;
@@ -35,6 +36,7 @@ pub struct AppState {
     pub segments: Arc<std::sync::RwLock<SegmentManager>>,
     pub workspaces: Option<Arc<WorkspaceManager>>,
     pub work_manager: Arc<WorkManager>,
+    pub caddy: Option<Arc<CaddyManager>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -49,6 +51,7 @@ pub async fn serve(
     segment_manager: SegmentManager,
     workspace_manager: Option<WorkspaceManager>,
     mut work_manager: WorkManager,
+    caddy_manager: Option<CaddyManager>,
 ) -> Result<()> {
     let assignments = Arc::new(RwLock::new(assignment_manager));
 
@@ -65,6 +68,7 @@ pub async fn serve(
         segments: Arc::new(std::sync::RwLock::new(segment_manager)),
         workspaces: workspace_manager.map(Arc::new),
         work_manager: Arc::new(work_manager),
+        caddy: caddy_manager.map(Arc::new),
     };
 
     let app = Router::new()
@@ -359,8 +363,9 @@ async fn workspaces_cleanup(
         })));
     }
 
-    match ws_mgr.cleanup_workspace(&segment_path, &request.segment, &request.workspace) {
-        Ok(()) => Ok(Json(serde_json::json!({
+    let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
+    match ws_mgr.cleanup_workspace(&segment_path, &request.segment, &request.workspace, proxy_config) {
+        Ok(_result) => Ok(Json(serde_json::json!({
             "success": true,
             "message": format!("Workspace {} cleaned up", request.workspace)
         }))),
@@ -530,12 +535,14 @@ async fn assignments_create(
     let ws_name = toren_lib::number_to_word(ancillary_num).to_lowercase();
 
     // Create workspace (with setup hooks)
-    let ws_path = ws_mgr
+    let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
+    let (ws_path, setup_result) = ws_mgr
         .create_workspace_with_setup(
             &segment_path,
             &request.segment,
             &ws_name,
-            Some(ancillary_num),
+            ancillary_num,
+            proxy_config,
         )
         .map_err(|e| {
             (
@@ -543,6 +550,13 @@ async fn assignments_create(
                 Json(serde_json::json!({"error": format!("Failed to create workspace: {}", e)})),
             )
         })?;
+
+    // Add Caddy routes if proxy directives were generated
+    if let Some(ref caddy) = state.caddy {
+        if let Err(e) = caddy.add_routes(&setup_result.proxy_directives).await {
+            tracing::warn!("Failed to add Caddy routes: {}", e);
+        }
+    }
 
     // Create assignment
     let assignment = if let Some(prompt) = original_prompt {
@@ -728,10 +742,12 @@ async fn assignments_complete(
         ),
     ))?;
 
+    let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
     let opts = toren_lib::CompleteOptions {
         push: request.push,
         keep_open: request.keep_open,
         segment_path: &segment_path,
+        proxy_config,
     };
 
     let result =
@@ -743,6 +759,13 @@ async fn assignments_complete(
                 )
             },
         )?;
+
+    // Remove Caddy routes from destroy directives
+    if let Some(ref caddy) = state.caddy {
+        if let Err(e) = caddy.remove_routes(&result.destroy_directives).await {
+            tracing::warn!("Failed to remove Caddy routes: {}", e);
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -796,17 +819,26 @@ async fn assignments_abort(
         ),
     ))?;
 
+    let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
     let opts = toren_lib::AbortOptions {
         close_bead: request.close_bead,
         segment_path: &segment_path,
+        proxy_config,
     };
 
-    toren_lib::abort_assignment(&assignment, &mut assignments, ws_mgr, &opts).map_err(|e| {
+    let abort_result = toren_lib::abort_assignment(&assignment, &mut assignments, ws_mgr, &opts).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
         )
     })?;
+
+    // Remove Caddy routes from destroy directives
+    if let Some(ref caddy) = state.caddy {
+        if let Err(e) = caddy.remove_routes(&abort_result.destroy_directives).await {
+            tracing::warn!("Failed to remove Caddy routes: {}", e);
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -860,10 +892,12 @@ async fn assignments_resume(
         ),
     ))?;
 
+    let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
     let opts = toren_lib::ResumeOptions {
         instruction: request.instruction.as_deref(),
         segment_path: &segment_path,
         segment_name: &assignment.segment,
+        proxy_config,
     };
 
     let resume_result =

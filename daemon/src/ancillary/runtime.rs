@@ -147,7 +147,7 @@ impl AncillaryWork {
                             .and_then(|n| n.to_str())
                             .unwrap_or("")
                             .to_string(),
-                        num: assignment.ancillary_num,
+                        num: assignment.ancillary_num.unwrap_or(0),
                         path: assignment.workspace_path.display().to_string(),
                     },
                     repo: toren_lib::RepoInfo {
@@ -158,6 +158,8 @@ impl AncillaryWork {
                         id: assignment.bead_id.clone(),
                         title: task_title,
                     }),
+                    vars: std::collections::HashMap::new(),
+                    config: None,
                 };
                 // TODO: read intent template from config (requires passing config to work loop)
                 let template = toren_lib::config::IntentsConfig::default().act;

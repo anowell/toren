@@ -1,10 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 
 mod ancillary;
 mod api;
+mod caddy;
 mod plugins;
 mod security;
 mod services;
@@ -88,6 +89,17 @@ async fn main() -> Result<()> {
     let work_manager = ancillary::WorkManager::new();
     info!("Work manager initialized");
 
+    // Initialize Caddy manager if proxy is enabled
+    let caddy_manager = if config.proxy.enabled {
+        let cm = caddy::CaddyManager::new(config.proxy.clone());
+        if let Err(e) = cm.ensure_server().await {
+            warn!("Failed to initialize Caddy server: {}", e);
+        }
+        Some(cm)
+    } else {
+        None
+    };
+
     // Start API server
     let addr = format!("{}:{}", config.host(), config.port());
     info!("Starting API server on {}", addr);
@@ -103,6 +115,7 @@ async fn main() -> Result<()> {
         segment_manager,
         workspace_manager,
         work_manager,
+        caddy_manager,
     )
     .await?;
 

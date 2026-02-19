@@ -39,13 +39,15 @@ pub fn generate_prompt(task: &Task, template: &str) -> String {
     let ctx = crate::workspace_setup::WorkspaceContext {
         ws: crate::workspace_setup::WorkspaceInfo {
             name: String::new(),
-            num: None,
+            num: 0,
             path: String::new(),
         },
         repo: crate::workspace_setup::RepoInfo {
             root: String::new(),
             name: String::new(),
         },
+        vars: std::collections::HashMap::new(),
+        config: None,
         task: Some(crate::workspace_setup::TaskInfo {
             id: task.id.clone(),
             title: task.title.clone(),

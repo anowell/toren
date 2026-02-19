@@ -11,14 +11,14 @@ pub use assignment::{
     AssignmentManager, AssignmentRef, AssignmentSource, AssignmentStatus,
 };
 pub use assignment_ops::{
-    abort_assignment, complete_assignment, prepare_resume, AbortOptions, CompleteOptions,
-    CompleteResult, ResumeOptions, ResumeResult,
+    abort_assignment, complete_assignment, prepare_resume, AbortOptions, AbortResult,
+    CompleteOptions, CompleteResult, ResumeOptions, ResumeResult,
 };
-pub use config::{Config, IntentsConfig};
+pub use config::{Config, IntentsConfig, ProxyConfig};
 pub use segments::{Segment, SegmentManager};
 pub use tasks::{fetch_task, generate_prompt, Task, TaskProvider};
 pub use workspace::WorkspaceManager;
 pub use workspace_setup::{
-    render_template, BreqConfig, TaskInfo, WorkspaceContext, WorkspaceInfo, WorkspaceSetup,
-    RepoInfo,
+    render_template, BreqConfig, ConfigContext, ProxyContext, ProxyDirective, SetupResult, TaskInfo,
+    WorkspaceContext, WorkspaceInfo, WorkspaceSetup, RepoInfo,
 };

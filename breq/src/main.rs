@@ -362,11 +362,12 @@ fn cmd_assign(
     let ws_name = workspace_name_for_assignment(ancillary_num);
 
     // Create workspace and run setup hooks
-    let ws_path = workspace_mgr.create_workspace_with_setup(
+    let (ws_path, _setup_result) = workspace_mgr.create_workspace_with_setup(
         &segment.path,
         &segment.name,
         &ws_name,
-        Some(ancillary_num),
+        ancillary_num,
+        Some(&config.proxy),
     )?;
     println!("Workspace: {}", ws_path.display());
 
@@ -395,7 +396,7 @@ fn cmd_assign(
     let ctx = toren_lib::WorkspaceContext {
         ws: toren_lib::WorkspaceInfo {
             name: ws_name.clone(),
-            num: Some(ancillary_num),
+            num: ancillary_num,
             path: ws_path.display().to_string(),
         },
         repo: toren_lib::RepoInfo {
@@ -406,6 +407,8 @@ fn cmd_assign(
             id: bead_id.clone(),
             title: task_title.clone(),
         }),
+        vars: std::collections::HashMap::new(),
+        config: None,
     };
     let claude_prompt = toren_lib::render_template(template, &ctx)?;
 
@@ -775,6 +778,7 @@ fn cmd_resume(
         instruction,
         segment_path: &segment.path,
         segment_name: &segment.name,
+        proxy_config: Some(&config.proxy),
     };
 
     let result =
@@ -843,7 +847,7 @@ fn cmd_abort(config: &Config, reference: &str, close: bool) -> Result<()> {
                 let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name);
                 if ws_path.exists() {
                     println!("Cleaning up orphaned workspace: {}", ws_path.display());
-                    workspace_mgr.cleanup_workspace(&segment.path, &segment.name, &ws_name)?;
+                    workspace_mgr.cleanup_workspace(&segment.path, &segment.name, &ws_name, None)?;
                     println!("Workspace removed.");
                 } else {
                     println!("No assignment or workspace found for: {}", reference);
@@ -853,7 +857,7 @@ fn cmd_abort(config: &Config, reference: &str, close: bool) -> Result<()> {
         };
 
         // Try to cleanup workspace if it exists (orphaned workspace case)
-        let _ = workspace_mgr.cleanup_workspace(&segment.path, &segment.name, &bead_id);
+        let _ = workspace_mgr.cleanup_workspace(&segment.path, &segment.name, &bead_id, None);
 
         if close {
             println!("Closing bead {}...", bead_id);
@@ -872,6 +876,7 @@ fn cmd_abort(config: &Config, reference: &str, close: bool) -> Result<()> {
     let opts = toren_lib::AbortOptions {
         close_bead: close,
         segment_path: &segment.path,
+        proxy_config: Some(&config.proxy),
     };
 
     for assignment in &assignments {
@@ -979,6 +984,7 @@ fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool) -
         push,
         keep_open,
         segment_path: &segment.path,
+        proxy_config: Some(&config.proxy),
     };
 
     let result =
@@ -1120,7 +1126,8 @@ fn cmd_ws_setup(config: &Config) -> Result<()> {
         &segment_path,
         &workspace_path,
         &workspace_name,
-        ancillary_num,
+        ancillary_num.unwrap_or(0),
+        Some(&config.proxy),
     )?;
 
     println!("Setup complete.");
@@ -1296,7 +1303,7 @@ fn cmd_ws_destroy(config: &Config) -> Result<()> {
         workspace_path.display()
     );
 
-    workspace_mgr.run_destroy(&segment_path, &workspace_path, &workspace_name)?;
+    workspace_mgr.run_destroy(&segment_path, &workspace_path, &workspace_name, Some(&config.proxy))?;
 
     println!("Destroy complete.");
     Ok(())

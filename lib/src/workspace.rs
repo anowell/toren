@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::workspace_setup::{BreqConfig, WorkspaceSetup};
+use crate::config::ProxyConfig;
+use crate::workspace_setup::{BreqConfig, SetupResult, WorkspaceSetup};
 
 /// Manages jujutsu workspaces for ancillaries
 pub struct WorkspaceManager {
@@ -154,20 +155,27 @@ impl WorkspaceManager {
         segment_path: &Path,
         segment_name: &str,
         workspace_name: &str,
-    ) -> Result<()> {
+        proxy_config: Option<&ProxyConfig>,
+    ) -> Result<SetupResult> {
         let ws_path = self.workspace_path(segment_name, workspace_name);
+        let mut result = SetupResult::default();
 
         // Run destroy hooks if workspace exists
         if ws_path.exists() {
-            if let Err(e) = self.run_destroy(segment_path, &ws_path, workspace_name) {
-                warn!("Workspace destroy hooks failed: {}", e);
-                // Continue with cleanup even if destroy fails
+            match self.run_destroy(segment_path, &ws_path, workspace_name, proxy_config) {
+                Ok(destroy_result) => {
+                    result = destroy_result;
+                }
+                Err(e) => {
+                    warn!("Workspace destroy hooks failed: {}", e);
+                    // Continue with cleanup even if destroy fails
+                }
             }
         }
 
         self.forget_workspace(segment_path, workspace_name)?;
         self.delete_workspace(segment_name, workspace_name)?;
-        Ok(())
+        Ok(result)
     }
 
     /// List workspaces for a segment
@@ -201,18 +209,19 @@ impl WorkspaceManager {
         ws_path.exists() && ws_path.join(".jj").exists()
     }
 
-    /// Run workspace setup hooks if .breq.kdl exists
+    /// Run workspace setup hooks if .toren.kdl exists
     /// Called automatically after workspace creation, but can also be invoked manually
     pub fn run_setup(
         &self,
         segment_path: &Path,
         workspace_path: &Path,
         workspace_name: &str,
-        ancillary_num: Option<u32>,
-    ) -> Result<()> {
+        ancillary_num: u32,
+        proxy_config: Option<&ProxyConfig>,
+    ) -> Result<SetupResult> {
         if !BreqConfig::exists(segment_path) {
-            debug!("No .breq.kdl found, skipping setup");
-            return Ok(());
+            debug!("No .toren.kdl found, skipping setup");
+            return Ok(SetupResult::default());
         }
 
         let setup = WorkspaceSetup::new(
@@ -222,30 +231,31 @@ impl WorkspaceManager {
             ancillary_num,
         );
 
-        setup.run_setup()
+        setup.run_setup(proxy_config)
     }
 
-    /// Run workspace destroy hooks if .breq.kdl exists
+    /// Run workspace destroy hooks if .toren.kdl exists
     /// Should be called before cleanup to allow cleanup scripts to run
     pub fn run_destroy(
         &self,
         segment_path: &Path,
         workspace_path: &Path,
         workspace_name: &str,
-    ) -> Result<()> {
+        proxy_config: Option<&ProxyConfig>,
+    ) -> Result<SetupResult> {
         if !BreqConfig::exists(segment_path) {
-            debug!("No .breq.kdl found, skipping destroy");
-            return Ok(());
+            debug!("No .toren.kdl found, skipping destroy");
+            return Ok(SetupResult::default());
         }
 
         let setup = WorkspaceSetup::new(
             segment_path.to_path_buf(),
             workspace_path.to_path_buf(),
             workspace_name.to_string(),
-            None, // ancillary_num not available during destroy
+            0, // ancillary_num not available during destroy
         );
 
-        setup.run_destroy()
+        setup.run_destroy(proxy_config)
     }
 
     /// Create workspace and run setup hooks
@@ -258,30 +268,32 @@ impl WorkspaceManager {
         segment_path: &Path,
         segment_name: &str,
         workspace_name: &str,
-        ancillary_num: Option<u32>,
-    ) -> Result<PathBuf> {
+        ancillary_num: u32,
+        proxy_config: Option<&ProxyConfig>,
+    ) -> Result<(PathBuf, SetupResult)> {
         let ws_path = self.create_workspace(segment_path, segment_name, workspace_name)?;
 
         // Run setup hooks if .toren.kdl exists - fail if setup fails
-        if let Err(e) = self.run_setup(segment_path, &ws_path, workspace_name, ancillary_num) {
-            // Rollback: forget + delete the partially-created workspace
-            warn!(
-                "Setup failed for '{}', rolling back workspace: {}",
-                workspace_name, e
-            );
-            if let Err(rollback_err) =
-                self.cleanup_workspace(segment_path, segment_name, workspace_name)
-            {
-                warn!("Rollback cleanup also failed: {}", rollback_err);
+        match self.run_setup(segment_path, &ws_path, workspace_name, ancillary_num, proxy_config) {
+            Ok(setup_result) => Ok((ws_path, setup_result)),
+            Err(e) => {
+                // Rollback: forget + delete the partially-created workspace
+                warn!(
+                    "Setup failed for '{}', rolling back workspace: {}",
+                    workspace_name, e
+                );
+                if let Err(rollback_err) =
+                    self.cleanup_workspace(segment_path, segment_name, workspace_name, None)
+                {
+                    warn!("Rollback cleanup also failed: {}", rollback_err);
+                }
+                Err(e).with_context(|| {
+                    format!(
+                        "Workspace setup failed for '{}' (workspace rolled back)",
+                        workspace_name
+                    )
+                })
             }
-            return Err(e).with_context(|| {
-                format!(
-                    "Workspace setup failed for '{}' (workspace rolled back)",
-                    workspace_name
-                )
-            });
         }
-
-        Ok(ws_path)
     }
 }

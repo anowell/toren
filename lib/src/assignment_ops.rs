@@ -8,7 +8,9 @@ use std::path::Path;
 use tracing::info;
 
 use crate::assignment::{AssignmentManager, AssignmentStatus};
+use crate::config::ProxyConfig;
 use crate::workspace::WorkspaceManager;
+use crate::workspace_setup::{ProxyDirective, SetupResult};
 use crate::Assignment;
 
 /// Options for completing an assignment
@@ -19,6 +21,8 @@ pub struct CompleteOptions<'a> {
     pub keep_open: bool,
     /// Segment path for running workspace hooks and bead commands
     pub segment_path: &'a Path,
+    /// Proxy configuration (for destroy hooks)
+    pub proxy_config: Option<&'a ProxyConfig>,
 }
 
 /// Result from completing an assignment
@@ -27,6 +31,8 @@ pub struct CompleteResult {
     pub revision: Option<String>,
     /// Whether changes were pushed
     pub pushed: bool,
+    /// Proxy directives from destroy hooks (to remove routes)
+    pub destroy_directives: Vec<ProxyDirective>,
 }
 
 /// Options for aborting an assignment
@@ -35,6 +41,14 @@ pub struct AbortOptions<'a> {
     pub close_bead: bool,
     /// Segment path for running workspace hooks and bead commands
     pub segment_path: &'a Path,
+    /// Proxy configuration (for destroy hooks)
+    pub proxy_config: Option<&'a ProxyConfig>,
+}
+
+/// Result from aborting an assignment
+pub struct AbortResult {
+    /// Proxy directives from destroy hooks (to remove routes)
+    pub destroy_directives: Vec<ProxyDirective>,
 }
 
 /// Options for preparing a resume
@@ -45,6 +59,8 @@ pub struct ResumeOptions<'a> {
     pub segment_path: &'a Path,
     /// Segment name
     pub segment_name: &'a str,
+    /// Proxy configuration (for setup hooks if workspace is recreated)
+    pub proxy_config: Option<&'a ProxyConfig>,
 }
 
 /// Result from preparing a resume
@@ -53,6 +69,8 @@ pub struct ResumeResult {
     pub prompt: String,
     /// Whether the workspace was recreated
     pub workspace_recreated: bool,
+    /// Proxy directives from setup hooks (if workspace was recreated)
+    pub setup_result: SetupResult,
 }
 
 /// Complete an assignment: capture revision, optionally push, cleanup workspace,
@@ -68,6 +86,7 @@ pub fn complete_assignment(
     let mut result = CompleteResult {
         revision: None,
         pushed: false,
+        destroy_directives: Vec::new(),
     };
 
     // Get the current revision before cleanup (if workspace exists)
@@ -100,7 +119,8 @@ pub fn complete_assignment(
     }
 
     // Cleanup workspace if it exists
-    cleanup_workspace(assignment, ws_mgr, opts.segment_path)?;
+    let destroy_result = cleanup_workspace(assignment, ws_mgr, opts.segment_path, opts.proxy_config)?;
+    result.destroy_directives = destroy_result.proxy_directives;
 
     // Remove assignment from storage
     assignment_mgr.remove(&assignment.id)?;
@@ -122,9 +142,9 @@ pub fn abort_assignment(
     assignment_mgr: &mut AssignmentManager,
     ws_mgr: &WorkspaceManager,
     opts: &AbortOptions,
-) -> Result<()> {
+) -> Result<AbortResult> {
     // Cleanup workspace if it exists
-    cleanup_workspace(assignment, ws_mgr, opts.segment_path)?;
+    let destroy_result = cleanup_workspace(assignment, ws_mgr, opts.segment_path, opts.proxy_config)?;
 
     // Remove assignment from storage
     assignment_mgr.remove(&assignment.id)?;
@@ -144,7 +164,9 @@ pub fn abort_assignment(
         );
     }
 
-    Ok(())
+    Ok(AbortResult {
+        destroy_directives: destroy_result.proxy_directives,
+    })
 }
 
 /// Prepare an assignment for resuming: recreate workspace if missing,
@@ -159,6 +181,7 @@ pub fn prepare_resume(
     opts: &ResumeOptions,
 ) -> Result<ResumeResult> {
     let mut workspace_recreated = false;
+    let mut setup_result = SetupResult::default();
 
     // Recreate workspace if missing
     if !assignment.workspace_path.exists() {
@@ -171,14 +194,16 @@ pub fn prepare_resume(
             .file_name()
             .and_then(|n| n.to_str())
             .context("Invalid workspace path")?;
-        let ancillary_num = crate::ancillary_number(&assignment.ancillary_id);
+        let ancillary_num = crate::ancillary_number(&assignment.ancillary_id).unwrap_or(0);
 
-        ws_mgr.create_workspace_with_setup(
+        let (_ws_path, result) = ws_mgr.create_workspace_with_setup(
             opts.segment_path,
             opts.segment_name,
             ws_name,
             ancillary_num,
+            opts.proxy_config,
         )?;
+        setup_result = result;
         workspace_recreated = true;
         info!("Workspace recreated: {}", assignment.workspace_path.display());
     }
@@ -212,6 +237,7 @@ pub fn prepare_resume(
     Ok(ResumeResult {
         prompt,
         workspace_recreated,
+        setup_result,
     })
 }
 
@@ -220,7 +246,8 @@ fn cleanup_workspace(
     assignment: &Assignment,
     ws_mgr: &WorkspaceManager,
     segment_path: &Path,
-) -> Result<()> {
+    proxy_config: Option<&ProxyConfig>,
+) -> Result<SetupResult> {
     if assignment.workspace_path.exists() {
         let ws_name = assignment
             .workspace_path
@@ -231,14 +258,14 @@ fn cleanup_workspace(
         let segment_name = crate::ancillary_segment(&assignment.ancillary_id)
             .unwrap_or_else(|| assignment.segment.clone());
 
-        ws_mgr.cleanup_workspace(segment_path, &segment_name, ws_name)?;
+        let result = ws_mgr.cleanup_workspace(segment_path, &segment_name, ws_name, proxy_config)?;
         info!("Workspace cleaned up for assignment {}", assignment.id);
+        Ok(result)
     } else {
         info!(
             "Workspace already gone for assignment {}",
             assignment.id
         );
+        Ok(SetupResult::default())
     }
-
-    Ok(())
 }

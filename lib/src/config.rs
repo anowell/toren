@@ -25,6 +25,9 @@ pub struct Config {
 
     #[serde(default)]
     pub intents: IntentsConfig,
+
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 }
 
 fn default_server() -> ServerConfig {
@@ -135,6 +138,33 @@ pub struct AutoApproveConfig {
     pub non_vcs_commands: bool,
     pub vcs_commands: bool,
     pub file_operations: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub tls: bool,
+    #[serde(default = "default_proxy_domain")]
+    pub domain: String,
+    #[serde(default)]
+    pub dns_port: Option<u16>,
+}
+
+fn default_proxy_domain() -> String {
+    "lvh.me".to_string()
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tls: false,
+            domain: default_proxy_domain(),
+            dns_port: None,
+        }
+    }
 }
 
 impl Default for AutoApproveConfig {
@@ -253,6 +283,7 @@ impl Default for Config {
             auto_approve: AutoApproveConfig::default(),
             ancillary: AncillaryConfig::default(),
             intents: IntentsConfig::default(),
+            proxy: ProxyConfig::default(),
         }
     }
 }
