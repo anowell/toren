@@ -738,6 +738,9 @@ struct CompleteRequest {
     /// Whether to keep the bead open (default: close it)
     #[serde(default)]
     keep_open: bool,
+    /// Whether to kill processes running in the workspace before cleanup
+    #[serde(default)]
+    kill: bool,
 }
 
 async fn assignments_complete(
@@ -784,15 +787,18 @@ async fn assignments_complete(
         keep_open: request.keep_open,
         segment_path: &segment_path,
         proxy_config,
+        kill: request.kill,
     };
 
     let result =
         toren_lib::complete_assignment(&assignment, &mut assignments, ws_mgr, &opts).map_err(
             |e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
+                let status = if e.downcast_ref::<toren_lib::WorkspaceProcessesRunning>().is_some() {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (status, Json(serde_json::json!({"error": e.to_string()})))
             },
         )?;
 
@@ -815,6 +821,9 @@ struct AbortRequest {
     /// Whether to close the bead (default: reopen it)
     #[serde(default)]
     close_bead: bool,
+    /// Whether to kill processes running in the workspace before cleanup
+    #[serde(default)]
+    kill: bool,
 }
 
 async fn assignments_abort(
@@ -860,13 +869,16 @@ async fn assignments_abort(
         close_bead: request.close_bead,
         segment_path: &segment_path,
         proxy_config,
+        kill: request.kill,
     };
 
     let abort_result = toren_lib::abort_assignment(&assignment, &mut assignments, ws_mgr, &opts).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
+        let status = if e.downcast_ref::<toren_lib::WorkspaceProcessesRunning>().is_some() {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, Json(serde_json::json!({"error": e.to_string()})))
     })?;
 
     // Remove Caddy routes from destroy directives

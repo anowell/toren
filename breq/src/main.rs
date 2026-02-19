@@ -115,6 +115,10 @@ enum Commands {
         /// Also close the bead
         #[arg(long)]
         close: bool,
+
+        /// Kill processes running in the workspace before cleanup
+        #[arg(long)]
+        kill: bool,
     },
 
     /// Complete work: cleanup workspace, close bead, print revision for integration
@@ -129,6 +133,10 @@ enum Commands {
         /// Keep bead open instead of closing
         #[arg(long)]
         keep_open: bool,
+
+        /// Kill processes running in the workspace before cleanup
+        #[arg(long)]
+        kill: bool,
     },
 
     /// Remove orphaned workspace directories (exist on disk but not tracked by jj)
@@ -244,12 +252,13 @@ fn main() -> Result<()> {
             instruction,
             danger,
         } => cmd_resume(&config, &reference, instruction.as_deref(), danger),
-        Commands::Abort { reference, close } => cmd_abort(&config, &reference, close),
+        Commands::Abort { reference, close, kill } => cmd_abort(&config, &reference, close, kill),
         Commands::Complete {
             reference,
             push,
             keep_open,
-        } => cmd_complete(&config, &reference, push, keep_open),
+            kill,
+        } => cmd_complete(&config, &reference, push, keep_open, kill),
         Commands::Cleanup { segment, all } => cmd_cleanup(&config, all, segment),
         Commands::Go {
             workspace,
@@ -814,7 +823,7 @@ fn cmd_resume(
     Err(err).context("Failed to exec claude")
 }
 
-fn cmd_abort(config: &Config, reference: &str, close: bool) -> Result<()> {
+fn cmd_abort(config: &Config, reference: &str, close: bool, kill: bool) -> Result<()> {
     let workspace_root = config
         .ancillary
         .workspace_root
@@ -875,6 +884,7 @@ fn cmd_abort(config: &Config, reference: &str, close: bool) -> Result<()> {
         close_bead: close,
         segment_path: &segment.path,
         proxy_config: Some(&config.proxy),
+        kill,
     };
 
     for assignment in &assignments {
@@ -898,7 +908,7 @@ fn cmd_abort(config: &Config, reference: &str, close: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool) -> Result<()> {
+fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool, kill: bool) -> Result<()> {
     let workspace_root = config
         .ancillary
         .workspace_root
@@ -983,6 +993,7 @@ fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool) -
         keep_open,
         segment_path: &segment.path,
         proxy_config: Some(&config.proxy),
+        kill,
     };
 
     let result =

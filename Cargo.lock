@@ -2284,6 +2284,7 @@ dependencies = [
  "glob",
  "kdl",
  "minijinja",
+ "nix",
  "serde",
  "serde_json",
  "shellexpand",

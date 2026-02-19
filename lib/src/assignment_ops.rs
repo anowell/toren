@@ -23,6 +23,8 @@ pub struct CompleteOptions<'a> {
     pub segment_path: &'a Path,
     /// Proxy configuration (for destroy hooks)
     pub proxy_config: Option<&'a ProxyConfig>,
+    /// Whether to kill processes running in the workspace
+    pub kill: bool,
 }
 
 /// Result from completing an assignment
@@ -43,6 +45,8 @@ pub struct AbortOptions<'a> {
     pub segment_path: &'a Path,
     /// Proxy configuration (for destroy hooks)
     pub proxy_config: Option<&'a ProxyConfig>,
+    /// Whether to kill processes running in the workspace
+    pub kill: bool,
 }
 
 /// Result from aborting an assignment
@@ -119,7 +123,7 @@ pub fn complete_assignment(
     }
 
     // Cleanup workspace if it exists
-    let destroy_result = cleanup_workspace(assignment, ws_mgr, opts.segment_path, opts.proxy_config)?;
+    let destroy_result = cleanup_workspace(assignment, ws_mgr, opts.segment_path, opts.proxy_config, opts.kill)?;
     result.destroy_directives = destroy_result.proxy_directives;
 
     // Record completion history and remove assignment from active storage
@@ -149,7 +153,7 @@ pub fn abort_assignment(
     opts: &AbortOptions,
 ) -> Result<AbortResult> {
     // Cleanup workspace if it exists
-    let destroy_result = cleanup_workspace(assignment, ws_mgr, opts.segment_path, opts.proxy_config)?;
+    let destroy_result = cleanup_workspace(assignment, ws_mgr, opts.segment_path, opts.proxy_config, opts.kill)?;
 
     // Record abort history and remove assignment from active storage
     assignment_mgr.record_completion(assignment, CompletionReason::Aborted, None)?;
@@ -247,14 +251,34 @@ pub fn prepare_resume(
     })
 }
 
-/// Cleanup workspace for an assignment (destroy hooks + forget + delete)
+/// Cleanup workspace for an assignment (process check + destroy hooks + forget + delete)
 fn cleanup_workspace(
     assignment: &Assignment,
     ws_mgr: &WorkspaceManager,
     segment_path: &Path,
     proxy_config: Option<&ProxyConfig>,
+    kill: bool,
 ) -> Result<SetupResult> {
     if assignment.workspace_path.exists() {
+        // Check for running processes before cleanup
+        let processes = crate::process::find_workspace_processes(&assignment.workspace_path);
+        if !processes.is_empty() {
+            if kill {
+                info!(
+                    "Terminating {} process(es) in workspace",
+                    processes.len()
+                );
+                crate::process::terminate_processes(
+                    &processes,
+                    std::time::Duration::from_secs(5),
+                )?;
+            } else {
+                return Err(
+                    crate::process::WorkspaceProcessesRunning { processes }.into()
+                );
+            }
+        }
+
         let ws_name = assignment
             .workspace_path
             .file_name()

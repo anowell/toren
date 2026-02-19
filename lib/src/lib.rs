@@ -2,6 +2,7 @@ pub mod assignment;
 pub mod assignment_ops;
 pub mod composite_status;
 pub mod config;
+pub mod process;
 pub mod segments;
 pub mod tasks;
 pub mod workspace;
@@ -21,6 +22,7 @@ pub use config::{Config, IntentsConfig, ProxyConfig};
 pub use segments::{Segment, SegmentManager};
 pub use tasks::{fetch_task, generate_prompt, Task, TaskProvider};
 pub use workspace::WorkspaceManager;
+pub use process::{ProcessInfo, WorkspaceProcessesRunning};
 pub use workspace_setup::{
     render_template, BreqConfig, ConfigContext, ProxyContext, ProxyDirective, SetupResult, TaskInfo,
     WorkspaceContext, WorkspaceInfo, WorkspaceSetup, RepoInfo,
