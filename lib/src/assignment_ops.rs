@@ -8,14 +8,14 @@ use std::path::Path;
 use tracing::info;
 
 use crate::assignment::{AssignmentManager, CompletionReason};
-use crate::config::ProxyConfig;
-use crate::workspace::WorkspaceManager;
-use crate::workspace_setup::{ProxyDirective, SetupResult};
+use crate::config::{AncillaryConfig, ProxyConfig};
+use crate::workspace::{CleanupMode, CommitInfo, WorkspaceManager};
+use crate::workspace_setup::{ProxyDirective, SetupResult, WorkspaceContext, WorkspaceInfo, RepoInfo, TaskInfo};
 use crate::Assignment;
 
 /// Options for completing an assignment
 pub struct CompleteOptions<'a> {
-    /// Whether to push changes via `jj git push`
+    /// Whether to push changes
     pub push: bool,
     /// Whether to keep the bead open (default: close it)
     pub keep_open: bool,
@@ -25,16 +25,20 @@ pub struct CompleteOptions<'a> {
     pub proxy_config: Option<&'a ProxyConfig>,
     /// Whether to kill processes running in the workspace
     pub kill: bool,
+    /// Auto-commit message (rendered template). If Some, auto-commit before capture.
+    pub auto_commit_message: Option<String>,
 }
 
 /// Result from completing an assignment
 pub struct CompleteResult {
-    /// The jj revision hash if captured before cleanup
+    /// The revision hash if captured before cleanup
     pub revision: Option<String>,
     /// Whether changes were pushed
     pub pushed: bool,
     /// Proxy directives from destroy hooks (to remove routes)
     pub destroy_directives: Vec<ProxyDirective>,
+    /// Commits exclusive to this workspace (captured before cleanup)
+    pub workspace_info: Vec<CommitInfo>,
 }
 
 /// Options for aborting an assignment
@@ -77,8 +81,50 @@ pub struct ResumeResult {
     pub setup_result: SetupResult,
 }
 
-/// Complete an assignment: capture revision, optionally push, cleanup workspace,
-/// close bead, and remove assignment from storage.
+/// Render the auto-commit message template for an assignment.
+///
+/// Uses the `auto_commit_message` template from AncillaryConfig, rendered with
+/// task context (task.id, task.title). Workspace and repo fields are populated
+/// from the assignment when available.
+pub fn render_auto_commit_message(
+    ancillary_config: &AncillaryConfig,
+    assignment: &Assignment,
+    segment_name: &str,
+    segment_path: &std::path::Path,
+) -> Option<String> {
+    let task_title = assignment
+        .bead_title
+        .clone()
+        .unwrap_or_else(|| assignment.bead_id.clone());
+    let ws_name = assignment
+        .workspace_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    let ancillary_num = crate::ancillary_number(&assignment.ancillary_id).unwrap_or(0);
+    let ctx = WorkspaceContext {
+        ws: WorkspaceInfo {
+            name: ws_name,
+            num: ancillary_num,
+            path: assignment.workspace_path.display().to_string(),
+        },
+        repo: RepoInfo {
+            root: segment_path.display().to_string(),
+            name: segment_name.to_string(),
+        },
+        task: Some(TaskInfo {
+            id: assignment.bead_id.clone(),
+            title: task_title,
+        }),
+        vars: std::collections::HashMap::new(),
+        config: None,
+    };
+    crate::workspace_setup::render_template(&ancillary_config.auto_commit_message, &ctx).ok()
+}
+
+/// Complete an assignment: auto-commit, capture revision, optionally push,
+/// capture workspace info, cleanup workspace, close bead, and remove from storage.
 ///
 /// This mirrors `breq complete` behavior.
 pub fn complete_assignment(
@@ -91,39 +137,60 @@ pub fn complete_assignment(
         revision: None,
         pushed: false,
         destroy_directives: Vec::new(),
+        workspace_info: Vec::new(),
     };
 
-    // Get the current revision before cleanup (if workspace exists)
     if assignment.workspace_path.exists() {
-        let output = std::process::Command::new("jj")
-            .args(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
-            .current_dir(&assignment.workspace_path)
-            .output()
-            .ok();
+        // Auto-commit if message provided
+        if let Some(ref message) = opts.auto_commit_message {
+            match ws_mgr.auto_commit(opts.segment_path, &assignment.workspace_path, message) {
+                Ok(committed) => {
+                    if committed {
+                        info!("Auto-committed changes for assignment {}", assignment.id);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Auto-commit failed: {}", e);
+                    // Continue — don't fail the complete over an auto-commit failure
+                }
+            }
+        }
 
-        result.revision = output
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty());
+        // Capture revision
+        result.revision =
+            ws_mgr.capture_revision(opts.segment_path, &assignment.workspace_path);
+
+        // Capture workspace info (commit list) before cleanup
+        result.workspace_info = ws_mgr
+            .workspace_info(
+                opts.segment_path,
+                &assignment.workspace_path,
+                assignment.base_branch.as_deref(),
+            )
+            .unwrap_or_default();
 
         // Push if requested
         if opts.push {
-            if let Some(ref rev) = result.revision {
+            if result.revision.is_some() {
                 info!("Pushing changes for assignment {}", assignment.id);
-                let status = std::process::Command::new("jj")
-                    .args(["git", "push", "-c", rev])
-                    .current_dir(&assignment.workspace_path)
-                    .status()?;
-                if !status.success() {
-                    anyhow::bail!("Failed to push changes");
-                }
+                ws_mgr.push(opts.segment_path, &assignment.workspace_path)?;
                 result.pushed = true;
             }
         }
     }
 
     // Cleanup workspace if it exists
-    let destroy_result = cleanup_workspace(assignment, ws_mgr, opts.segment_path, opts.proxy_config, opts.kill)?;
+    let cleanup_mode = CleanupMode::Complete {
+        pushed: result.pushed,
+    };
+    let destroy_result = cleanup_workspace(
+        assignment,
+        ws_mgr,
+        opts.segment_path,
+        opts.proxy_config,
+        opts.kill,
+        cleanup_mode,
+    )?;
     result.destroy_directives = destroy_result.proxy_directives;
 
     // Record completion history and remove assignment from active storage
@@ -153,7 +220,14 @@ pub fn abort_assignment(
     opts: &AbortOptions,
 ) -> Result<AbortResult> {
     // Cleanup workspace if it exists
-    let destroy_result = cleanup_workspace(assignment, ws_mgr, opts.segment_path, opts.proxy_config, opts.kill)?;
+    let destroy_result = cleanup_workspace(
+        assignment,
+        ws_mgr,
+        opts.segment_path,
+        opts.proxy_config,
+        opts.kill,
+        CleanupMode::Abort,
+    )?;
 
     // Record abort history and remove assignment from active storage
     assignment_mgr.record_completion(assignment, CompletionReason::Aborted, None)?;
@@ -251,13 +325,14 @@ pub fn prepare_resume(
     })
 }
 
-/// Cleanup workspace for an assignment (process check + destroy hooks + forget + delete)
+/// Cleanup workspace for an assignment (process check + destroy hooks + VCS tracking removal + delete)
 fn cleanup_workspace(
     assignment: &Assignment,
     ws_mgr: &WorkspaceManager,
     segment_path: &Path,
     proxy_config: Option<&ProxyConfig>,
     kill: bool,
+    mode: CleanupMode,
 ) -> Result<SetupResult> {
     if assignment.workspace_path.exists() {
         // Check for running processes before cleanup
@@ -288,7 +363,8 @@ fn cleanup_workspace(
         let segment_name = crate::ancillary_segment(&assignment.ancillary_id)
             .unwrap_or_else(|| assignment.segment.clone());
 
-        let result = ws_mgr.cleanup_workspace(segment_path, &segment_name, ws_name, proxy_config)?;
+        let result =
+            ws_mgr.cleanup_workspace(segment_path, &segment_name, ws_name, proxy_config, mode)?;
         info!("Workspace cleaned up for assignment {}", assignment.id);
         Ok(result)
     } else {

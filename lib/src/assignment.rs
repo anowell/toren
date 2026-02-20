@@ -101,6 +101,10 @@ pub struct Assignment {
     /// Numeric ancillary number, derived from ancillary_id (e.g., "Toren One" -> 1)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ancillary_num: Option<u32>,
+    /// Base branch at the time of assignment (for git worktrees).
+    /// Used as the comparison reference for has_changes and workspace_info.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 /// Max number that gets a word name (1-99 use English words, 100+ use digits)
@@ -323,6 +327,7 @@ impl AssignmentManager {
         segment: &str,
         workspace_path: PathBuf,
         bead_title: Option<String>,
+        base_branch: Option<String>,
     ) -> Result<Assignment> {
         let now = chrono::Utc::now().to_rfc3339();
         let id = uuid::Uuid::new_v4().to_string();
@@ -340,6 +345,7 @@ impl AssignmentManager {
             updated_at: now,
             bead_title,
             session_id: None,
+            base_branch,
         };
 
         self.assignments
@@ -362,6 +368,7 @@ impl AssignmentManager {
         segment: &str,
         workspace_path: PathBuf,
         bead_title: Option<String>,
+        base_branch: Option<String>,
     ) -> Result<Assignment> {
         let now = chrono::Utc::now().to_rfc3339();
         let id = uuid::Uuid::new_v4().to_string();
@@ -381,6 +388,7 @@ impl AssignmentManager {
             updated_at: now,
             bead_title,
             session_id: None,
+            base_branch,
         };
 
         self.assignments

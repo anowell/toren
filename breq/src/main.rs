@@ -127,7 +127,7 @@ enum Commands {
         /// Bead ID or ancillary reference
         reference: String,
 
-        /// Also push the commits (jj git push -c <rev>)
+        /// Also push the commits
         #[arg(long)]
         push: bool,
 
@@ -140,7 +140,7 @@ enum Commands {
         kill: bool,
     },
 
-    /// Remove orphaned workspace directories (exist on disk but not tracked by jj)
+    /// Remove orphaned workspace directories (exist on disk but not tracked by VCS)
     Cleanup {
         /// Segment to clean up (defaults to current directory's segment)
         #[arg(short, long)]
@@ -405,6 +405,9 @@ fn cmd_assign(
     let ancillary_num = toren_lib::ancillary_number(&ancillary_id).unwrap_or(1);
     println!("Ancillary: {}", ancillary_id);
 
+    // Record base branch (for git worktrees; None for jj)
+    let base_branch = workspace_mgr.active_branch(&segment.path);
+
     // Generate workspace name from ancillary number word
     let ws_name = workspace_name_for_assignment(ancillary_num);
 
@@ -427,6 +430,7 @@ fn cmd_assign(
             &segment.name,
             ws_path.clone(),
             Some(task_title.clone()),
+            base_branch,
         )?;
     } else {
         assignment_mgr.create_from_bead(
@@ -435,6 +439,7 @@ fn cmd_assign(
             &segment.name,
             ws_path.clone(),
             Some(task_title.clone()),
+            base_branch,
         )?;
     }
 
@@ -531,8 +536,11 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
             &assignment.workspace_path,
         );
 
-        // 3. Has changes (from jj workspace)
-        let has_changes = toren_lib::composite_status::workspace_has_changes(&assignment.workspace_path);
+        // 3. Has changes (VCS-agnostic)
+        let has_changes = toren_lib::composite_status::workspace_has_changes(
+            &assignment.workspace_path,
+            assignment.base_branch.as_deref(),
+        );
 
         // 4. Assignee
         let assignee = bead_info
@@ -628,7 +636,7 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
     Ok(())
 }
 
-/// Find workspace directories that exist on disk but are not tracked by jj
+/// Find workspace directories that exist on disk but are not tracked by VCS
 /// and have no assignment record.
 fn find_orphaned_workspaces(
     ws_mgr: &WorkspaceManager,
@@ -638,8 +646,8 @@ fn find_orphaned_workspaces(
     let mut orphans = Vec::new();
 
     for segment in segments {
-        // Get jj-tracked workspace names
-        let jj_workspaces = ws_mgr.list_workspaces(&segment.path).unwrap_or_default();
+        // Get VCS-tracked workspace names (works for both jj and git)
+        let tracked_workspaces = ws_mgr.list_workspaces(&segment.path).unwrap_or_default();
 
         // Get assignment workspace paths for this segment
         let assigned_paths: std::collections::HashSet<_> = assignments
@@ -661,8 +669,8 @@ fn find_orphaned_workspaces(
                     None => continue,
                 };
 
-                // Skip if tracked by jj
-                if jj_workspaces.contains(&ws_name) {
+                // Skip if tracked by VCS
+                if tracked_workspaces.contains(&ws_name) {
                     continue;
                 }
 
@@ -736,16 +744,10 @@ fn cmd_cleanup(config: &Config, all_segments: bool, segment_name: Option<String>
 }
 
 fn truncate_title(title: &str, max_len: usize) -> String {
-    if max_len < 4 {
-        return title.chars().take(max_len).collect();
-    }
-    // Use char count for proper Unicode handling
-    let char_count = title.chars().count();
-    if char_count <= max_len {
+    if title.len() <= max_len {
         title.to_string()
     } else {
-        let truncated: String = title.chars().take(max_len - 3).collect();
-        format!("{}...", truncated)
+        format!("{}...", &title[..max_len - 3])
     }
 }
 
@@ -785,6 +787,9 @@ fn cmd_show(config: &Config, reference: &str) -> Result<()> {
         println!("  Status:    {:?}", assignment.status);
         println!("  Source:    {:?}", assignment.source);
         println!("  Workspace: {}", assignment.workspace_path.display());
+        if let Some(ref branch) = assignment.base_branch {
+            println!("  Base:      {}", branch);
+        }
         println!("  Created:   {}", assignment.created_at);
         println!("  Updated:   {}", assignment.updated_at);
 
@@ -800,13 +805,22 @@ fn cmd_show(config: &Config, reference: &str) -> Result<()> {
             )
             .status();
 
-        // Show workspace info if exists
+        // Show workspace info if exists — use VCS-appropriate log command
         if assignment.workspace_path.exists() {
             println!("\nRecent changes:");
-            let _ = Command::new("jj")
-                .args(["log", "-n", "5"])
-                .current_dir(&assignment.workspace_path)
-                .status();
+            if assignment.workspace_path.join(".jj").exists() {
+                let _ = Command::new("jj")
+                    .args(["log", "-n", "5"])
+                    .current_dir(&assignment.workspace_path)
+                    .status();
+            } else if assignment.workspace_path.join(".git").exists() {
+                let base = assignment.base_branch.as_deref().unwrap_or("main");
+                let range = format!("{}..HEAD", base);
+                let _ = Command::new("git")
+                    .args(["log", "--oneline", &range])
+                    .current_dir(&assignment.workspace_path)
+                    .status();
+            }
         } else {
             println!("\n(Workspace not found - use `breq resume` to recreate)");
         }
@@ -929,7 +943,13 @@ fn cmd_abort(config: &Config, reference: &str, close: bool, kill: bool) -> Resul
                 let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name);
                 if ws_path.exists() {
                     println!("Cleaning up orphaned workspace: {}", ws_path.display());
-                    workspace_mgr.cleanup_workspace(&segment.path, &segment.name, &ws_name, None)?;
+                    workspace_mgr.cleanup_workspace(
+                        &segment.path,
+                        &segment.name,
+                        &ws_name,
+                        None,
+                        toren_lib::workspace::CleanupMode::Abort,
+                    )?;
                     println!("Workspace removed.");
                 } else {
                     println!("No assignment or workspace found for: {}", reference);
@@ -939,7 +959,13 @@ fn cmd_abort(config: &Config, reference: &str, close: bool, kill: bool) -> Resul
         };
 
         // Try to cleanup workspace if it exists (orphaned workspace case)
-        let _ = workspace_mgr.cleanup_workspace(&segment.path, &segment.name, &bead_id, None);
+        let _ = workspace_mgr.cleanup_workspace(
+            &segment.path,
+            &segment.name,
+            &bead_id,
+            None,
+            toren_lib::workspace::CleanupMode::Abort,
+        );
 
         if close {
             println!("Closing bead {}...", bead_id);
@@ -1040,27 +1066,44 @@ fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool, k
     // Show changes before cleanup (interactive output for CLI)
     if assignment.workspace_path.exists() {
         println!("\nChanges:");
-        let output = Command::new("jj")
-            .args(["log", "-r", "@"])
-            .current_dir(&assignment.workspace_path)
-            .output();
+        if assignment.workspace_path.join(".jj").exists() {
+            let output = Command::new("jj")
+                .args(["log", "-r", "@"])
+                .current_dir(&assignment.workspace_path)
+                .output();
 
-        if let Ok(output) = output {
-            if !output.stdout.is_empty() {
-                print!("{}", String::from_utf8_lossy(&output.stdout));
-            }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            for line in stderr.lines() {
-                if !line.contains("working copy is stale")
-                    && !line.contains("workspace update-stale")
-                {
-                    eprintln!("{}", line);
+            if let Ok(output) = output {
+                if !output.stdout.is_empty() {
+                    print!("{}", String::from_utf8_lossy(&output.stdout));
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                for line in stderr.lines() {
+                    if !line.contains("working copy is stale")
+                        && !line.contains("workspace update-stale")
+                    {
+                        eprintln!("{}", line);
+                    }
                 }
             }
+        } else if assignment.workspace_path.join(".git").exists() {
+            let base = assignment.base_branch.as_deref().unwrap_or("main");
+            let range = format!("{}..HEAD", base);
+            let _ = Command::new("git")
+                .args(["log", "--oneline", &range])
+                .current_dir(&assignment.workspace_path)
+                .status();
         }
     } else {
         println!("(Workspace already cleaned up)");
     }
+
+    // Render auto-commit message
+    let auto_commit_message = toren_lib::render_auto_commit_message(
+        &config.ancillary,
+        &assignment,
+        &segment.name,
+        &segment.path,
+    );
 
     // Use shared complete logic
     let opts = toren_lib::CompleteOptions {
@@ -1069,6 +1112,7 @@ fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool, k
         segment_path: &segment.path,
         proxy_config: Some(&config.proxy),
         kill,
+        auto_commit_message,
     };
 
     let result =
@@ -1078,14 +1122,45 @@ fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool, k
         println!("Bead closed.");
     }
 
+    // Print workspace info (commits in this workspace)
+    if !result.workspace_info.is_empty() {
+        println!("\nWorkspace commits:");
+        for commit in &result.workspace_info {
+            println!(
+                "  {} {}",
+                &commit.id[..12.min(commit.id.len())],
+                commit.summary
+            );
+        }
+    }
+
     // Print integration instructions
     if let Some(rev) = result.revision {
         if !result.pushed {
-            println!("\nCommit preserved at: {}", &rev[..12.min(rev.len())]);
-            println!(
-                "To integrate: jj rebase -r {} -d main",
-                &rev[..12.min(rev.len())]
-            );
+            // Detect VCS type for appropriate instructions
+            let repo_type = workspace_mgr.repo_type(&segment.path);
+            match repo_type {
+                Some(toren_lib::workspace::RepoType::Git) => {
+                    if let Some(ref base) = assignment.base_branch {
+                        println!(
+                            "\nBranch preserved. To integrate: git merge {}",
+                            assignment
+                                .workspace_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("unknown")
+                        );
+                        println!("  (branched from {})", base);
+                    }
+                }
+                _ => {
+                    println!("\nCommit preserved at: {}", &rev[..12.min(rev.len())]);
+                    println!(
+                        "To integrate: jj rebase -r {} -d main",
+                        &rev[..12.min(rev.len())]
+                    );
+                }
+            }
         } else {
             println!("Pushed.");
         }
@@ -1094,19 +1169,34 @@ fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool, k
     Ok(())
 }
 
-/// Detect workspace context from current directory
+/// Detect workspace context from current directory.
+/// Supports both jj workspaces and git worktrees.
 fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
     let cwd = std::env::current_dir()?;
 
-    // Check if we're in a jj workspace
-    if !cwd.join(".jj").exists() {
-        anyhow::bail!("Not in a jj workspace. Run this command from within a workspace directory.");
+    // Check for jj workspace
+    if cwd.join(".jj").exists() {
+        return detect_jj_workspace_context(&cwd);
     }
 
-    // Get the workspace name from jj
+    // Check for git worktree (.git file, not directory)
+    let git_entry = cwd.join(".git");
+    if git_entry.exists() && git_entry.is_file() {
+        return detect_git_worktree_context(&cwd);
+    }
+
+    anyhow::bail!(
+        "Not in a VCS workspace. Run this command from within a jj workspace or git worktree."
+    );
+}
+
+/// Detect jj workspace context from current directory
+fn detect_jj_workspace_context(
+    cwd: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
     let output = Command::new("jj")
         .args(["workspace", "root"])
-        .current_dir(&cwd)
+        .current_dir(cwd)
         .output()
         .context("Failed to run jj workspace root")?;
 
@@ -1117,15 +1207,13 @@ fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf,
     let workspace_path =
         std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
 
-    // Extract workspace name from path (last component)
     let workspace_name = workspace_path
         .file_name()
         .and_then(|n| n.to_str())
         .context("Invalid workspace path")?
         .to_string();
 
-    // Find the repo root (segment path) - look for .toren.kdl or use jj root
-    // First, try to find .toren.kdl by walking up from workspace
+    // Find the repo root (segment path) - look for .toren.kdl or .jj (repo root)
     let mut segment_path = None;
     let mut check_path = workspace_path.parent();
     while let Some(parent) = check_path {
@@ -1133,8 +1221,53 @@ fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf,
             segment_path = Some(parent.to_path_buf());
             break;
         }
-        // Also check if this is the repo root (has .jj and is not a workspace)
+        // Also check if this is the repo root (has .jj and is not the workspace)
         if parent.join(".jj").exists() && parent != workspace_path {
+            segment_path = Some(parent.to_path_buf());
+            break;
+        }
+        check_path = parent.parent();
+    }
+
+    let segment_path = segment_path
+        .context("Could not find segment root. Ensure you're in a breq-managed workspace.")?;
+
+    Ok((segment_path, workspace_path, workspace_name))
+}
+
+/// Detect git worktree context from current directory
+fn detect_git_worktree_context(
+    cwd: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .context("Failed to run git rev-parse --show-toplevel")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to determine git worktree root");
+    }
+
+    let workspace_path =
+        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+    let workspace_name = workspace_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("Invalid workspace path")?
+        .to_string();
+
+    // Find the segment path by walking up — look for .toren.kdl or .git directory
+    let mut segment_path = None;
+    let mut check_path = workspace_path.parent();
+    while let Some(parent) = check_path {
+        if parent.join(".toren.kdl").exists() {
+            segment_path = Some(parent.to_path_buf());
+            break;
+        }
+        // Check if this is the main git repo root (.git is a directory, not a file)
+        if parent.join(".git").is_dir() && parent != workspace_path {
             segment_path = Some(parent.to_path_buf());
             break;
         }
@@ -1342,30 +1475,58 @@ fn cmd_ws_setup(config: &Config) -> Result<()> {
 fn cmd_init(stealth: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
-    // Must be in a jj repo
-    if !cwd.join(".jj").exists() {
-        anyhow::bail!("Not a jujutsu repository. breq init must be run from a jj repo root.");
-    }
+    // Must be in a VCS repo
+    let has_jj = cwd.join(".jj").exists();
+    let has_git = cwd.join(".git").exists();
 
-    // Must be at the workspace root (jj root == cwd)
-    let output = Command::new("jj")
-        .args(["workspace", "root"])
-        .current_dir(&cwd)
-        .output()
-        .context("Failed to run jj workspace root")?;
-
-    if !output.status.success() {
-        anyhow::bail!("Failed to determine jj workspace root");
-    }
-
-    let jj_root =
-        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
-
-    if jj_root != cwd {
+    if !has_jj && !has_git {
         anyhow::bail!(
-            "breq init must be run from the workspace root: {}",
-            jj_root.display()
+            "Not a version-controlled repository. breq init must be run from a jj or git repo root."
         );
+    }
+
+    // Must be at the workspace/repo root
+    if has_jj {
+        let output = Command::new("jj")
+            .args(["workspace", "root"])
+            .current_dir(&cwd)
+            .output()
+            .context("Failed to run jj workspace root")?;
+
+        if !output.status.success() {
+            anyhow::bail!("Failed to determine jj workspace root");
+        }
+
+        let jj_root =
+            std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+        if jj_root != cwd {
+            anyhow::bail!(
+                "breq init must be run from the workspace root: {}",
+                jj_root.display()
+            );
+        }
+    } else {
+        // Git repo
+        let output = Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&cwd)
+            .output()
+            .context("Failed to run git rev-parse")?;
+
+        if !output.status.success() {
+            anyhow::bail!("Failed to determine git repo root");
+        }
+
+        let git_root =
+            std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+        if git_root != cwd {
+            anyhow::bail!(
+                "breq init must be run from the repo root: {}",
+                git_root.display()
+            );
+        }
     }
 
     let config_path = cwd.join(".toren.kdl");
@@ -1435,7 +1596,6 @@ fn cmd_init(stealth: bool) -> Result<()> {
     }
 
     // Also check for well-known artifacts that exist even if not in .gitignore
-    // (they might be using nested gitignores or global gitignore)
     for artifact in &well_known_artifacts {
         let artifact_path = cwd.join(artifact);
         if artifact_path.is_dir() {

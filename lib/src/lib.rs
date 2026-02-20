@@ -14,14 +14,17 @@ pub use assignment::{
     CompletionRecord,
 };
 pub use assignment_ops::{
-    abort_assignment, complete_assignment, prepare_resume, AbortOptions, AbortResult,
-    CompleteOptions, CompleteResult, ResumeOptions, ResumeResult,
+    abort_assignment, complete_assignment, prepare_resume, render_auto_commit_message,
+    AbortOptions, AbortResult, CompleteOptions, CompleteResult, ResumeOptions, ResumeResult,
 };
 pub use composite_status::CompositeStatus;
 pub use config::{Config, IntentsConfig, ProxyConfig};
 pub use segments::{Segment, SegmentManager};
 pub use tasks::{fetch_task, generate_prompt, Task, TaskProvider};
-pub use workspace::WorkspaceManager;
+pub use workspace::{
+    CleanupMode, CommitInfo, GitWorktreeBackend, JjBackend, RepoType, VcsBackend, WorkspaceManager,
+    detect_repo_type,
+};
 pub use process::{ProcessInfo, WorkspaceProcessesRunning};
 pub use workspace_setup::{
     render_template, BreqConfig, ConfigContext, ProxyContext, ProxyDirective, SetupResult, TaskInfo,

@@ -3,7 +3,7 @@
 //! The real status is derived from four observable signals:
 //! 1. Agent activity (busy/idle) — from Claude session log last-entry-type
 //! 2. Bead assignee — from bd
-//! 3. Has changes — from jj workspace
+//! 3. Has changes — from VCS workspace
 //! 4. Bead status — from bd
 
 use serde::{Deserialize, Serialize};
@@ -23,63 +23,24 @@ pub struct CompositeStatus {
     pub bead_assignee: String,
 }
 
-/// Check if a jj workspace has changes exclusive to it.
+/// Check if a workspace has changes exclusive to it.
 ///
-/// Two complementary checks:
-/// 1. `jj log -r "::@ ~ ::default@ ~ empty()"` — finds non-empty commits exclusive
-///    to this workspace (ancestors of @ not in default workspace). Catches committed
-///    work after `jj commit` + `jj new` where @ is empty but commits below have content.
-/// 2. `jj diff --stat` — detects uncommitted working-copy changes on @.
+/// Delegates to the appropriate VcsBackend based on auto-detected repo type.
 ///
-/// Both checks are needed: the revset misses working-copy changes when default@ is
-/// a descendant of @ (common topology), and `jj diff` misses committed-then-new'd work.
-pub fn workspace_has_changes(workspace_path: &Path) -> bool {
+/// `base_ref` is used for git worktrees as the comparison branch (e.g., "main").
+/// For jj workspaces, base_ref is ignored (uses `default@` revset).
+pub fn workspace_has_changes(workspace_path: &Path, base_ref: Option<&str>) -> bool {
+    use crate::workspace::{detect_repo_type, GitWorktreeBackend, JjBackend, RepoType, VcsBackend};
+
     if !workspace_path.exists() {
         return false;
     }
 
-    // Check 1: non-empty commits exclusive to this workspace
-    let log_output = std::process::Command::new("jj")
-        .args([
-            "log",
-            "-r",
-            "::@ ~ ::default@ ~ empty()",
-            "--no-graph",
-            "-T",
-            r#"change_id ++ "\n""#,
-        ])
-        .current_dir(workspace_path)
-        .output()
-        .ok();
-
-    if let Some(output) = log_output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.trim().is_empty() {
-                return true;
-            }
-        }
-        // Revset succeeded but found nothing, or failed (no default workspace).
-        // Either way, fall through to check working copy.
+    match detect_repo_type(workspace_path) {
+        Some(RepoType::Jj) => JjBackend.has_changes(workspace_path, base_ref),
+        Some(RepoType::Git) => GitWorktreeBackend.has_changes(workspace_path, base_ref),
+        None => false,
     }
-
-    // Check 2: uncommitted working-copy changes
-    let diff_output = std::process::Command::new("jj")
-        .args(["diff", "--stat"])
-        .current_dir(workspace_path)
-        .output()
-        .ok();
-
-    if let Some(output) = diff_output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.trim().is_empty() {
-                return true;
-            }
-        }
-    }
-
-    false
 }
 
 /// Detect agent activity by checking the last entry type in Claude Code session logs.

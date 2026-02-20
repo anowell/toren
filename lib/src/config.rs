@@ -71,10 +71,19 @@ pub struct AncillaryConfig {
     /// Default pool size for ancillaries per segment
     #[serde(default = "default_pool_size")]
     pub pool_size: u32,
+    /// Auto-commit message template rendered on complete.
+    /// Available placeholders: {{ task.id }}, {{ task.title }}
+    /// Skipped if workspace is clean (git) or working commit is empty (jj).
+    #[serde(default = "default_auto_commit_message")]
+    pub auto_commit_message: String,
 }
 
 fn default_pool_size() -> u32 {
     10
+}
+
+fn default_auto_commit_message() -> String {
+    "{{ task.id }}: {{ task.title }}".to_string()
 }
 
 fn default_task_prompt_template() -> String {
@@ -129,6 +138,7 @@ impl Default for AncillaryConfig {
             workspace_root: None,
             task_prompt_template: default_task_prompt_template(),
             pool_size: default_pool_size(),
+            auto_commit_message: default_auto_commit_message(),
         }
     }
 }

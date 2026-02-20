@@ -366,7 +366,13 @@ async fn workspaces_cleanup(
     }
 
     let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
-    match ws_mgr.cleanup_workspace(&segment_path, &request.segment, &request.workspace, proxy_config) {
+    match ws_mgr.cleanup_workspace(
+        &segment_path,
+        &request.segment,
+        &request.workspace,
+        proxy_config,
+        toren_lib::workspace::CleanupMode::Abort,
+    ) {
         Ok(_result) => Ok(Json(serde_json::json!({
             "success": true,
             "message": format!("Workspace {} cleaned up", request.workspace)
@@ -539,8 +545,11 @@ async fn compute_composite_status(
         toren_lib::composite_status::detect_agent_activity(&assignment.workspace_path)
     };
 
-    // 2. Has changes — from jj workspace
-    let has_changes = toren_lib::composite_status::workspace_has_changes(&assignment.workspace_path);
+    // 2. Has changes (VCS-agnostic)
+    let has_changes = toren_lib::composite_status::workspace_has_changes(
+        &assignment.workspace_path,
+        assignment.base_branch.as_deref(),
+    );
 
     // 3. Bead status + assignee — from bd
     let segment_path = {
@@ -710,6 +719,9 @@ async fn assignments_create(
     );
     let ancillary_num = toren_lib::ancillary_number(&ancillary_id).unwrap_or(1);
 
+    // Record base branch (for git worktrees; None for jj)
+    let base_branch = ws_mgr.active_branch(&segment_path);
+
     // Generate workspace name from ancillary number word
     let ws_name = toren_lib::number_to_word(ancillary_num).to_lowercase();
 
@@ -747,6 +759,7 @@ async fn assignments_create(
                 &request.segment,
                 ws_path,
                 bead_title,
+                base_branch,
             )
             .map_err(|e| {
                 (
@@ -764,6 +777,7 @@ async fn assignments_create(
                 &request.segment,
                 ws_path,
                 bead_title,
+                base_branch,
             )
             .map_err(|e| {
                 (
@@ -916,6 +930,14 @@ async fn assignments_complete(
         ),
     ))?;
 
+    // Render auto-commit message from config template
+    let auto_commit_message = toren_lib::render_auto_commit_message(
+        &state.config.ancillary,
+        &assignment,
+        &assignment.segment,
+        &segment_path,
+    );
+
     let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
     let opts = toren_lib::CompleteOptions {
         push: request.push,
@@ -923,6 +945,7 @@ async fn assignments_complete(
         segment_path: &segment_path,
         proxy_config,
         kill: request.kill,
+        auto_commit_message,
     };
 
     let result =
