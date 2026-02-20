@@ -36,7 +36,7 @@ impl SegmentManager {
             }
         }
 
-        info!("Discovered {} segment roots", roots.len());
+        debug!("Discovered {} segment roots", roots.len());
 
         let workspace_root = config
             .ancillary

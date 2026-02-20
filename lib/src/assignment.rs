@@ -268,7 +268,7 @@ impl AssignmentManager {
         }
         self.last_mtime = mtime;
 
-        info!("Loaded {} assignments from disk", self.assignments.len());
+        debug!("Loaded {} assignments from disk", self.assignments.len());
         Ok(())
     }
 

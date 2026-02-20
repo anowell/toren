@@ -571,16 +571,13 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
         let orphans = find_orphaned_workspaces(&ws_mgr, &segments, &assignments);
 
         if !orphans.is_empty() {
-            if has_assignments {
-                println!();
+            for (segment_name, ws_name, path) in &orphans {
+                tracing::debug!("orphaned workspace dir: {}/{} ({})", segment_name, ws_name, path.display());
             }
-            println!(
-                "{} orphaned workspace dir(s) (will be reclaimed on next assign, or run `breq cleanup`):",
+            tracing::debug!(
+                "{} orphaned workspace dir(s) (will be reclaimed on next assign, or run `breq cleanup`)",
                 orphans.len()
             );
-            for (segment_name, ws_name, path) in &orphans {
-                println!("  {}/{} ({})", segment_name, ws_name, path.display());
-            }
         }
     }
 
