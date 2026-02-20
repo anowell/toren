@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use colored::Colorize;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -467,6 +468,14 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
 
     let has_assignments = !assignments.is_empty();
 
+    let term_width = terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(80);
+
+    // Fixed column widths: workspace(10) + bead_id(15) + activity(6) + assignee(10) + spaces(4)
+    let fixed_width: usize = 10 + 15 + 6 + 10 + 4;
+    let narrow = term_width < fixed_width + 15;
+
     for assignment in &assignments {
         // Fetch composite status signals
         let segment_path = segment_mgr
@@ -480,15 +489,15 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
                 toren_lib::tasks::beads::fetch_bead_info(&assignment.bead_id, seg_path).ok()
             });
 
-        // 1. Agent activity (from Claude session log last-entry-type)
+        // 2. Agent activity (from Claude session log last-entry-type)
         let agent_activity = toren_lib::composite_status::detect_agent_activity(
             &assignment.workspace_path,
         );
 
-        // 2. Has changes (from jj workspace)
+        // 3. Has changes (from jj workspace)
         let has_changes = toren_lib::composite_status::workspace_has_changes(&assignment.workspace_path);
 
-        // 3. Assignee
+        // 4. Assignee
         let assignee = bead_info
             .as_ref()
             .map(|b| b.assignee.as_str())
@@ -499,35 +508,61 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
             format!("@{}", assignee)
         };
 
-        // 4. Title
+        // 5. Title — use available terminal width
+        let title_max = if narrow {
+            term_width.saturating_sub(4) // indented on next line
+        } else {
+            term_width.saturating_sub(fixed_width)
+        };
         let title = bead_info
             .as_ref()
-            .map(|b| truncate_title(&b.title, 40))
+            .map(|b| truncate_title(&b.title, title_max))
             .or_else(|| {
                 segment_path
                     .as_ref()
                     .and_then(|seg| toren_lib::tasks::fetch_task(&assignment.bead_id, seg).ok())
-                    .map(|task| truncate_title(&task.title, 40))
+                    .map(|task| truncate_title(&task.title, title_max))
             })
             .unwrap_or_else(|| "-".to_string());
 
-        // Extract ancillary short name (e.g., "Toren One" -> "One")
-        // Append * for dirty workspaces (like jj bookmark markers)
+        // 6. Workspace name — extract short name, mark dirty with *
         let ancillary_name = assignment
             .ancillary_id
             .split_whitespace()
             .last()
             .unwrap_or(&assignment.ancillary_id);
-        let workspace_display = if has_changes {
-            format!("{} *", ancillary_name)
+
+        // Pad plain text first, then colorize (ANSI codes break format width)
+        let ws_text = if has_changes {
+            format!("{:<10}", format!("{} *", ancillary_name))
         } else {
-            ancillary_name.to_string()
+            format!("{:<10}", ancillary_name)
+        };
+        let ws_colored = if has_changes {
+            ws_text.yellow()
+        } else {
+            ws_text.normal()
         };
 
-        println!(
-            "{:<10} {:<15} {:<6} {:<10} {}",
-            workspace_display, assignment.bead_id, agent_activity, assignee_display, title
-        );
+        let activity_text = format!("{:<6}", agent_activity);
+        let activity_colored = if agent_activity == "busy" {
+            activity_text.yellow()
+        } else {
+            activity_text.green()
+        };
+
+        if narrow {
+            println!(
+                "{} {:<15} {} {:<10}",
+                ws_colored, assignment.bead_id, activity_colored, assignee_display
+            );
+            println!("    {}", title);
+        } else {
+            println!(
+                "{} {:<15} {} {:<10} {}",
+                ws_colored, assignment.bead_id, activity_colored, assignee_display, title
+            );
+        }
     }
 
     // Detect orphaned workspace directories
@@ -667,10 +702,16 @@ fn cmd_cleanup(config: &Config, all_segments: bool, segment_name: Option<String>
 }
 
 fn truncate_title(title: &str, max_len: usize) -> String {
-    if title.len() <= max_len {
+    if max_len < 4 {
+        return title.chars().take(max_len).collect();
+    }
+    // Use char count for proper Unicode handling
+    let char_count = title.chars().count();
+    if char_count <= max_len {
         title.to_string()
     } else {
-        format!("{}...", &title[..max_len - 3])
+        let truncated: String = title.chars().take(max_len - 3).collect();
+        format!("{}...", truncated)
     }
 }
 
