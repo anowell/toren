@@ -3,6 +3,52 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
+/// Recursively remove a directory without following symlinks.
+/// Symlinks themselves are removed, but their targets are not traversed.
+fn remove_dir_all_no_follow(path: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        // file_type() on DirEntry uses lstat (doesn't follow symlinks)
+        let ft = entry.file_type()?;
+        if ft.is_symlink() || ft.is_file() {
+            std::fs::remove_file(entry.path())?;
+        } else if ft.is_dir() {
+            remove_dir_all_no_follow(&entry.path())?;
+        }
+    }
+    std::fs::remove_dir(path)
+}
+
+/// Spawn a background thread to delete all `.cleanup-*` directories under `parent`.
+fn spawn_background_cleanup(parent: PathBuf) {
+    std::thread::spawn(move || {
+        let entries = match std::fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!("Failed to read directory for cleanup {}: {}", parent.display(), e);
+                return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("Failed to read dir entry during cleanup: {}", e);
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(".cleanup-") {
+                let p = entry.path();
+                info!("Background cleanup: removing {}", p.display());
+                if let Err(e) = remove_dir_all_no_follow(&p) {
+                    warn!("Background cleanup failed for {}: {}", p.display(), e);
+                }
+            }
+        }
+    });
+}
+
 use crate::config::ProxyConfig;
 use crate::workspace_setup::{BreqConfig, SetupResult, WorkspaceSetup};
 
@@ -56,6 +102,9 @@ impl WorkspaceManager {
                     parent.display()
                 )
             })?;
+
+            // Sweep any stale .cleanup-* dirs from previously interrupted deletions
+            spawn_background_cleanup(parent.to_path_buf());
         }
 
         // Check if workspace already exists
@@ -77,7 +126,7 @@ impl WorkspaceManager {
                 "Removing orphaned workspace directory: {}",
                 ws_path.display()
             );
-            std::fs::remove_dir_all(&ws_path).with_context(|| {
+            remove_dir_all_no_follow(&ws_path).with_context(|| {
                 format!(
                     "Failed to remove orphaned workspace directory: {}",
                     ws_path.display()
@@ -132,18 +181,39 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    /// Delete a workspace directory (after forgetting)
+    /// Delete a workspace directory (after forgetting).
+    ///
+    /// Renames the directory to a `.cleanup-*` sibling for near-instant return,
+    /// then spawns a background thread to delete it (plus any stale `.cleanup-*`
+    /// dirs left behind by previous interrupted cleanups).
     pub fn delete_workspace(&self, segment_name: &str, workspace_name: &str) -> Result<()> {
         let ws_path = self.workspace_path(segment_name, workspace_name);
 
         if ws_path.exists() {
-            info!("Deleting workspace directory: {}", ws_path.display());
-            std::fs::remove_dir_all(&ws_path).with_context(|| {
+            let parent = ws_path.parent().with_context(|| {
+                format!("Workspace path has no parent: {}", ws_path.display())
+            })?;
+
+            let cleanup_name = format!(
+                ".cleanup-{}-{}",
+                workspace_name,
+                std::process::id()
+            );
+            let cleanup_path = parent.join(&cleanup_name);
+
+            info!(
+                "Renaming workspace for background deletion: {} -> {}",
+                ws_path.display(),
+                cleanup_path.display()
+            );
+            std::fs::rename(&ws_path, &cleanup_path).with_context(|| {
                 format!(
-                    "Failed to delete workspace directory: {}",
+                    "Failed to rename workspace directory for cleanup: {}",
                     ws_path.display()
                 )
             })?;
+
+            spawn_background_cleanup(parent.to_path_buf());
         }
 
         Ok(())
