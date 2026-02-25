@@ -246,6 +246,25 @@ pub enum Action {
     },
 }
 
+/// Failure handling mode for setup/destroy actions
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum OnFail {
+    /// Abort setup on failure (default, current behavior)
+    #[default]
+    Exit,
+    /// Log a warning and continue
+    Warn,
+    /// Silently continue (debug-level log only)
+    Ignore,
+}
+
+/// A parsed action with failure-handling metadata
+#[derive(Debug, Clone)]
+pub struct ParsedAction {
+    pub action: Action,
+    pub on_fail: OnFail,
+}
+
 /// A resolved proxy directive ready for Caddy configuration
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyDirective {
@@ -309,8 +328,8 @@ pub struct SetupResult {
 /// Configuration parsed from .toren.kdl
 #[derive(Debug, Default)]
 pub struct BreqConfig {
-    pub setup: Vec<Action>,
-    pub destroy: Vec<Action>,
+    pub setup: Vec<ParsedAction>,
+    pub destroy: Vec<ParsedAction>,
     pub vars: Vec<VarDef>,
 }
 
@@ -402,7 +421,7 @@ impl BreqConfig {
         Ok(vars)
     }
 
-    fn parse_block(node: &KdlNode) -> Result<Vec<Action>> {
+    fn parse_block(node: &KdlNode) -> Result<Vec<ParsedAction>> {
         let mut actions = Vec::new();
 
         if let Some(children) = node.children() {
@@ -415,7 +434,26 @@ impl BreqConfig {
         Ok(actions)
     }
 
-    fn parse_action(node: &KdlNode) -> Result<Action> {
+    fn parse_on_fail(node: &KdlNode) -> Result<OnFail> {
+        match node.get("on_fail").and_then(|v| v.as_string()) {
+            None => Ok(OnFail::Exit),
+            Some("exit") => Ok(OnFail::Exit),
+            Some("warn") => Ok(OnFail::Warn),
+            Some("ignore") => Ok(OnFail::Ignore),
+            Some(other) => anyhow::bail!(
+                "Invalid on_fail value '{}': expected 'exit', 'warn', or 'ignore'",
+                other
+            ),
+        }
+    }
+
+    fn parse_action(node: &KdlNode) -> Result<ParsedAction> {
+        let on_fail = Self::parse_on_fail(node)?;
+        let action = Self::parse_action_inner(node)?;
+        Ok(ParsedAction { action, on_fail })
+    }
+
+    fn parse_action_inner(node: &KdlNode) -> Result<Action> {
         match node.name().value() {
             "template" => {
                 let src = node
@@ -627,9 +665,9 @@ impl WorkspaceSetup {
         }
 
         let mut directives = Vec::new();
-        for (i, action) in config.setup.iter().enumerate() {
-            if let Action::Proxy { .. } = action {
-                let directive = resolve_proxy_directive(action, &ctx, proxy_config)
+        for (i, parsed) in config.setup.iter().enumerate() {
+            if let Action::Proxy { .. } = &parsed.action {
+                let directive = resolve_proxy_directive(&parsed.action, &ctx, proxy_config)
                     .with_context(|| format!("Action {} (proxy): resolution failed", i + 1))?;
                 directives.push(directive);
             }
@@ -677,27 +715,40 @@ impl WorkspaceSetup {
         Ok(result)
     }
 
-    /// Execute a list of actions in order, collecting proxy directives
+    /// Execute a list of actions in order, collecting proxy directives.
+    /// Respects on_fail metadata on each action.
     fn execute_actions(
         &self,
-        actions: &[Action],
+        actions: &[ParsedAction],
         ctx: &WorkspaceContext,
         proxy_config: Option<&ProxyConfig>,
     ) -> Result<SetupResult> {
         let mut result = SetupResult::default();
 
-        for (i, action) in actions.iter().enumerate() {
-            trace!("Executing action {}: {:?}", i + 1, action);
-            match action {
+        for (i, parsed) in actions.iter().enumerate() {
+            trace!("Executing action {}: {:?}", i + 1, parsed.action);
+            let res = match &parsed.action {
                 Action::Proxy { .. } => {
-                    let directive = resolve_proxy_directive(action, ctx, proxy_config)
-                        .with_context(|| format!("Action {} (proxy): resolution failed", i + 1))?;
-                    info!("  proxy: {} -> {} (port {})", directive.host, directive.upstream, directive.port);
-                    result.proxy_directives.push(directive);
+                    resolve_proxy_directive(&parsed.action, ctx, proxy_config)
+                        .map(|directive| {
+                            info!(
+                                "  proxy: {} -> {} (port {})",
+                                directive.host, directive.upstream, directive.port
+                            );
+                            result.proxy_directives.push(directive);
+                        })
+                        .with_context(|| format!("Action {} (proxy): resolution failed", i + 1))
                 }
-                _ => {
-                    self.execute_action(action, ctx)
-                        .with_context(|| format!("Action {} failed", i + 1))?;
+                _ => self
+                    .execute_action(&parsed.action, ctx)
+                    .with_context(|| format!("Action {} failed", i + 1)),
+            };
+
+            if let Err(e) = res {
+                match parsed.on_fail {
+                    OnFail::Exit => return Err(e),
+                    OnFail::Warn => warn!("Action {} failed (continuing): {:#}", i + 1, e),
+                    OnFail::Ignore => debug!("Action {} failed (ignored): {:#}", i + 1, e),
                 }
             }
         }
@@ -922,7 +973,7 @@ destroy {
         assert_eq!(config.setup.len(), 2);
         assert_eq!(config.destroy.len(), 1);
 
-        match &config.setup[0] {
+        match &config.setup[0].action {
             Action::Template { src, dest } => {
                 assert_eq!(src, ".env.breq");
                 assert_eq!(dest, ".env");
@@ -930,7 +981,7 @@ destroy {
             _ => panic!("Expected Template action"),
         }
 
-        match &config.setup[1] {
+        match &config.setup[1].action {
             Action::Run { command, cwd } => {
                 assert_eq!(command, "pnpm install");
                 assert!(cwd.is_none());
@@ -950,7 +1001,7 @@ setup {
         let config = BreqConfig::parse_kdl(content).unwrap();
 
         assert_eq!(config.setup.len(), 1);
-        match &config.setup[0] {
+        match &config.setup[0].action {
             Action::Copy { src, dest, from } => {
                 assert_eq!(src, "config.example.json");
                 assert_eq!(dest, "config.json");
@@ -981,14 +1032,14 @@ setup {
         let config = BreqConfig::parse_kdl(content).unwrap();
 
         assert_eq!(config.setup.len(), 2);
-        match &config.setup[0] {
+        match &config.setup[0].action {
             Action::Share { src, from } => {
                 assert_eq!(src, "node_modules");
                 assert_eq!(from.as_deref(), Some("{{ repo.root }}"));
             }
             _ => panic!("Expected Share action"),
         }
-        match &config.setup[1] {
+        match &config.setup[1].action {
             Action::Share { src, from } => {
                 assert_eq!(src, ".pnpm-store");
                 assert!(from.is_none());
@@ -1009,7 +1060,7 @@ setup {
         let config = BreqConfig::parse_kdl(content).unwrap();
 
         assert_eq!(config.setup.len(), 2);
-        match &config.setup[0] {
+        match &config.setup[0].action {
             Action::Copy { src, dest, from } => {
                 assert_eq!(src, "node_modules");
                 assert_eq!(dest, "node_modules"); // dest defaults to src
@@ -1017,7 +1068,7 @@ setup {
             }
             _ => panic!("Expected Copy action"),
         }
-        match &config.setup[1] {
+        match &config.setup[1].action {
             Action::Copy { src, dest, from } => {
                 assert_eq!(src, "config.json");
                 assert_eq!(dest, "config.json");
@@ -1039,7 +1090,7 @@ setup {
         let config = BreqConfig::parse_kdl(content).unwrap();
 
         assert_eq!(config.setup.len(), 2);
-        match &config.setup[0] {
+        match &config.setup[0].action {
             Action::Copy { src, dest, from } => {
                 assert_eq!(src, "/some/path/to/node_modules");
                 assert_eq!(dest, "node_modules"); // basename for absolute paths
@@ -1047,7 +1098,7 @@ setup {
             }
             _ => panic!("Expected Copy action"),
         }
-        match &config.setup[1] {
+        match &config.setup[1].action {
             Action::Copy { src, dest, from } => {
                 assert_eq!(src, "relative/path");
                 assert_eq!(dest, "relative/path"); // relative paths preserved
@@ -1069,14 +1120,14 @@ setup {
         let config = BreqConfig::parse_kdl(content).unwrap();
 
         assert_eq!(config.setup.len(), 2);
-        match &config.setup[0] {
+        match &config.setup[0].action {
             Action::Run { command, cwd } => {
                 assert_eq!(command, "pnpm install");
                 assert_eq!(cwd.as_deref(), Some("web"));
             }
             _ => panic!("Expected Run action"),
         }
-        match &config.setup[1] {
+        match &config.setup[1].action {
             Action::Run { command, cwd } => {
                 assert_eq!(command, "cargo build");
                 assert!(cwd.is_none());
@@ -1211,7 +1262,7 @@ setup {
         let config = BreqConfig::parse_kdl(content).unwrap();
         assert_eq!(config.setup.len(), 1);
 
-        match &config.setup[0] {
+        match &config.setup[0].action {
             Action::Proxy {
                 port,
                 upstream,
@@ -1244,7 +1295,7 @@ setup {
         let config = BreqConfig::parse_kdl(content).unwrap();
         assert_eq!(config.setup.len(), 1);
 
-        match &config.setup[0] {
+        match &config.setup[0].action {
             Action::Proxy {
                 port,
                 upstream,
@@ -1307,7 +1358,7 @@ setup {
         let config = BreqConfig::parse_kdl(content).unwrap();
         assert_eq!(config.setup.len(), 1);
 
-        match &config.setup[0] {
+        match &config.setup[0].action {
             Action::Proxy { port, upstream, tls, .. } => {
                 assert_eq!(*port, 443);
                 match upstream {
@@ -1374,8 +1425,8 @@ setup {
         };
 
         let mut directives = Vec::new();
-        for action in &config.setup {
-            if let Action::Proxy { port, upstream, tls, host } = action {
+        for parsed in &config.setup {
+            if let Action::Proxy { port, upstream, tls, host } = &parsed.action {
                 let resolved_upstream = upstream.resolve(&ctx).unwrap();
                 let resolved_host = if let Some(h) = host {
                     h.resolve(&ctx).unwrap()
@@ -1489,5 +1540,174 @@ setup {
         let d = resolve_proxy_directive(&action, &ctx, None).unwrap();
         assert_eq!(d.host, "one.toren.lvh.me"); // fallback to lvh.me
         assert!(!d.tls); // fallback to false
+    }
+
+    #[test]
+    fn test_parse_on_fail_default() {
+        let content = r#"
+setup {
+    run "pnpm install"
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.setup[0].on_fail, OnFail::Exit);
+    }
+
+    #[test]
+    fn test_parse_on_fail_exit() {
+        let content = r#"
+setup {
+    run "pnpm install" on_fail="exit"
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.setup[0].on_fail, OnFail::Exit);
+    }
+
+    #[test]
+    fn test_parse_on_fail_warn() {
+        let content = r#"
+setup {
+    run "createdb mydb" on_fail="warn"
+    template src=".env.tpl" dest=".env" on_fail="warn"
+    copy src="optional.conf" on_fail="warn"
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.setup[0].on_fail, OnFail::Warn);
+        assert_eq!(config.setup[1].on_fail, OnFail::Warn);
+        assert_eq!(config.setup[2].on_fail, OnFail::Warn);
+    }
+
+    #[test]
+    fn test_parse_on_fail_ignore() {
+        let content = r#"
+setup {
+    run "optional-step" on_fail="ignore"
+    share src="cache" on_fail="ignore"
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.setup[0].on_fail, OnFail::Ignore);
+        assert_eq!(config.setup[1].on_fail, OnFail::Ignore);
+    }
+
+    #[test]
+    fn test_parse_on_fail_invalid() {
+        let content = r#"
+setup {
+    run "test" on_fail="retry"
+}
+"#;
+        let err = BreqConfig::parse_kdl(content).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid on_fail value 'retry'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_on_fail_on_proxy() {
+        let content = r#"
+setup {
+    proxy 5173 upstream="http://localhost:5173" on_fail="warn"
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.setup[0].on_fail, OnFail::Warn);
+    }
+
+    #[test]
+    fn test_parse_on_fail_in_destroy() {
+        let content = r#"
+destroy {
+    run "cleanup" on_fail="ignore"
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.destroy[0].on_fail, OnFail::Ignore);
+    }
+
+    fn test_setup() -> WorkspaceSetup {
+        let dir = std::env::temp_dir().join("toren-test-ws");
+        let _ = fs::create_dir_all(&dir);
+        WorkspaceSetup::new(dir.clone(), dir, "test".to_string(), 1)
+    }
+
+    #[test]
+    fn test_execute_actions_on_fail_warn_continues() {
+        let setup = test_setup();
+        let ctx = setup.build_context();
+        let actions = vec![
+            ParsedAction {
+                action: Action::Run {
+                    command: "exit 1".to_string(),
+                    cwd: None,
+                },
+                on_fail: OnFail::Warn,
+            },
+            ParsedAction {
+                action: Action::Run {
+                    command: "echo ok".to_string(),
+                    cwd: None,
+                },
+                on_fail: OnFail::Exit,
+            },
+        ];
+        let result = setup.execute_actions(&actions, &ctx, None);
+        assert!(result.is_ok(), "on_fail=warn should continue: {:?}", result);
+    }
+
+    #[test]
+    fn test_execute_actions_on_fail_ignore_continues() {
+        let setup = test_setup();
+        let ctx = setup.build_context();
+        let actions = vec![
+            ParsedAction {
+                action: Action::Run {
+                    command: "exit 1".to_string(),
+                    cwd: None,
+                },
+                on_fail: OnFail::Ignore,
+            },
+            ParsedAction {
+                action: Action::Run {
+                    command: "echo ok".to_string(),
+                    cwd: None,
+                },
+                on_fail: OnFail::Exit,
+            },
+        ];
+        let result = setup.execute_actions(&actions, &ctx, None);
+        assert!(
+            result.is_ok(),
+            "on_fail=ignore should continue: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_execute_actions_on_fail_exit_aborts() {
+        let setup = test_setup();
+        let ctx = setup.build_context();
+        let actions = vec![
+            ParsedAction {
+                action: Action::Run {
+                    command: "exit 1".to_string(),
+                    cwd: None,
+                },
+                on_fail: OnFail::Exit,
+            },
+            ParsedAction {
+                action: Action::Run {
+                    command: "echo should-not-run".to_string(),
+                    cwd: None,
+                },
+                on_fail: OnFail::Exit,
+            },
+        ];
+        let result = setup.execute_actions(&actions, &ctx, None);
+        assert!(result.is_err(), "on_fail=exit should abort");
     }
 }
