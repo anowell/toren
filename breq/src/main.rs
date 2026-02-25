@@ -176,11 +176,19 @@ enum Commands {
     /// Setup/refresh Caddy reverse proxy routes for a workspace
     Proxy {
         /// Workspace name (e.g., "one", "two")
-        workspace: String,
+        workspace: Option<String>,
+
+        /// List all active proxy routes
+        #[arg(short, long)]
+        list: bool,
 
         /// Explicit port mapping (port:upstream), can be repeated
         #[arg(short, long = "port", value_name = "PORT:UPSTREAM")]
         p: Vec<String>,
+
+        /// Enable TLS on explicit port mappings
+        #[arg(long)]
+        tls: bool,
 
         /// Segment to use (defaults to current directory's segment)
         #[arg(short, long)]
@@ -286,9 +294,19 @@ fn main() -> Result<()> {
         },
         Commands::Proxy {
             workspace,
+            list,
             p,
+            tls,
             segment,
-        } => cmd_proxy(&config, &workspace, p, segment.as_deref()),
+        } => {
+            if list {
+                cmd_proxy_list(&config)
+            } else {
+                let workspace = workspace
+                    .ok_or_else(|| anyhow::anyhow!("workspace name is required (or use --list)"))?;
+                cmd_proxy(&config, &workspace, p, tls, segment.as_deref())
+            }
+        }
         Commands::Init { stealth } => cmd_init(stealth),
     }
 }
@@ -1173,6 +1191,7 @@ fn cmd_proxy(
     config: &Config,
     workspace: &str,
     port_mappings: Vec<String>,
+    tls: bool,
     segment_name: Option<&str>,
 ) -> Result<()> {
     let segment_mgr = SegmentManager::new(config)?;
@@ -1185,11 +1204,14 @@ fn cmd_proxy(
         config.port()
     );
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "segment": segment.name,
         "workspace": ws_name,
         "port_mappings": port_mappings,
     });
+    if tls {
+        body["tls"] = serde_json::json!(true);
+    }
 
     println!("Refreshing proxy routes for workspace '{}'...", ws_name);
 
@@ -1232,6 +1254,57 @@ fn cmd_proxy(
         }
     }
     println!("Registered {} proxy route(s).", count);
+    Ok(())
+}
+
+fn cmd_proxy_list(config: &Config) -> Result<()> {
+    let daemon_url = format!(
+        "http://{}:{}/api/proxy/routes",
+        config.host(),
+        config.port()
+    );
+
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+
+    let resp = agent
+        .get(&daemon_url)
+        .call()
+        .with_context(|| {
+            format!(
+                "Failed to connect to daemon at {} (is the daemon running?)",
+                daemon_url
+            )
+        })?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .into_body()
+        .read_json()
+        .context("Failed to read daemon response")?;
+
+    if status != 200 {
+        let error = body["error"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("Daemon returned HTTP {}: {}", status, error);
+    }
+
+    if let Some(routes) = body["routes"].as_array() {
+        if routes.is_empty() {
+            println!("No active proxy routes.");
+        } else {
+            for route in routes {
+                let host = route["host"].as_str().unwrap_or("?");
+                let upstream = route["upstream"].as_str().unwrap_or("?");
+                let port = route["port"].as_u64().unwrap_or(0);
+                println!("  {} -> {} on :{}", host, upstream, port);
+            }
+            println!("{} active route(s).", routes.len());
+        }
+    }
+
     Ok(())
 }
 

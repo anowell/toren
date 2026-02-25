@@ -108,6 +108,7 @@ pub async fn serve(
         .route("/api/workspaces/list/:segment", get(workspaces_list))
         .route("/api/workspaces/cleanup", post(workspaces_cleanup))
         .route("/api/workspaces/proxy", post(workspaces_proxy))
+        .route("/api/proxy/routes", get(proxy_routes_list))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -387,6 +388,8 @@ struct WorkspaceProxyRequest {
     /// Explicit port mappings (e.g., ["80:30001", "443:30002"])
     #[serde(default)]
     port_mappings: Vec<String>,
+    /// Override TLS setting for explicit port mappings
+    tls: Option<bool>,
 }
 
 async fn workspaces_proxy(
@@ -447,7 +450,7 @@ async fn workspaces_proxy(
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
         let default_host = format!("{}.{}.{}", request.workspace, repo_name, domain);
-        let default_tls = proxy_config.tls;
+        let default_tls = request.tls.unwrap_or(proxy_config.tls);
 
         let mut directives = Vec::new();
         for mapping in &request.port_mappings {
@@ -486,6 +489,28 @@ async fn workspaces_proxy(
         "success": true,
         "directives": directives,
         "count": directives.len(),
+    })))
+}
+
+async fn proxy_routes_list(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let caddy = state.caddy.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "proxy not enabled"})),
+    ))?;
+
+    let routes = caddy.list_routes().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to list routes: {}", e)})),
+        )
+    })?;
+
+    let count = routes.len();
+    Ok(Json(serde_json::json!({
+        "routes": routes,
+        "count": count,
     })))
 }
 
