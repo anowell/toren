@@ -107,6 +107,7 @@ pub async fn serve(
         .route("/api/segments/create", post(segments_create))
         .route("/api/workspaces/list/:segment", get(workspaces_list))
         .route("/api/workspaces/cleanup", post(workspaces_cleanup))
+        .route("/api/workspaces/proxy", post(workspaces_proxy))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -377,6 +378,115 @@ async fn workspaces_cleanup(
             })))
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceProxyRequest {
+    segment: String,
+    workspace: String,
+    /// Explicit port mappings (e.g., ["80:30001", "443:30002"])
+    #[serde(default)]
+    port_mappings: Vec<String>,
+}
+
+async fn workspaces_proxy(
+    State(state): State<AppState>,
+    Json(request): Json<WorkspaceProxyRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let ws_mgr = state.workspaces.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "workspace_root not configured"})),
+    ))?;
+
+    let caddy = state.caddy.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "proxy not enabled"})),
+    ))?;
+
+    let segment_path = {
+        let segments = state.segments.read().unwrap();
+        segments
+            .find_by_name(&request.segment)
+            .map(|s| s.path.clone())
+    };
+
+    let segment_path = segment_path.ok_or((
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": format!("Segment not found: {}", request.segment)})),
+    ))?;
+
+    // Verify workspace exists
+    if !ws_mgr.workspace_exists(&request.segment, &request.workspace) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Workspace not found: {}", request.workspace)})),
+        ));
+    }
+
+    let proxy_config = caddy.proxy_config();
+    let directives = if request.port_mappings.is_empty() {
+        // Re-evaluate .toren.kdl proxy directives
+        ws_mgr
+            .evaluate_proxy_directives(
+                &segment_path,
+                &request.segment,
+                &request.workspace,
+                Some(proxy_config),
+            )
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to evaluate proxy directives: {}", e)})),
+                )
+            })?
+    } else {
+        // Construct directives from explicit port mappings
+        let domain = &proxy_config.domain;
+        let repo_name = segment_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let default_host = format!("{}.{}.{}", request.workspace, repo_name, domain);
+        let default_tls = proxy_config.tls;
+
+        let mut directives = Vec::new();
+        for mapping in &request.port_mappings {
+            let parts: Vec<&str> = mapping.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid port mapping: {} (expected port:upstream)", mapping)})),
+                ));
+            }
+            let port: u16 = parts[0].parse().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid port: {}", parts[0])})),
+                )
+            })?;
+            directives.push(toren_lib::workspace_setup::ProxyDirective {
+                host: default_host.clone(),
+                upstream: parts[1].to_string(),
+                tls: default_tls,
+                port,
+            });
+        }
+        directives
+    };
+
+    // Register routes in Caddy
+    if let Err(e) = caddy.add_routes(&directives).await {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to add Caddy routes: {}", e)})),
+        ));
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "directives": directives,
+        "count": directives.len(),
+    })))
 }
 
 // ==================== Composite Status Helper ====================

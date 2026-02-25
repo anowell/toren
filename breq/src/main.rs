@@ -173,6 +173,20 @@ enum Commands {
         cmd: Vec<String>,
     },
 
+    /// Setup/refresh Caddy reverse proxy routes for a workspace
+    Proxy {
+        /// Workspace name (e.g., "one", "two")
+        workspace: String,
+
+        /// Explicit port mapping (port:upstream), can be repeated
+        #[arg(short, long = "port", value_name = "PORT:UPSTREAM")]
+        p: Vec<String>,
+
+        /// Segment to use (defaults to current directory's segment)
+        #[arg(short, long)]
+        segment: Option<String>,
+    },
+
     /// Initialize .toren.kdl in the current repository
     Init {
         /// Add .toren.kdl to .git/info/exclude instead of committing it
@@ -270,6 +284,11 @@ fn main() -> Result<()> {
             WorkspaceCommands::Setup => cmd_ws_setup(&config),
             WorkspaceCommands::Destroy => cmd_ws_destroy(&config),
         },
+        Commands::Proxy {
+            workspace,
+            p,
+            segment,
+        } => cmd_proxy(&config, &workspace, p, segment.as_deref()),
         Commands::Init { stealth } => cmd_init(stealth),
     }
 }
@@ -1148,6 +1167,72 @@ fn cmd_go(
         .current_dir(&ws_path)
         .exec();
     Err(err).with_context(|| format!("Failed to exec: {}", program))
+}
+
+fn cmd_proxy(
+    config: &Config,
+    workspace: &str,
+    port_mappings: Vec<String>,
+    segment_name: Option<&str>,
+) -> Result<()> {
+    let segment_mgr = SegmentManager::new(config)?;
+    let segment = resolve_segment(&segment_mgr, segment_name)?;
+    let ws_name = workspace.to_lowercase();
+
+    let daemon_url = format!(
+        "http://{}:{}/api/workspaces/proxy",
+        config.host(),
+        config.port()
+    );
+
+    let body = serde_json::json!({
+        "segment": segment.name,
+        "workspace": ws_name,
+        "port_mappings": port_mappings,
+    });
+
+    println!("Refreshing proxy routes for workspace '{}'...", ws_name);
+
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+
+    let resp = agent
+        .post(&daemon_url)
+        .send_json(&body)
+        .with_context(|| {
+            format!(
+                "Failed to connect to daemon at {} (is the daemon running?)",
+                daemon_url
+            )
+        })?;
+
+    let status = resp.status();
+    let resp_body: serde_json::Value = resp
+        .into_body()
+        .read_json()
+        .context("Failed to read daemon response")?;
+
+    if status != 200 {
+        let error = resp_body["error"]
+            .as_str()
+            .unwrap_or("unknown error");
+        anyhow::bail!("Daemon returned HTTP {}: {}", status, error);
+    }
+
+    let count = resp_body["count"].as_u64().unwrap_or(0);
+    if let Some(directives) = resp_body["directives"].as_array() {
+        for d in directives {
+            let host = d["host"].as_str().unwrap_or("?");
+            let upstream = d["upstream"].as_str().unwrap_or("?");
+            let port = d["port"].as_u64().unwrap_or(0);
+            println!("  {} -> {} on :{}", host, upstream, port);
+        }
+    }
+    println!("Registered {} proxy route(s).", count);
+    Ok(())
 }
 
 fn cmd_ws_setup(config: &Config) -> Result<()> {

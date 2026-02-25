@@ -259,6 +259,44 @@ pub struct ProxyDirective {
     pub port: u16,
 }
 
+/// Resolve a proxy action into a ProxyDirective by evaluating upstream, host, and tls.
+fn resolve_proxy_directive(
+    action: &Action,
+    ctx: &WorkspaceContext,
+    proxy_config: Option<&ProxyConfig>,
+) -> Result<ProxyDirective> {
+    let Action::Proxy {
+        port,
+        upstream,
+        tls,
+        host,
+    } = action
+    else {
+        anyhow::bail!("resolve_proxy_directive called with non-proxy action");
+    };
+
+    let resolved_upstream = upstream
+        .resolve(ctx)
+        .context("failed to resolve upstream")?;
+    let resolved_host = if let Some(h) = host {
+        h.resolve(ctx).context("failed to resolve host")?
+    } else {
+        let domain = proxy_config
+            .map(|pc| pc.domain.as_str())
+            .unwrap_or("lvh.me");
+        format!("{}.{}.{}", ctx.ws.name, ctx.repo.name, domain)
+    };
+    let resolved_tls =
+        tls.unwrap_or_else(|| proxy_config.map(|pc| pc.tls).unwrap_or(false));
+
+    Ok(ProxyDirective {
+        host: resolved_host,
+        upstream: resolved_upstream,
+        tls: resolved_tls,
+        port: *port,
+    })
+}
+
 /// Result from running setup or destroy actions
 #[derive(Debug, Default)]
 pub struct SetupResult {
@@ -560,6 +598,46 @@ impl WorkspaceSetup {
         Ok(result)
     }
 
+    /// Evaluate only proxy directives from the setup block without executing other actions.
+    /// Used to refresh Caddy routes for an existing workspace.
+    pub fn evaluate_proxy_directives(
+        &self,
+        proxy_config: Option<&ProxyConfig>,
+    ) -> Result<Vec<ProxyDirective>> {
+        let config = BreqConfig::parse(&self.repo_root)?;
+
+        if config.setup.is_empty() && config.vars.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ctx = self.build_context();
+
+        if let Some(pc) = proxy_config {
+            ctx.config = Some(ConfigContext {
+                proxy: ProxyContext {
+                    domain: pc.domain.clone(),
+                    tls: pc.tls,
+                },
+            });
+        }
+
+        if !config.vars.is_empty() {
+            let vars = evaluate_vars(&config.vars, &ctx)?;
+            ctx.vars = vars;
+        }
+
+        let mut directives = Vec::new();
+        for (i, action) in config.setup.iter().enumerate() {
+            if let Action::Proxy { .. } = action {
+                let directive = resolve_proxy_directive(action, &ctx, proxy_config)
+                    .with_context(|| format!("Action {} (proxy): resolution failed", i + 1))?;
+                directives.push(directive);
+            }
+        }
+
+        Ok(directives)
+    }
+
     /// Run the destroy block
     pub fn run_destroy(&self, proxy_config: Option<&ProxyConfig>) -> Result<SetupResult> {
         let config = BreqConfig::parse(&self.repo_root)?;
@@ -611,37 +689,11 @@ impl WorkspaceSetup {
         for (i, action) in actions.iter().enumerate() {
             trace!("Executing action {}: {:?}", i + 1, action);
             match action {
-                Action::Proxy {
-                    port,
-                    upstream,
-                    tls,
-                    host,
-                } => {
-                    // Resolve proxy directive
-                    let resolved_upstream = upstream
-                        .resolve(ctx)
-                        .with_context(|| format!("Action {} (proxy): failed to resolve upstream", i + 1))?;
-                    let resolved_host = if let Some(h) = host {
-                        h.resolve(ctx)
-                            .with_context(|| format!("Action {} (proxy): failed to resolve host", i + 1))?
-                    } else {
-                        // Default host: ws.name.repo.name.config.proxy.domain
-                        let domain = proxy_config
-                            .map(|pc| pc.domain.as_str())
-                            .unwrap_or("lvh.me");
-                        format!("{}.{}.{}", ctx.ws.name, ctx.repo.name, domain)
-                    };
-                    let resolved_tls = tls.unwrap_or_else(|| {
-                        proxy_config.map(|pc| pc.tls).unwrap_or(false)
-                    });
-
-                    info!("  proxy: {} -> {} (port {})", resolved_host, resolved_upstream, port);
-                    result.proxy_directives.push(ProxyDirective {
-                        host: resolved_host,
-                        upstream: resolved_upstream,
-                        tls: resolved_tls,
-                        port: *port,
-                    });
+                Action::Proxy { .. } => {
+                    let directive = resolve_proxy_directive(action, ctx, proxy_config)
+                        .with_context(|| format!("Action {} (proxy): resolution failed", i + 1))?;
+                    info!("  proxy: {} -> {} (port {})", directive.host, directive.upstream, directive.port);
+                    result.proxy_directives.push(directive);
                 }
                 _ => {
                     self.execute_action(action, ctx)
@@ -1354,5 +1406,88 @@ setup {
         assert_eq!(directives[1].upstream, "9001");
         assert_eq!(directives[1].host, "one.toren.lvh.me");
         assert!(!directives[1].tls);
+    }
+
+    #[test]
+    fn test_resolve_proxy_directive_helper() {
+        // Verify the shared resolve_proxy_directive helper works correctly
+        // (used by both evaluate_proxy_directives and execute_actions)
+        let ctx = WorkspaceContext {
+            ws: WorkspaceInfo {
+                name: "one".to_string(),
+                num: 1,
+                path: "/tmp/ws/one".to_string(),
+            },
+            repo: RepoInfo {
+                root: "/tmp/repo".to_string(),
+                name: "toren".to_string(),
+            },
+            task: None,
+            vars: {
+                let mut m = HashMap::new();
+                m.insert("web_port".to_string(), serde_json::json!(8001));
+                m
+            },
+            config: Some(ConfigContext {
+                proxy: ProxyContext {
+                    domain: "lvh.me".to_string(),
+                    tls: false,
+                },
+            }),
+        };
+
+        let proxy_config = ProxyConfig {
+            enabled: true,
+            tls: false,
+            domain: "lvh.me".to_string(),
+            dns_port: None,
+        };
+
+        // Test with var-referenced upstream and explicit tls
+        let action = Action::Proxy {
+            port: 443,
+            upstream: AttrValue::VarRef("vars.web_port".to_string()),
+            tls: Some(true),
+            host: None,
+        };
+        let d = resolve_proxy_directive(&action, &ctx, Some(&proxy_config)).unwrap();
+        assert_eq!(d.port, 443);
+        assert_eq!(d.upstream, "8001");
+        assert_eq!(d.host, "one.toren.lvh.me");
+        assert!(d.tls);
+
+        // Test with literal upstream and default tls (inherits from config)
+        let action = Action::Proxy {
+            port: 8080,
+            upstream: AttrValue::Literal("3000".to_string()),
+            tls: None,
+            host: None,
+        };
+        let d = resolve_proxy_directive(&action, &ctx, Some(&proxy_config)).unwrap();
+        assert_eq!(d.port, 8080);
+        assert_eq!(d.upstream, "3000");
+        assert_eq!(d.host, "one.toren.lvh.me");
+        assert!(!d.tls);
+
+        // Test with explicit host
+        let action = Action::Proxy {
+            port: 80,
+            upstream: AttrValue::Literal("5000".to_string()),
+            tls: None,
+            host: Some(AttrValue::Literal("custom.example.com".to_string())),
+        };
+        let d = resolve_proxy_directive(&action, &ctx, Some(&proxy_config)).unwrap();
+        assert_eq!(d.host, "custom.example.com");
+
+        // Test without proxy config (fallback domain)
+        let action = Action::Proxy {
+            port: 80,
+            upstream: AttrValue::Literal("5000".to_string()),
+            tls: None,
+            host: None,
+        };
+        let d = resolve_proxy_directive(&action, &ctx, None).unwrap();
+        assert_eq!(d.host, "one.toren.lvh.me"); // fallback to lvh.me
+        assert!(!d.tls); // fallback to false
     }
 }

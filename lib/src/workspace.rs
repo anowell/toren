@@ -50,7 +50,7 @@ fn spawn_background_cleanup(parent: PathBuf) {
 }
 
 use crate::config::ProxyConfig;
-use crate::workspace_setup::{BreqConfig, SetupResult, WorkspaceSetup};
+use crate::workspace_setup::{BreqConfig, ProxyDirective, SetupResult, WorkspaceSetup};
 
 /// Manages jujutsu workspaces for ancillaries
 pub struct WorkspaceManager {
@@ -326,6 +326,28 @@ impl WorkspaceManager {
         );
 
         setup.run_destroy(proxy_config)
+    }
+
+    /// Evaluate proxy directives from .toren.kdl for an existing workspace
+    /// without running other setup actions. Used to refresh Caddy routes.
+    pub fn evaluate_proxy_directives(
+        &self,
+        segment_path: &Path,
+        segment_name: &str,
+        workspace_name: &str,
+        proxy_config: Option<&ProxyConfig>,
+    ) -> Result<Vec<ProxyDirective>> {
+        let ws_path = self.workspace_path(segment_name, workspace_name);
+        let ancillary_num = crate::word_to_number(workspace_name).unwrap_or(0);
+
+        let setup = WorkspaceSetup::new(
+            segment_path.to_path_buf(),
+            ws_path,
+            workspace_name.to_string(),
+            ancillary_num,
+        );
+
+        setup.evaluate_proxy_directives(proxy_config)
     }
 
     /// Create workspace and run setup hooks
