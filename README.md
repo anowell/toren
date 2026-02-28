@@ -2,109 +2,87 @@
 
 > *"I am Toren. I am continuity."*
 
-Toren orchestrates AI-assisted development by managing:
-- **Agent sessions** - Claude Code sessions with persistent context
-- **Issues** - Beads for task tracking and handoff
-- **Isolated workspaces** - jj workspaces with per-workspace config, hooks, and copy-on-write content
+Toren is a set of composable tools to orchestrate workspaces for agentic development.
 
-## Interfaces
+- Supports git worktrees and jj workspaces
+- Configurable workspace setup and destruction (isolate and/or share components between workspaces)
+- Per-workspace local domains (i.e. upstream reverse proxying through local domains with Caddy)
+- Agent sessions: currently Claude Code
 
-Toren provides multiple ways to interact with this functionality:
+
+## Introduction
 
 - **Breq** - CLI using Claude's TUI for interactive sessions
-- **Daemon API** - REST + WebSocket interface using Claude Code SDK
+- **Toren Daemon** - REST + WebSocket workspace API (using Claude Code SDK)
+- **Station** - Manage reverse proxy configuration (e.g. proxies per workspace)
 - **Web** - Browser-based interface connecting to the daemon
 - **Mobile** - Coming soon (tunnels to the daemon)
+
+Given a repo named "snake":
+
+- Breq (CLI) or Toren (API) issue commands to ancillaries
+- A single ancillary (e.g. Snake One) manages
+  - a single workspace ("@one") or worktree (branch "one")
+  - one or more agents (e.g. claude)
+- Services in the workspace become accessible via one.snake.lvh.me (or other local-resolving domain)
+
 
 ## Installation
 
 ```bash
-# Install the CLI and daemon
-cargo install --path breq
-cargo install --path daemon
+cargo install --git https://github.com/anowell/toren breq
 ```
 
-## Configuration
-
-Create `toren.toml` in your project root (or `~/.config/toren/config.toml` for global config):
-
-```toml
-[server]
-host = "127.0.0.1"
-port = 8787
-
-[segments]
-# Directories containing your projects
-roots = ["~/projects"]
-
-[ancillary]
-workspace_root = "~/.toren/workspaces"
-pool_size = 10
-```
-
-### Claude Authentication
-
-The daemon spawns Claude Code sessions, which require authentication. Either:
+## Getting Started
 
 ```bash
-# Option A: Anthropic API key
-export ANTHROPIC_API_KEY=<your-key>
-
-# Option B: Claude Max/Pro subscription (OAuth token via `claude setup-token`)
-export CLAUDE_CODE_OAUTH_TOKEN=<token>
+cd ~/projects/myapp
+breq init
 ```
 
-## Breq Usage
+This does two things:
+1. Creates `.toren.kdl` in your repo with auto-discovered workspace hooks (copying `node_modules`, sharing `.beads`, etc.)
+2. Offers to register your project directory in `~/.toren/config.toml` so breq can find it
+
+Then start a Claude session:
 
 ```bash
-# Start the daemon (optional - for web UI and remote access)
-toren-daemon
+breq cmd -p "Add input validation to the signup form"
+```
 
-# Assign work to Claude
-breq assign <bead-id>              # Assign a bead task
-breq assign --prompt "Build X"    # Quick task from prompt
+Breq creates a workspace (git worktree or jj workspace), runs your setup hooks, and launches Claude Code with your prompt. Each ancillary gets a named workspace ("one", "two", etc.).
 
-# Manage assignments
+## Breq CLI
+
+```bash
+# Start a session with a prompt
+breq cmd -p <prompt>              # Launch Claude in a new/reused workspace
+breq cmd -i <intent>              # Use a configured prompt template
+bd show proj-123 | breq cmd       # Prompt from stdin
+
+# Manage active sessions
 breq list                          # Show active assignments
-breq resume <ref>                  # Continue work on assignment
-breq approve <ref>                 # Accept completed work
-breq abort <ref>                   # Discard and cleanup
+breq clean <workspace>             # Teardown workspace and cleanup
 
-# Navigate to workspaces
-breq go <workspace>                # Spawn shell in workspace
-breq go <workspace> -- <cmd>       # Run command in workspace
+# Work in a workspace directly
+breq run <workspace>               # Spawn shell in workspace
+breq run <workspace> -- <cmd>      # Run command in workspace
 ```
 
-## Web Interface
+## Workspace Hooks (.toren.kdl)
 
-The web UI provides mobile-friendly access to your Toren sessions. Note: significant functionality is still missing.
-
-```bash
-cd web && pnpm install && pnpm dev
-# Open http://localhost:5173
-```
-
-## Workspace Hooks
-
-Toren uses `.toren.kdl` to customize setup and teardown of workspaces. Generate a starter config with:
-
-```bash
-breq init             # Auto-discovers common patterns (.beads, node_modules, target, etc.)
-breq init --stealth   # Same, but adds .toren.kdl to .git/info/exclude
-```
-
-### Manual Configuration
-
-Add a `.toren.kdl` file to your repo root:
+The `.toren.kdl` file in your repo root configures workspace setup and teardown:
 
 ```kdl
+vars {
+    web_port expr="30000 + {{ ws.num }}"
+}
+
 setup {
-    template src=".env.breq" dest=".env"
-    copy src="config.example.json" dest="config.json"
     copy src="node_modules"
     share src=".beads"
     run "pnpm install"
-    run "just migrate"
+    proxy http upstream.vars="vars.web_port"
 }
 
 destroy {
@@ -113,31 +91,19 @@ destroy {
 ```
 
 **Actions:**
-- `template src="..." dest="..."` - Copy and render with workspace context
-- `copy src="..." [dest="..."]` - Copy file/directory using CoW when available
-- `share src="..."` - Symlink to shared content (e.g., `.beads` directory)
+- `copy src="..."` - Copy file/directory using CoW when available
+- `share src="..."` - Symlink to shared content
+- `template src="..." dest="..."` - Copy and render with workspace template variables
 - `run "command"` - Execute shell command
+- `proxy` - Register a reverse proxy route via [Station](station/README.md)
 
-For `copy`, `dest` defaults to `src` (or basename if `src` is absolute).
+**Template variables:** `{{ ws.name }}`, `{{ ws.num }}`, `{{ ws.path }}`, `{{ repo.root }}`, `{{ repo.name }}`
 
-**Template variables:**
-```
-{{ ws.name }}    # Workspace name (e.g., "one", "two")
-{{ ws.num }}     # Ancillary number (1, 2, etc.)
-{{ ws.path }}    # Full workspace path
-{{ repo.root }}  # Repository root path
-{{ repo.name }}  # Repository name
-```
+## More
 
-Example `.env.breq` template:
-```env
-PORT={{ 5173 + ws.num }}
-DATABASE_URL=postgres://localhost/myapp_{{ ws.name }}
-```
-
-## Documentation
-
+- [Configuration](docs/configuration.md) - Global config, proxy, intents, and aliases
+- [Toren Daemon](daemon/README.md) - REST + WebSocket API for programmatic workspace and agent management
+- [Station](station/README.md) - Reverse proxy management for per-workspace local domains
 - [docs/CONCEPTS.md](docs/CONCEPTS.md) - Naming and metaphor
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Technical design
-- [docs/SEGMENTS.md](docs/SEGMENTS.md) - Segment configuration
 
