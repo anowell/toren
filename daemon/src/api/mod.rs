@@ -12,7 +12,6 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
 use crate::ancillary::{AncillaryManager, WorkManager};
-use crate::caddy::CaddyManager;
 use crate::plugins::PluginManager;
 use crate::security::SecurityContext;
 use crate::services::Services;
@@ -36,7 +35,6 @@ pub struct AppState {
     pub segments: Arc<std::sync::RwLock<SegmentManager>>,
     pub workspaces: Option<Arc<WorkspaceManager>>,
     pub work_manager: Arc<WorkManager>,
-    pub caddy: Option<Arc<CaddyManager>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -51,7 +49,6 @@ pub async fn serve(
     segment_manager: SegmentManager,
     workspace_manager: Option<WorkspaceManager>,
     mut work_manager: WorkManager,
-    caddy_manager: Option<CaddyManager>,
 ) -> Result<()> {
     let assignments = Arc::new(RwLock::new(assignment_manager));
 
@@ -68,7 +65,6 @@ pub async fn serve(
         segments: Arc::new(std::sync::RwLock::new(segment_manager)),
         workspaces: workspace_manager.map(Arc::new),
         work_manager: Arc::new(work_manager),
-        caddy: caddy_manager.map(Arc::new),
     };
 
     let app = Router::new()
@@ -107,8 +103,6 @@ pub async fn serve(
         .route("/api/segments/create", post(segments_create))
         .route("/api/workspaces/list/:segment", get(workspaces_list))
         .route("/api/workspaces/cleanup", post(workspaces_cleanup))
-        .route("/api/workspaces/proxy", post(workspaces_proxy))
-        .route("/api/proxy/routes", get(proxy_routes_list))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -365,12 +359,10 @@ async fn workspaces_cleanup(
         })));
     }
 
-    let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
     match ws_mgr.cleanup_workspace(
         &segment_path,
         &request.segment,
         &request.workspace,
-        proxy_config,
         toren_lib::workspace::CleanupMode::Abort,
     ) {
         Ok(_result) => Ok(Json(serde_json::json!({
@@ -385,139 +377,6 @@ async fn workspaces_cleanup(
             })))
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkspaceProxyRequest {
-    segment: String,
-    workspace: String,
-    /// Explicit port mappings (e.g., ["80:30001", "443:30002"])
-    #[serde(default)]
-    port_mappings: Vec<String>,
-    /// Override TLS setting for explicit port mappings
-    tls: Option<bool>,
-}
-
-async fn workspaces_proxy(
-    State(state): State<AppState>,
-    Json(request): Json<WorkspaceProxyRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let ws_mgr = state.workspaces.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({"error": "workspace_root not configured"})),
-    ))?;
-
-    let caddy = state.caddy.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({"error": "proxy not enabled"})),
-    ))?;
-
-    let segment_path = {
-        let segments = state.segments.read().unwrap();
-        segments
-            .find_by_name(&request.segment)
-            .map(|s| s.path.clone())
-    };
-
-    let segment_path = segment_path.ok_or((
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error": format!("Segment not found: {}", request.segment)})),
-    ))?;
-
-    // Verify workspace exists
-    if !ws_mgr.workspace_exists(&request.segment, &request.workspace) {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Workspace not found: {}", request.workspace)})),
-        ));
-    }
-
-    let proxy_config = caddy.proxy_config();
-    let directives = if request.port_mappings.is_empty() {
-        // Re-evaluate .toren.kdl proxy directives
-        ws_mgr
-            .evaluate_proxy_directives(
-                &segment_path,
-                &request.segment,
-                &request.workspace,
-                Some(proxy_config),
-            )
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Failed to evaluate proxy directives: {}", e)})),
-                )
-            })?
-    } else {
-        // Construct directives from explicit port mappings
-        let domain = &proxy_config.domain;
-        let repo_name = segment_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-        let default_host = format!("{}.{}.{}", request.workspace, repo_name, domain);
-        let default_tls = request.tls.unwrap_or(proxy_config.tls);
-
-        let mut directives = Vec::new();
-        for mapping in &request.port_mappings {
-            let parts: Vec<&str> = mapping.splitn(2, ':').collect();
-            if parts.len() != 2 {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("Invalid port mapping: {} (expected port:upstream)", mapping)})),
-                ));
-            }
-            let port: u16 = parts[0].parse().map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("Invalid port: {}", parts[0])})),
-                )
-            })?;
-            directives.push(toren_lib::workspace_setup::ProxyDirective {
-                host: default_host.clone(),
-                upstream: parts[1].to_string(),
-                tls: default_tls,
-                port,
-            });
-        }
-        directives
-    };
-
-    // Register routes in Caddy
-    if let Err(e) = caddy.add_routes(&directives).await {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to add Caddy routes: {}", e)})),
-        ));
-    }
-
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "directives": directives,
-        "count": directives.len(),
-    })))
-}
-
-async fn proxy_routes_list(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let caddy = state.caddy.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({"error": "proxy not enabled"})),
-    ))?;
-
-    let routes = caddy.list_routes().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to list routes: {}", e)})),
-        )
-    })?;
-
-    let count = routes.len();
-    Ok(Json(serde_json::json!({
-        "routes": routes,
-        "count": count,
-    })))
 }
 
 // ==================== Composite Status Helper ====================
@@ -726,14 +585,12 @@ async fn assignments_create(
     let ws_name = toren_lib::number_to_word(ancillary_num).to_lowercase();
 
     // Create workspace (with setup hooks)
-    let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
-    let (ws_path, setup_result) = ws_mgr
+    let (ws_path, _setup_result) = ws_mgr
         .create_workspace_with_setup(
             &segment_path,
             &request.segment,
             &ws_name,
             ancillary_num,
-            proxy_config,
         )
         .map_err(|e| {
             (
@@ -741,13 +598,6 @@ async fn assignments_create(
                 Json(serde_json::json!({"error": format!("Failed to create workspace: {}", e)})),
             )
         })?;
-
-    // Add Caddy routes if proxy directives were generated
-    if let Some(ref caddy) = state.caddy {
-        if let Err(e) = caddy.add_routes(&setup_result.proxy_directives).await {
-            tracing::warn!("Failed to add Caddy routes: {}", e);
-        }
-    }
 
     // Create assignment
     let assignment = if let Some(prompt) = original_prompt {
@@ -938,12 +788,10 @@ async fn assignments_complete(
         &segment_path,
     );
 
-    let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
     let opts = toren_lib::CompleteOptions {
         push: request.push,
         keep_open: request.keep_open,
         segment_path: &segment_path,
-        proxy_config,
         kill: request.kill,
         auto_commit_message,
     };
@@ -959,13 +807,6 @@ async fn assignments_complete(
                 (status, Json(serde_json::json!({"error": e.to_string()})))
             },
         )?;
-
-    // Remove Caddy routes from destroy directives
-    if let Some(ref caddy) = state.caddy {
-        if let Err(e) = caddy.remove_routes(&result.destroy_directives).await {
-            tracing::warn!("Failed to remove Caddy routes: {}", e);
-        }
-    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1022,15 +863,13 @@ async fn assignments_abort(
         ),
     ))?;
 
-    let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
     let opts = toren_lib::AbortOptions {
         close_bead: request.close_bead,
         segment_path: &segment_path,
-        proxy_config,
         kill: request.kill,
     };
 
-    let abort_result = toren_lib::abort_assignment(&assignment, &mut assignments, ws_mgr, &opts).map_err(|e| {
+    toren_lib::abort_assignment(&assignment, &mut assignments, ws_mgr, &opts).map_err(|e| {
         let status = if e.downcast_ref::<toren_lib::WorkspaceProcessesRunning>().is_some() {
             StatusCode::CONFLICT
         } else {
@@ -1038,13 +877,6 @@ async fn assignments_abort(
         };
         (status, Json(serde_json::json!({"error": e.to_string()})))
     })?;
-
-    // Remove Caddy routes from destroy directives
-    if let Some(ref caddy) = state.caddy {
-        if let Err(e) = caddy.remove_routes(&abort_result.destroy_directives).await {
-            tracing::warn!("Failed to remove Caddy routes: {}", e);
-        }
-    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1098,12 +930,10 @@ async fn assignments_resume(
         ),
     ))?;
 
-    let proxy_config = state.caddy.as_ref().map(|c| c.proxy_config());
     let opts = toren_lib::ResumeOptions {
         instruction: request.instruction.as_deref(),
         segment_path: &segment_path,
         segment_name: &assignment.segment,
-        proxy_config,
     };
 
     let resume_result =

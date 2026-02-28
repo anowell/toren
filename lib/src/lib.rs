@@ -16,11 +16,11 @@ pub use assignment::{
 };
 pub use assignment_ops::{
     abort_assignment, clean_assignment, complete_assignment, prepare_resume,
-    render_auto_commit_message, AbortOptions, AbortResult, CleanOptions, CleanResult,
+    render_auto_commit_message, AbortOptions, CleanOptions, CleanResult,
     CompleteOptions, CompleteResult, ResumeOptions, ResumeResult,
 };
 pub use composite_status::CompositeStatus;
-pub use config::{Config, IntentsConfig, ProxyConfig};
+pub use config::{Config, IntentsConfig};
 pub use segments::{Segment, SegmentManager};
 pub use tasks::{fetch_task, generate_prompt, Task, TaskProvider};
 pub use workspace::{
@@ -29,6 +29,6 @@ pub use workspace::{
 };
 pub use process::{ProcessInfo, WorkspaceProcessesRunning};
 pub use workspace_setup::{
-    render_template, BreqConfig, ConfigContext, ProxyContext, ProxyDirective, SetupResult, TaskInfo,
+    render_template, BreqConfig, SetupResult, TaskInfo,
     WorkspaceContext, WorkspaceInfo, WorkspaceSetup, RepoInfo,
 };

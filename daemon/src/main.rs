@@ -1,11 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
-use tracing::{info, warn, Level};
+use tracing::{info, Level};
 
 mod ancillary;
 mod api;
-mod caddy;
 mod plugins;
 mod security;
 mod services;
@@ -77,28 +76,18 @@ async fn main() -> Result<()> {
     info!("Segment manager initialized");
 
     // Initialize workspace manager (if workspace_root is configured)
+    let local_domain = Some(config.local_domain.clone());
     let workspace_manager = config.ancillary.workspace_root.clone().map(|root| {
         info!(
             "Workspace manager initialized with root: {}",
             root.display()
         );
-        WorkspaceManager::new(root)
+        WorkspaceManager::new(root, local_domain.clone())
     });
 
     // Initialize work manager (for embedded ancillary runtime)
     let work_manager = ancillary::WorkManager::new();
     info!("Work manager initialized");
-
-    // Initialize Caddy manager if proxy is enabled
-    let caddy_manager = if config.proxy.enabled {
-        let cm = caddy::CaddyManager::new(config.proxy.clone());
-        if let Err(e) = cm.ensure_server().await {
-            warn!("Failed to initialize Caddy server: {}", e);
-        }
-        Some(cm)
-    } else {
-        None
-    };
 
     // Start API server
     let addr = format!("{}:{}", config.host(), config.port());
@@ -115,7 +104,6 @@ async fn main() -> Result<()> {
         segment_manager,
         workspace_manager,
         work_manager,
-        caddy_manager,
     )
     .await?;
 

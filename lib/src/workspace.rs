@@ -49,8 +49,7 @@ fn spawn_background_cleanup(parent: PathBuf) {
     });
 }
 
-use crate::config::ProxyConfig;
-use crate::workspace_setup::{BreqConfig, ProxyDirective, SetupResult, WorkspaceSetup};
+use crate::workspace_setup::{BreqConfig, SetupResult, WorkspaceSetup};
 
 /// Version control system type for a repository
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -822,10 +821,11 @@ impl VcsBackend for GitWorktreeBackend {
 /// to the appropriate backend (jj or git) based on segment repo type.
 pub struct WorkspaceManager {
     workspace_root: PathBuf,
+    local_domain: Option<String>,
 }
 
 impl WorkspaceManager {
-    pub fn new(workspace_root: PathBuf) -> Self {
+    pub fn new(workspace_root: PathBuf, local_domain: Option<String>) -> Self {
         // Make workspace_root absolute if it's relative
         let workspace_root = if workspace_root.is_absolute() {
             workspace_root
@@ -834,7 +834,7 @@ impl WorkspaceManager {
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(&workspace_root)
         };
-        Self { workspace_root }
+        Self { workspace_root, local_domain }
     }
 
     /// Get the VCS backend for a segment based on repo type detection
@@ -1019,22 +1019,15 @@ impl WorkspaceManager {
         segment_path: &Path,
         segment_name: &str,
         workspace_name: &str,
-        proxy_config: Option<&ProxyConfig>,
         mode: CleanupMode,
     ) -> Result<SetupResult> {
         let ws_path = self.workspace_path(segment_name, workspace_name);
-        let mut result = SetupResult::default();
 
         // Run destroy hooks if workspace exists
         if ws_path.exists() {
-            match self.run_destroy(segment_path, &ws_path, workspace_name, proxy_config) {
-                Ok(destroy_result) => {
-                    result = destroy_result;
-                }
-                Err(e) => {
-                    warn!("Workspace destroy hooks failed: {}", e);
-                    // Continue with cleanup even if destroy fails
-                }
+            if let Err(e) = self.run_destroy(segment_path, &ws_path, workspace_name) {
+                warn!("Workspace destroy hooks failed: {}", e);
+                // Continue with cleanup even if destroy fails
             }
         }
 
@@ -1045,7 +1038,7 @@ impl WorkspaceManager {
         // Delete workspace directory (if VCS removal didn't already do it)
         self.delete_workspace(segment_name, workspace_name)?;
 
-        Ok(result)
+        Ok(SetupResult)
     }
 
     /// List workspaces for a segment
@@ -1066,11 +1059,10 @@ impl WorkspaceManager {
         workspace_path: &Path,
         workspace_name: &str,
         ancillary_num: u32,
-        proxy_config: Option<&ProxyConfig>,
     ) -> Result<SetupResult> {
         if !BreqConfig::exists(segment_path) {
             debug!("No .toren.kdl found, skipping setup");
-            return Ok(SetupResult::default());
+            return Ok(SetupResult);
         }
 
         let setup = WorkspaceSetup::new(
@@ -1078,9 +1070,10 @@ impl WorkspaceManager {
             workspace_path.to_path_buf(),
             workspace_name.to_string(),
             ancillary_num,
+            self.local_domain.clone(),
         );
 
-        setup.run_setup(proxy_config)
+        setup.run_setup()
     }
 
     /// Run workspace destroy hooks if .toren.kdl exists
@@ -1089,11 +1082,10 @@ impl WorkspaceManager {
         segment_path: &Path,
         workspace_path: &Path,
         workspace_name: &str,
-        proxy_config: Option<&ProxyConfig>,
     ) -> Result<SetupResult> {
         if !BreqConfig::exists(segment_path) {
             debug!("No .toren.kdl found, skipping destroy");
-            return Ok(SetupResult::default());
+            return Ok(SetupResult);
         }
 
         let setup = WorkspaceSetup::new(
@@ -1101,31 +1093,10 @@ impl WorkspaceManager {
             workspace_path.to_path_buf(),
             workspace_name.to_string(),
             0, // ancillary_num not available during destroy
+            self.local_domain.clone(),
         );
 
-        setup.run_destroy(proxy_config)
-    }
-
-    /// Evaluate proxy directives from .toren.kdl for an existing workspace
-    /// without running other setup actions. Used to refresh Caddy routes.
-    pub fn evaluate_proxy_directives(
-        &self,
-        segment_path: &Path,
-        segment_name: &str,
-        workspace_name: &str,
-        proxy_config: Option<&ProxyConfig>,
-    ) -> Result<Vec<ProxyDirective>> {
-        let ws_path = self.workspace_path(segment_name, workspace_name);
-        let ancillary_num = crate::word_to_number(workspace_name).unwrap_or(0);
-
-        let setup = WorkspaceSetup::new(
-            segment_path.to_path_buf(),
-            ws_path,
-            workspace_name.to_string(),
-            ancillary_num,
-        );
-
-        setup.evaluate_proxy_directives(proxy_config)
+        setup.run_destroy()
     }
 
     /// Create workspace and run setup hooks.
@@ -1136,7 +1107,6 @@ impl WorkspaceManager {
         segment_name: &str,
         workspace_name: &str,
         ancillary_num: u32,
-        proxy_config: Option<&ProxyConfig>,
     ) -> Result<(PathBuf, SetupResult)> {
         let ws_path = self.create_workspace(segment_path, segment_name, workspace_name)?;
 
@@ -1146,7 +1116,6 @@ impl WorkspaceManager {
             &ws_path,
             workspace_name,
             ancillary_num,
-            proxy_config,
         ) {
             Ok(setup_result) => Ok((ws_path, setup_result)),
             Err(e) => {
@@ -1159,7 +1128,6 @@ impl WorkspaceManager {
                     segment_path,
                     segment_name,
                     workspace_name,
-                    None,
                     CleanupMode::Abort,
                 ) {
                     warn!("Rollback cleanup also failed: {}", rollback_err);
@@ -1212,7 +1180,7 @@ mod tests {
 
     #[test]
     fn test_workspace_manager_path() {
-        let mgr = WorkspaceManager::new(PathBuf::from("/tmp/workspaces"));
+        let mgr = WorkspaceManager::new(PathBuf::from("/tmp/workspaces"), None);
         assert_eq!(
             mgr.workspace_path("toren", "one"),
             PathBuf::from("/tmp/workspaces/toren/one")
@@ -1221,7 +1189,7 @@ mod tests {
 
     #[test]
     fn test_workspace_exists_nonexistent() {
-        let mgr = WorkspaceManager::new(PathBuf::from("/tmp/nonexistent-ws-root"));
+        let mgr = WorkspaceManager::new(PathBuf::from("/tmp/nonexistent-ws-root"), None);
         assert!(!mgr.workspace_exists("toren", "one"));
     }
 
@@ -1364,7 +1332,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let mgr = WorkspaceManager::new(ws_root);
+        let mgr = WorkspaceManager::new(ws_root, None);
 
         // Detect repo type
         assert_eq!(mgr.repo_type(&repo_path), Some(RepoType::Git));
@@ -1380,7 +1348,7 @@ mod tests {
         assert!(workspaces.contains(&"one".to_string()));
 
         // Cleanup
-        mgr.cleanup_workspace(&repo_path, "repo", "one", None, CleanupMode::Abort)
+        mgr.cleanup_workspace(&repo_path, "repo", "one", CleanupMode::Abort)
             .expect("Should cleanup");
         assert!(!ws_path.exists());
     }

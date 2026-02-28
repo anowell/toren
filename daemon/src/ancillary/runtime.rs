@@ -160,7 +160,6 @@ impl AncillaryWork {
                         title: task_title,
                     }),
                     vars: std::collections::HashMap::new(),
-                    config: None,
                 };
                 // TODO: read intent template from config (requires passing config to work loop)
                 let template = toren_lib::config::IntentsConfig::default()

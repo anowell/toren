@@ -9,9 +9,9 @@ use std::path::Path;
 use tracing::info;
 
 use crate::assignment::{AssignmentManager, CompletionReason};
-use crate::config::{AncillaryConfig, ProxyConfig};
+use crate::config::AncillaryConfig;
 use crate::workspace::{CleanupMode, CommitInfo, WorkspaceManager};
-use crate::workspace_setup::{ProxyDirective, SetupResult, WorkspaceContext, WorkspaceInfo, RepoInfo, TaskInfo};
+use crate::workspace_setup::{SetupResult, WorkspaceContext, WorkspaceInfo, RepoInfo, TaskInfo};
 use crate::Assignment;
 
 /// Options for completing an assignment
@@ -22,8 +22,6 @@ pub struct CompleteOptions<'a> {
     pub keep_open: bool,
     /// Segment path for running workspace hooks and bead commands
     pub segment_path: &'a Path,
-    /// Proxy configuration (for destroy hooks)
-    pub proxy_config: Option<&'a ProxyConfig>,
     /// Whether to kill processes running in the workspace
     pub kill: bool,
     /// Auto-commit message (rendered template). If Some, auto-commit before capture.
@@ -36,8 +34,6 @@ pub struct CompleteResult {
     pub revision: Option<String>,
     /// Whether changes were pushed
     pub pushed: bool,
-    /// Proxy directives from destroy hooks (to remove routes)
-    pub destroy_directives: Vec<ProxyDirective>,
     /// Commits exclusive to this workspace (captured before cleanup)
     pub workspace_info: Vec<CommitInfo>,
 }
@@ -48,16 +44,8 @@ pub struct AbortOptions<'a> {
     pub close_bead: bool,
     /// Segment path for running workspace hooks and bead commands
     pub segment_path: &'a Path,
-    /// Proxy configuration (for destroy hooks)
-    pub proxy_config: Option<&'a ProxyConfig>,
     /// Whether to kill processes running in the workspace
     pub kill: bool,
-}
-
-/// Result from aborting an assignment
-pub struct AbortResult {
-    /// Proxy directives from destroy hooks (to remove routes)
-    pub destroy_directives: Vec<ProxyDirective>,
 }
 
 /// Options for preparing a resume
@@ -68,8 +56,6 @@ pub struct ResumeOptions<'a> {
     pub segment_path: &'a Path,
     /// Segment name
     pub segment_name: &'a str,
-    /// Proxy configuration (for setup hooks if workspace is recreated)
-    pub proxy_config: Option<&'a ProxyConfig>,
 }
 
 /// Result from preparing a resume
@@ -78,7 +64,7 @@ pub struct ResumeResult {
     pub prompt: String,
     /// Whether the workspace was recreated
     pub workspace_recreated: bool,
-    /// Proxy directives from setup hooks (if workspace was recreated)
+    /// Setup result (if workspace was recreated)
     pub setup_result: SetupResult,
 }
 
@@ -88,8 +74,6 @@ pub struct CleanOptions<'a> {
     pub push: bool,
     /// Segment path for running workspace hooks
     pub segment_path: &'a Path,
-    /// Proxy configuration (for destroy hooks)
-    pub proxy_config: Option<&'a ProxyConfig>,
     /// Whether to kill processes running in the workspace
     pub kill: bool,
     /// Auto-commit message (rendered template). If Some, auto-commit before capture.
@@ -149,7 +133,6 @@ pub fn render_auto_commit_message(
             title: task_title,
         }),
         vars: std::collections::HashMap::new(),
-        config: None,
     };
     crate::workspace_setup::render_template(&ancillary_config.auto_commit_message, &ctx).ok()
 }
@@ -167,7 +150,6 @@ pub fn complete_assignment(
     let mut result = CompleteResult {
         revision: None,
         pushed: false,
-        destroy_directives: Vec::new(),
         workspace_info: Vec::new(),
     };
 
@@ -214,15 +196,13 @@ pub fn complete_assignment(
     let cleanup_mode = CleanupMode::Complete {
         pushed: result.pushed,
     };
-    let destroy_result = cleanup_workspace(
+    cleanup_workspace(
         assignment,
         ws_mgr,
         opts.segment_path,
-        opts.proxy_config,
         opts.kill,
         cleanup_mode,
     )?;
-    result.destroy_directives = destroy_result.proxy_directives;
 
     // Record completion history and remove assignment from active storage
     assignment_mgr.record_completion(
@@ -251,13 +231,12 @@ pub fn abort_assignment(
     assignment_mgr: &mut AssignmentManager,
     ws_mgr: &WorkspaceManager,
     opts: &AbortOptions,
-) -> Result<AbortResult> {
+) -> Result<()> {
     // Cleanup workspace if it exists
-    let destroy_result = cleanup_workspace(
+    cleanup_workspace(
         assignment,
         ws_mgr,
         opts.segment_path,
-        opts.proxy_config,
         opts.kill,
         CleanupMode::Abort,
     )?;
@@ -279,9 +258,7 @@ pub fn abort_assignment(
         }
     }
 
-    Ok(AbortResult {
-        destroy_directives: destroy_result.proxy_directives,
-    })
+    Ok(())
 }
 
 /// Prepare an assignment for resuming: recreate workspace if missing,
@@ -296,7 +273,7 @@ pub fn prepare_resume(
     opts: &ResumeOptions,
 ) -> Result<ResumeResult> {
     let mut workspace_recreated = false;
-    let mut setup_result = SetupResult::default();
+    let mut setup_result = SetupResult;
 
     // Recreate workspace if missing
     if !assignment.workspace_path.exists() {
@@ -316,7 +293,6 @@ pub fn prepare_resume(
             opts.segment_name,
             ws_name,
             ancillary_num,
-            opts.proxy_config,
         )?;
         setup_result = result;
         workspace_recreated = true;
@@ -420,7 +396,6 @@ pub fn clean_assignment(
         assignment,
         ws_mgr,
         opts.segment_path,
-        opts.proxy_config,
         opts.kill,
         cleanup_mode,
     )?;
@@ -446,7 +421,6 @@ fn cleanup_workspace(
     assignment: &Assignment,
     ws_mgr: &WorkspaceManager,
     segment_path: &Path,
-    proxy_config: Option<&ProxyConfig>,
     kill: bool,
     mode: CleanupMode,
 ) -> Result<SetupResult> {
@@ -480,7 +454,7 @@ fn cleanup_workspace(
             .unwrap_or_else(|| assignment.segment.clone());
 
         let result =
-            ws_mgr.cleanup_workspace(segment_path, &segment_name, ws_name, proxy_config, mode)?;
+            ws_mgr.cleanup_workspace(segment_path, &segment_name, ws_name, mode)?;
         info!("Workspace cleaned up for assignment {}", assignment.id);
         Ok(result)
     } else {
@@ -488,6 +462,6 @@ fn cleanup_workspace(
             "Workspace already gone for assignment {}",
             assignment.id
         );
-        Ok(SetupResult::default())
+        Ok(SetupResult)
     }
 }

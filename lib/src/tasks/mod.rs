@@ -47,7 +47,6 @@ pub fn generate_prompt(task: &Task, template: &str) -> String {
             name: String::new(),
         },
         vars: std::collections::HashMap::new(),
-        config: None,
         task: Some(crate::workspace_setup::TaskInfo {
             id: task.id.clone(),
             title: task.title.clone(),

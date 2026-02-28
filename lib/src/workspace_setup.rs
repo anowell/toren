@@ -4,8 +4,8 @@
 //! using `.toren.kdl` configuration files. It supports these primitive actions:
 //! - `template`: Copy and render files with workspace context
 //! - `copy`: Copy files verbatim
-//! - `run`: Execute shell commands
-//! - `proxy`: Declare a reverse-proxy route (returned as a directive)
+//! - `run`: Execute shell commands (auto-gets `STATION_DOMAIN` env var)
+//! - `proxy`: Manage station reverse-proxy routes (auto-cleanup on destroy)
 
 use anyhow::{Context, Result};
 use clonetree::Options as CloneOptions;
@@ -18,8 +18,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, trace, warn};
 
-use crate::config::ProxyConfig;
-
 const TOREN_CONFIG_FILE: &str = ".toren.kdl";
 
 /// Extract an i64 from a KdlValue (kdl 6.x uses i128 internally)
@@ -28,7 +26,7 @@ fn kdl_value_as_i64(val: &kdl::KdlValue) -> Option<i64> {
 }
 
 /// Render a template string with workspace context using minijinja.
-/// Available variables: ws.name, ws.num, ws.path, repo.root, repo.name, task.id, task.title, vars.*, config.*
+/// Available variables: ws.name, ws.num, ws.path, repo.root, repo.name, task.id, task.title, vars.*
 pub fn render_template(template: &str, ctx: &WorkspaceContext) -> Result<String> {
     let mut env = Environment::new();
     env.add_template("inline", template)?;
@@ -38,7 +36,6 @@ pub fn render_template(template: &str, ctx: &WorkspaceContext) -> Result<String>
         repo => ctx.repo,
         task => ctx.task,
         vars => ctx.vars,
-        config => ctx.config,
     })?;
     Ok(rendered)
 }
@@ -74,21 +71,6 @@ pub struct WorkspaceContext {
     pub task: Option<TaskInfo>,
     #[serde(default)]
     pub vars: HashMap<String, serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub config: Option<ConfigContext>,
-}
-
-/// Config context exposed to templates
-#[derive(Debug, Clone, Serialize)]
-pub struct ConfigContext {
-    pub proxy: ProxyContext,
-}
-
-/// Proxy config exposed to templates
-#[derive(Debug, Clone, Serialize)]
-pub struct ProxyContext {
-    pub domain: String,
-    pub tls: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,7 +132,6 @@ pub fn evaluate_vars(
                     repo => ctx.repo,
                     task => ctx.task,
                     vars => &result,
-                    config => ctx.config,
                 })?;
 
                 // Try to parse as integer, otherwise store as string
@@ -205,18 +186,6 @@ impl AttrValue {
     }
 }
 
-/// Get an attribute value from a KDL node, checking for `.var` suffix first.
-/// If `name.var` exists, returns `AttrValue::VarRef`; otherwise checks `name` for a literal.
-fn get_attr(node: &KdlNode, name: &str) -> Option<AttrValue> {
-    let var_name = format!("{}.var", name);
-    if let Some(val) = node.get(&*var_name).and_then(|v| v.as_string()) {
-        return Some(AttrValue::VarRef(val.to_string()));
-    }
-    node.get(name)
-        .and_then(|v| v.as_string())
-        .map(|s| AttrValue::Literal(s.to_string()))
-}
-
 // ==================== Actions ====================
 
 /// An action to execute during setup or destroy
@@ -237,12 +206,12 @@ pub enum Action {
         command: String,
         cwd: Option<String>,
     },
-    /// Declare a reverse-proxy route
+    /// Manage a station reverse-proxy route
     Proxy {
         port: u16,
         upstream: AttrValue,
-        tls: Option<bool>,
-        host: Option<AttrValue>,
+        tls: bool,
+        name: Option<String>,
     },
 }
 
@@ -265,63 +234,9 @@ pub struct ParsedAction {
     pub on_fail: OnFail,
 }
 
-/// A resolved proxy directive ready for Caddy configuration
-#[derive(Debug, Clone, Serialize)]
-pub struct ProxyDirective {
-    /// The hostname to match (e.g., "one.toren.lvh.me")
-    pub host: String,
-    /// The upstream URL (e.g., "http://localhost:5173")
-    pub upstream: String,
-    /// Whether to use TLS
-    pub tls: bool,
-    /// The workspace port
-    pub port: u16,
-}
-
-/// Resolve a proxy action into a ProxyDirective by evaluating upstream, host, and tls.
-fn resolve_proxy_directive(
-    action: &Action,
-    ctx: &WorkspaceContext,
-    proxy_config: Option<&ProxyConfig>,
-) -> Result<ProxyDirective> {
-    let Action::Proxy {
-        port,
-        upstream,
-        tls,
-        host,
-    } = action
-    else {
-        anyhow::bail!("resolve_proxy_directive called with non-proxy action");
-    };
-
-    let resolved_upstream = upstream
-        .resolve(ctx)
-        .context("failed to resolve upstream")?;
-    let resolved_host = if let Some(h) = host {
-        h.resolve(ctx).context("failed to resolve host")?
-    } else {
-        let domain = proxy_config
-            .map(|pc| pc.domain.as_str())
-            .unwrap_or("lvh.me");
-        format!("{}.{}.{}", ctx.ws.name, ctx.repo.name, domain)
-    };
-    let resolved_tls =
-        tls.unwrap_or_else(|| proxy_config.map(|pc| pc.tls).unwrap_or(false));
-
-    Ok(ProxyDirective {
-        host: resolved_host,
-        upstream: resolved_upstream,
-        tls: resolved_tls,
-        port: *port,
-    })
-}
-
 /// Result from running setup or destroy actions
 #[derive(Debug, Default)]
-pub struct SetupResult {
-    /// Proxy directives declared by proxy actions
-    pub proxy_directives: Vec<ProxyDirective>,
-}
+pub struct SetupResult;
 
 // ==================== Config Parsing ====================
 
@@ -513,27 +428,58 @@ impl BreqConfig {
                 Ok(Action::Run { command, cwd })
             }
             "proxy" => {
-                // Support both positional (proxy 443 ...) and named (proxy port=443 ...)
-                let port = node
-                    .get("port")
-                    .and_then(kdl_value_as_i64)
-                    .or_else(|| {
-                        node.entries()
-                            .iter()
-                            .find(|e| e.name().is_none())
-                            .and_then(|e| kdl_value_as_i64(e.value()))
-                    })
-                    .context("proxy requires port= attribute or port number as first argument")?
-                    as u16;
-                let upstream = get_attr(node, "upstream")
-                    .context("proxy requires upstream= or upstream.var= attribute")?;
-                let tls = node.get("tls").and_then(|v| v.as_bool());
-                let host = get_attr(node, "host");
+                // First positional arg: port number or protocol string ("http"/"https")
+                let first = node
+                    .entries()
+                    .iter()
+                    .find(|e| e.name().is_none())
+                    .context("proxy requires a port or protocol argument")?;
+
+                let (port, implicit_tls) = if let Some(n) = kdl_value_as_i64(first.value()) {
+                    (u16::try_from(n).context("proxy port must be a valid u16")?, false)
+                } else if let Some(s) = first.value().as_string() {
+                    match s {
+                        "http" => (80, false),
+                        "https" => (443, true),
+                        other => anyhow::bail!(
+                            "proxy protocol must be \"http\" or \"https\", got \"{}\"",
+                            other
+                        ),
+                    }
+                } else {
+                    anyhow::bail!("proxy first argument must be a port number or protocol string");
+                };
+
+                // upstream=: string or integer; supports .var suffix for variable references
+                let upstream = if let Some(var_path) =
+                    node.get("upstream.var").and_then(|v| v.as_string())
+                {
+                    AttrValue::VarRef(var_path.to_string())
+                } else if let Some(s) = node.get("upstream").and_then(|v| v.as_string()) {
+                    AttrValue::Literal(s.to_string())
+                } else if let Some(n) = node.get("upstream").and_then(|v| kdl_value_as_i64(v)) {
+                    AttrValue::Literal(n.to_string())
+                } else {
+                    anyhow::bail!("proxy requires upstream= attribute");
+                };
+
+                // tls=: optional bool (default false, overridden by "https" protocol)
+                let tls = node
+                    .get("tls")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(implicit_tls);
+
+                // name=: optional subdomain prefix
+                let name = node
+                    .get("name")
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_string());
+
                 Ok(Action::Proxy {
                     port,
                     upstream,
                     tls,
-                    host,
+                    name,
                 })
             }
             other => {
@@ -555,6 +501,8 @@ pub struct WorkspaceSetup {
     workspace_name: String,
     /// Ancillary number (0 if unknown)
     ancillary_num: u32,
+    /// Local domain for station proxy (e.g. "lvh.me")
+    local_domain: Option<String>,
 }
 
 impl WorkspaceSetup {
@@ -563,13 +511,57 @@ impl WorkspaceSetup {
         workspace_path: PathBuf,
         workspace_name: String,
         ancillary_num: u32,
+        local_domain: Option<String>,
     ) -> Self {
         Self {
             repo_root,
             workspace_path,
             workspace_name,
             ancillary_num,
+            local_domain,
         }
+    }
+
+    /// Compute the STATION_DOMAIN value: `{repo_name}.{local_domain}`
+    /// Returns None if local_domain is not configured.
+    fn station_domain(&self) -> Option<String> {
+        let repo_name = self
+            .repo_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        self.local_domain
+            .as_ref()
+            .map(|domain| format!("{}.{}", repo_name, domain))
+    }
+
+    /// Compute the station route name for a proxy action.
+    /// If `name` is provided: `{name}.{ws_name}`, otherwise just `{ws_name}`.
+    fn station_name(&self, name: Option<&str>) -> String {
+        match name {
+            Some(n) => format!("{}.{}", n, self.workspace_name),
+            None => self.workspace_name.clone(),
+        }
+    }
+
+    /// Collect unique station names from proxy actions in a setup block.
+    fn collect_proxy_station_names(actions: &[ParsedAction], ws_name: &str) -> Vec<String> {
+        let mut names: Vec<String> = actions
+            .iter()
+            .filter_map(|pa| match &pa.action {
+                Action::Proxy { name, .. } => {
+                    let station_name = match name.as_deref() {
+                        Some(n) => format!("{}.{}", n, ws_name),
+                        None => ws_name.to_string(),
+                    };
+                    Some(station_name)
+                }
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Build workspace context for template rendering
@@ -593,12 +585,11 @@ impl WorkspaceSetup {
             },
             task: None,
             vars: HashMap::new(),
-            config: None,
         }
     }
 
     /// Run the setup block
-    pub fn run_setup(&self, proxy_config: Option<&ProxyConfig>) -> Result<SetupResult> {
+    pub fn run_setup(&self) -> Result<SetupResult> {
         let config = BreqConfig::parse(&self.repo_root)?;
 
         if config.setup.is_empty() && config.vars.is_empty() {
@@ -614,74 +605,28 @@ impl WorkspaceSetup {
 
         let mut ctx = self.build_context();
 
-        // Set config context from proxy config
-        if let Some(pc) = proxy_config {
-            ctx.config = Some(ConfigContext {
-                proxy: ProxyContext {
-                    domain: pc.domain.clone(),
-                    tls: pc.tls,
-                },
-            });
-        }
-
         // Evaluate vars and inject into context
         if !config.vars.is_empty() {
             let vars = evaluate_vars(&config.vars, &ctx)?;
             ctx.vars = vars;
         }
 
-        let result = self.execute_actions(&config.setup, &ctx, proxy_config)?;
+        self.execute_actions(&config.setup, &ctx)?;
 
         info!("Workspace setup complete");
-        Ok(result)
+        Ok(SetupResult)
     }
 
-    /// Evaluate only proxy directives from the setup block without executing other actions.
-    /// Used to refresh Caddy routes for an existing workspace.
-    pub fn evaluate_proxy_directives(
-        &self,
-        proxy_config: Option<&ProxyConfig>,
-    ) -> Result<Vec<ProxyDirective>> {
+    /// Run the destroy block, then auto-forget any proxy routes from the setup block.
+    pub fn run_destroy(&self) -> Result<SetupResult> {
         let config = BreqConfig::parse(&self.repo_root)?;
 
-        if config.setup.is_empty() && config.vars.is_empty() {
-            return Ok(Vec::new());
-        }
+        let has_destroy = !config.destroy.is_empty();
+        let proxy_names = Self::collect_proxy_station_names(&config.setup, &self.workspace_name);
+        let has_proxies = !proxy_names.is_empty();
 
-        let mut ctx = self.build_context();
-
-        if let Some(pc) = proxy_config {
-            ctx.config = Some(ConfigContext {
-                proxy: ProxyContext {
-                    domain: pc.domain.clone(),
-                    tls: pc.tls,
-                },
-            });
-        }
-
-        if !config.vars.is_empty() {
-            let vars = evaluate_vars(&config.vars, &ctx)?;
-            ctx.vars = vars;
-        }
-
-        let mut directives = Vec::new();
-        for (i, parsed) in config.setup.iter().enumerate() {
-            if let Action::Proxy { .. } = &parsed.action {
-                let directive = resolve_proxy_directive(&parsed.action, &ctx, proxy_config)
-                    .with_context(|| format!("Action {} (proxy): resolution failed", i + 1))?;
-                directives.push(directive);
-            }
-        }
-
-        Ok(directives)
-    }
-
-    /// Run the destroy block
-    pub fn run_destroy(&self, proxy_config: Option<&ProxyConfig>) -> Result<SetupResult> {
-        let config = BreqConfig::parse(&self.repo_root)?;
-
-        if config.destroy.is_empty() {
-            debug!("No destroy actions defined");
+        if !has_destroy && !has_proxies {
+            debug!("No destroy actions or proxy routes to clean up");
             return Ok(SetupResult::default());
         }
 
@@ -693,56 +638,39 @@ impl WorkspaceSetup {
 
         let mut ctx = self.build_context();
 
-        // Set config context from proxy config
-        if let Some(pc) = proxy_config {
-            ctx.config = Some(ConfigContext {
-                proxy: ProxyContext {
-                    domain: pc.domain.clone(),
-                    tls: pc.tls,
-                },
-            });
-        }
-
         // Evaluate vars for destroy too
         if !config.vars.is_empty() {
             let vars = evaluate_vars(&config.vars, &ctx)?;
             ctx.vars = vars;
         }
 
-        let result = self.execute_actions(&config.destroy, &ctx, proxy_config)?;
+        if has_destroy {
+            self.execute_actions(&config.destroy, &ctx)?;
+        }
+
+        // Auto-forget proxy routes from setup block (best-effort)
+        for station_name in &proxy_names {
+            if let Err(e) = self.execute_station_forget(station_name) {
+                warn!("Failed to forget station route '{}': {}", station_name, e);
+            }
+        }
 
         info!("Workspace destroy complete");
-        Ok(result)
+        Ok(SetupResult)
     }
 
-    /// Execute a list of actions in order, collecting proxy directives.
+    /// Execute a list of actions in order.
     /// Respects on_fail metadata on each action.
     fn execute_actions(
         &self,
         actions: &[ParsedAction],
         ctx: &WorkspaceContext,
-        proxy_config: Option<&ProxyConfig>,
-    ) -> Result<SetupResult> {
-        let mut result = SetupResult::default();
-
+    ) -> Result<()> {
         for (i, parsed) in actions.iter().enumerate() {
             trace!("Executing action {}: {:?}", i + 1, parsed.action);
-            let res = match &parsed.action {
-                Action::Proxy { .. } => {
-                    resolve_proxy_directive(&parsed.action, ctx, proxy_config)
-                        .map(|directive| {
-                            info!(
-                                "  proxy: {} -> {} (port {})",
-                                directive.host, directive.upstream, directive.port
-                            );
-                            result.proxy_directives.push(directive);
-                        })
-                        .with_context(|| format!("Action {} (proxy): resolution failed", i + 1))
-                }
-                _ => self
-                    .execute_action(&parsed.action, ctx)
-                    .with_context(|| format!("Action {} failed", i + 1)),
-            };
+            let res = self
+                .execute_action(&parsed.action, ctx)
+                .with_context(|| format!("Action {} failed", i + 1));
 
             if let Err(e) = res {
                 match parsed.on_fail {
@@ -753,7 +681,7 @@ impl WorkspaceSetup {
             }
         }
 
-        Ok(result)
+        Ok(())
     }
 
     fn execute_action(&self, action: &Action, ctx: &WorkspaceContext) -> Result<()> {
@@ -762,7 +690,12 @@ impl WorkspaceSetup {
             Action::Copy { src, dest, from } => self.execute_copy(src, dest, from.as_deref(), ctx),
             Action::Share { src, from } => self.execute_share(src, from.as_deref(), ctx),
             Action::Run { command, cwd } => self.execute_run(command, cwd.as_deref()),
-            Action::Proxy { .. } => Ok(()), // handled in execute_actions
+            Action::Proxy {
+                port,
+                upstream,
+                tls,
+                name,
+            } => self.execute_proxy(*port, upstream, *tls, name.as_deref(), ctx),
         }
     }
 
@@ -784,7 +717,6 @@ impl WorkspaceSetup {
             repo => ctx.repo,
             task => ctx.task,
             vars => ctx.vars,
-            config => ctx.config,
         })?;
 
         // Ensure parent directory exists
@@ -921,10 +853,15 @@ impl WorkspaceSetup {
             info!("  run: {}", command);
         }
 
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(&work_dir)
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command).current_dir(&work_dir);
+
+        // Inject STATION_DOMAIN env var if available
+        if let Some(domain) = self.station_domain() {
+            cmd.env("STATION_DOMAIN", &domain);
+        }
+
+        let output = cmd
             .output()
             .with_context(|| format!("Failed to execute: {}", command))?;
 
@@ -945,6 +882,70 @@ impl WorkspaceSetup {
             for line in stdout.lines() {
                 debug!("    {}", line);
             }
+        }
+
+        Ok(())
+    }
+
+    fn execute_proxy(
+        &self,
+        port: u16,
+        upstream: &AttrValue,
+        tls: bool,
+        name: Option<&str>,
+        ctx: &WorkspaceContext,
+    ) -> Result<()> {
+        let upstream_val = upstream.resolve(ctx)?;
+        let station_name = self.station_name(name);
+
+        info!("  proxy: {} -> {} (port {}{})", station_name, upstream_val, port,
+            if tls { ", tls" } else { "" });
+
+        let mut cmd = Command::new("station");
+        cmd.arg("proxy")
+            .arg(&station_name)
+            .arg("-u")
+            .arg(&upstream_val)
+            .arg("-p")
+            .arg(port.to_string());
+
+        if tls {
+            cmd.arg("--tls");
+        }
+
+        if let Some(domain) = self.station_domain() {
+            cmd.env("STATION_DOMAIN", &domain);
+        }
+
+        let output = cmd
+            .output()
+            .with_context(|| format!("Failed to run station proxy for '{}'", station_name))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("station proxy failed for '{}': {}", station_name, stderr.trim());
+        }
+
+        Ok(())
+    }
+
+    fn execute_station_forget(&self, station_name: &str) -> Result<()> {
+        info!("  station forget: {}", station_name);
+
+        let mut cmd = Command::new("station");
+        cmd.arg("forget").arg(station_name);
+
+        if let Some(domain) = self.station_domain() {
+            cmd.env("STATION_DOMAIN", &domain);
+        }
+
+        let output = cmd
+            .output()
+            .with_context(|| format!("Failed to run station forget for '{}'", station_name))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("station forget failed for '{}': {}", station_name, stderr.trim());
         }
 
         Ok(())
@@ -1212,7 +1213,6 @@ setup { }
             },
             task: None,
             vars: HashMap::new(),
-            config: None,
         };
 
         let result = evaluate_vars(&vars, &ctx).unwrap();
@@ -1238,7 +1238,6 @@ setup { }
                 m.insert("upstream_url".to_string(), serde_json::json!("http://localhost:5173"));
                 m
             },
-            config: None,
         };
 
         let attr = AttrValue::VarRef("vars.upstream_url".to_string());
@@ -1249,297 +1248,6 @@ setup { }
 
         let attr = AttrValue::VarRef("ws.num".to_string());
         assert_eq!(attr.resolve(&ctx).unwrap(), "1");
-    }
-
-    #[test]
-    fn test_parse_proxy_action() {
-        let content = r#"
-setup {
-    proxy 5173 upstream="http://localhost:5173"
-}
-"#;
-
-        let config = BreqConfig::parse_kdl(content).unwrap();
-        assert_eq!(config.setup.len(), 1);
-
-        match &config.setup[0].action {
-            Action::Proxy {
-                port,
-                upstream,
-                tls,
-                host,
-            } => {
-                assert_eq!(*port, 5173);
-                match upstream {
-                    AttrValue::Literal(s) => assert_eq!(s, "http://localhost:5173"),
-                    _ => panic!("Expected Literal upstream"),
-                }
-                assert!(tls.is_none());
-                assert!(host.is_none());
-            }
-            _ => panic!("Expected Proxy action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_proxy_action_with_var() {
-        let content = r#"
-vars {
-    upstream_url "http://localhost:5173"
-}
-setup {
-    proxy 5173 upstream.var="vars.upstream_url" host="custom.lvh.me"
-}
-"#;
-
-        let config = BreqConfig::parse_kdl(content).unwrap();
-        assert_eq!(config.setup.len(), 1);
-
-        match &config.setup[0].action {
-            Action::Proxy {
-                port,
-                upstream,
-                host,
-                ..
-            } => {
-                assert_eq!(*port, 5173);
-                match upstream {
-                    AttrValue::VarRef(path) => assert_eq!(path, "vars.upstream_url"),
-                    _ => panic!("Expected VarRef upstream"),
-                }
-                match host.as_ref().unwrap() {
-                    AttrValue::Literal(s) => assert_eq!(s, "custom.lvh.me"),
-                    _ => panic!("Expected Literal host"),
-                }
-            }
-            _ => panic!("Expected Proxy action"),
-        }
-    }
-
-    #[test]
-    fn test_proxy_config_defaults() {
-        let pc = ProxyConfig::default();
-        assert!(!pc.enabled);
-        assert!(!pc.tls);
-        assert_eq!(pc.domain, "lvh.me");
-        assert!(pc.dns_port.is_none());
-    }
-
-    #[test]
-    fn test_default_host_pattern() {
-        let ctx = WorkspaceContext {
-            ws: WorkspaceInfo {
-                name: "one".to_string(),
-                num: 1,
-                path: "/tmp/ws".to_string(),
-            },
-            repo: RepoInfo {
-                root: "/tmp/repo".to_string(),
-                name: "toren".to_string(),
-            },
-            task: None,
-            vars: HashMap::new(),
-            config: None,
-        };
-
-        let pc = ProxyConfig::default();
-        let host = format!("{}.{}.{}", ctx.ws.name, ctx.repo.name, pc.domain);
-        assert_eq!(host, "one.toren.lvh.me");
-    }
-
-    #[test]
-    fn test_parse_proxy_named_port() {
-        let content = r#"
-setup {
-    proxy port=443 upstream="http://localhost:5173" tls=#true
-}
-"#;
-
-        let config = BreqConfig::parse_kdl(content).unwrap();
-        assert_eq!(config.setup.len(), 1);
-
-        match &config.setup[0].action {
-            Action::Proxy { port, upstream, tls, .. } => {
-                assert_eq!(*port, 443);
-                match upstream {
-                    AttrValue::Literal(s) => assert_eq!(s, "http://localhost:5173"),
-                    _ => panic!("Expected Literal upstream"),
-                }
-                assert_eq!(*tls, Some(true));
-            }
-            _ => panic!("Expected Proxy action"),
-        }
-    }
-
-    #[test]
-    fn test_proxy_directive_resolution_full_flow() {
-        // Simulate the full flow: vars evaluation -> proxy action resolution -> directive
-        let content = r#"
-vars {
-    web_port expr="8000 + ws.num"
-    api_port expr="9000 + ws.num"
-}
-setup {
-    proxy port=443 upstream.var="vars.web_port" tls=#true
-    proxy port=8080 upstream.var="vars.api_port"
-}
-"#;
-
-        let config = BreqConfig::parse_kdl(content).unwrap();
-        assert_eq!(config.vars.len(), 2);
-        assert_eq!(config.setup.len(), 2);
-
-        // Build context for workspace "one" (num=1)
-        let mut ctx = WorkspaceContext {
-            ws: WorkspaceInfo {
-                name: "one".to_string(),
-                num: 1,
-                path: "/tmp/ws/one".to_string(),
-            },
-            repo: RepoInfo {
-                root: "/tmp/repo".to_string(),
-                name: "toren".to_string(),
-            },
-            task: None,
-            vars: HashMap::new(),
-            config: Some(ConfigContext {
-                proxy: ProxyContext {
-                    domain: "lvh.me".to_string(),
-                    tls: false,
-                },
-            }),
-        };
-
-        // Evaluate vars
-        let vars = evaluate_vars(&config.vars, &ctx).unwrap();
-        assert_eq!(vars.get("web_port"), Some(&serde_json::json!(8001)));
-        assert_eq!(vars.get("api_port"), Some(&serde_json::json!(9001)));
-        ctx.vars = vars;
-
-        // Resolve proxy directives
-        let proxy_config = ProxyConfig {
-            enabled: true,
-            tls: false,
-            domain: "lvh.me".to_string(),
-            dns_port: None,
-        };
-
-        let mut directives = Vec::new();
-        for parsed in &config.setup {
-            if let Action::Proxy { port, upstream, tls, host } = &parsed.action {
-                let resolved_upstream = upstream.resolve(&ctx).unwrap();
-                let resolved_host = if let Some(h) = host {
-                    h.resolve(&ctx).unwrap()
-                } else {
-                    format!("{}.{}.{}", ctx.ws.name, ctx.repo.name, proxy_config.domain)
-                };
-                let resolved_tls = tls.unwrap_or(proxy_config.tls);
-
-                directives.push(ProxyDirective {
-                    host: resolved_host,
-                    upstream: resolved_upstream,
-                    tls: resolved_tls,
-                    port: *port,
-                });
-            }
-        }
-
-        assert_eq!(directives.len(), 2);
-
-        // First directive: port 443, web_port (8001), tls=true, default host
-        assert_eq!(directives[0].port, 443);
-        assert_eq!(directives[0].upstream, "8001");
-        assert_eq!(directives[0].host, "one.toren.lvh.me");
-        assert!(directives[0].tls);
-
-        // Second directive: port 8080, api_port (9001), tls=false (default), default host
-        assert_eq!(directives[1].port, 8080);
-        assert_eq!(directives[1].upstream, "9001");
-        assert_eq!(directives[1].host, "one.toren.lvh.me");
-        assert!(!directives[1].tls);
-    }
-
-    #[test]
-    fn test_resolve_proxy_directive_helper() {
-        // Verify the shared resolve_proxy_directive helper works correctly
-        // (used by both evaluate_proxy_directives and execute_actions)
-        let ctx = WorkspaceContext {
-            ws: WorkspaceInfo {
-                name: "one".to_string(),
-                num: 1,
-                path: "/tmp/ws/one".to_string(),
-            },
-            repo: RepoInfo {
-                root: "/tmp/repo".to_string(),
-                name: "toren".to_string(),
-            },
-            task: None,
-            vars: {
-                let mut m = HashMap::new();
-                m.insert("web_port".to_string(), serde_json::json!(8001));
-                m
-            },
-            config: Some(ConfigContext {
-                proxy: ProxyContext {
-                    domain: "lvh.me".to_string(),
-                    tls: false,
-                },
-            }),
-        };
-
-        let proxy_config = ProxyConfig {
-            enabled: true,
-            tls: false,
-            domain: "lvh.me".to_string(),
-            dns_port: None,
-        };
-
-        // Test with var-referenced upstream and explicit tls
-        let action = Action::Proxy {
-            port: 443,
-            upstream: AttrValue::VarRef("vars.web_port".to_string()),
-            tls: Some(true),
-            host: None,
-        };
-        let d = resolve_proxy_directive(&action, &ctx, Some(&proxy_config)).unwrap();
-        assert_eq!(d.port, 443);
-        assert_eq!(d.upstream, "8001");
-        assert_eq!(d.host, "one.toren.lvh.me");
-        assert!(d.tls);
-
-        // Test with literal upstream and default tls (inherits from config)
-        let action = Action::Proxy {
-            port: 8080,
-            upstream: AttrValue::Literal("3000".to_string()),
-            tls: None,
-            host: None,
-        };
-        let d = resolve_proxy_directive(&action, &ctx, Some(&proxy_config)).unwrap();
-        assert_eq!(d.port, 8080);
-        assert_eq!(d.upstream, "3000");
-        assert_eq!(d.host, "one.toren.lvh.me");
-        assert!(!d.tls);
-
-        // Test with explicit host
-        let action = Action::Proxy {
-            port: 80,
-            upstream: AttrValue::Literal("5000".to_string()),
-            tls: None,
-            host: Some(AttrValue::Literal("custom.example.com".to_string())),
-        };
-        let d = resolve_proxy_directive(&action, &ctx, Some(&proxy_config)).unwrap();
-        assert_eq!(d.host, "custom.example.com");
-
-        // Test without proxy config (fallback domain)
-        let action = Action::Proxy {
-            port: 80,
-            upstream: AttrValue::Literal("5000".to_string()),
-            tls: None,
-            host: None,
-        };
-        let d = resolve_proxy_directive(&action, &ctx, None).unwrap();
-        assert_eq!(d.host, "one.toren.lvh.me"); // fallback to lvh.me
-        assert!(!d.tls); // fallback to false
     }
 
     #[test]
@@ -1608,17 +1316,6 @@ setup {
     }
 
     #[test]
-    fn test_parse_on_fail_on_proxy() {
-        let content = r#"
-setup {
-    proxy 5173 upstream="http://localhost:5173" on_fail="warn"
-}
-"#;
-        let config = BreqConfig::parse_kdl(content).unwrap();
-        assert_eq!(config.setup[0].on_fail, OnFail::Warn);
-    }
-
-    #[test]
     fn test_parse_on_fail_in_destroy() {
         let content = r#"
 destroy {
@@ -1632,7 +1329,7 @@ destroy {
     fn test_setup() -> WorkspaceSetup {
         let dir = std::env::temp_dir().join("toren-test-ws");
         let _ = fs::create_dir_all(&dir);
-        WorkspaceSetup::new(dir.clone(), dir, "test".to_string(), 1)
+        WorkspaceSetup::new(dir.clone(), dir, "test".to_string(), 1, None)
     }
 
     #[test]
@@ -1655,7 +1352,7 @@ destroy {
                 on_fail: OnFail::Exit,
             },
         ];
-        let result = setup.execute_actions(&actions, &ctx, None);
+        let result = setup.execute_actions(&actions, &ctx);
         assert!(result.is_ok(), "on_fail=warn should continue: {:?}", result);
     }
 
@@ -1679,7 +1376,7 @@ destroy {
                 on_fail: OnFail::Exit,
             },
         ];
-        let result = setup.execute_actions(&actions, &ctx, None);
+        let result = setup.execute_actions(&actions, &ctx);
         assert!(
             result.is_ok(),
             "on_fail=ignore should continue: {:?}",
@@ -1707,7 +1404,214 @@ destroy {
                 on_fail: OnFail::Exit,
             },
         ];
-        let result = setup.execute_actions(&actions, &ctx, None);
+        let result = setup.execute_actions(&actions, &ctx);
         assert!(result.is_err(), "on_fail=exit should abort");
+    }
+
+    // ─── Proxy parsing tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_parse_proxy_with_port() {
+        let content = r#"
+setup {
+    proxy 80 upstream=3000
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.setup.len(), 1);
+        match &config.setup[0].action {
+            Action::Proxy { port, upstream, tls, name } => {
+                assert_eq!(*port, 80);
+                match upstream {
+                    AttrValue::Literal(s) => assert_eq!(s, "3000"),
+                    _ => panic!("Expected Literal upstream"),
+                }
+                assert!(!tls);
+                assert!(name.is_none());
+            }
+            _ => panic!("Expected Proxy action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_proxy_https_protocol() {
+        let content = r#"
+setup {
+    proxy "https" upstream=4443
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        match &config.setup[0].action {
+            Action::Proxy { port, tls, .. } => {
+                assert_eq!(*port, 443);
+                assert!(*tls);
+            }
+            _ => panic!("Expected Proxy action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_proxy_http_protocol() {
+        let content = r#"
+setup {
+    proxy "http" upstream=8080
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        match &config.setup[0].action {
+            Action::Proxy { port, tls, .. } => {
+                assert_eq!(*port, 80);
+                assert!(!tls);
+            }
+            _ => panic!("Expected Proxy action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_proxy_with_uri_upstream() {
+        let content = r#"
+setup {
+    proxy 80 upstream="http://localhost:3000"
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        match &config.setup[0].action {
+            Action::Proxy { upstream, .. } => match upstream {
+                AttrValue::Literal(s) => assert_eq!(s, "http://localhost:3000"),
+                _ => panic!("Expected Literal upstream"),
+            },
+            _ => panic!("Expected Proxy action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_proxy_with_upstream_var() {
+        let content = r#"
+setup {
+    proxy 80 upstream.var="vars.web_port"
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        match &config.setup[0].action {
+            Action::Proxy { upstream, .. } => match upstream {
+                AttrValue::VarRef(path) => assert_eq!(path, "vars.web_port"),
+                _ => panic!("Expected VarRef upstream"),
+            },
+            _ => panic!("Expected Proxy action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_proxy_with_tls_and_name() {
+        let content = r#"
+setup {
+    proxy 443 upstream=8443 tls=#true name="api"
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        match &config.setup[0].action {
+            Action::Proxy { port, upstream, tls, name } => {
+                assert_eq!(*port, 443);
+                match upstream {
+                    AttrValue::Literal(s) => assert_eq!(s, "8443"),
+                    _ => panic!("Expected Literal upstream"),
+                }
+                assert!(*tls);
+                assert_eq!(name.as_deref(), Some("api"));
+            }
+            _ => panic!("Expected Proxy action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_proxy_invalid_protocol() {
+        let content = r#"
+setup {
+    proxy "ftp" upstream=21
+}
+"#;
+        let err = BreqConfig::parse_kdl(content).unwrap_err();
+        assert!(err.to_string().contains("protocol"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_parse_proxy_missing_upstream() {
+        let content = r#"
+setup {
+    proxy 80
+}
+"#;
+        let err = BreqConfig::parse_kdl(content).unwrap_err();
+        assert!(err.to_string().contains("upstream"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_station_domain() {
+        let setup = WorkspaceSetup::new(
+            PathBuf::from("/repos/myrepo"),
+            PathBuf::from("/ws/one"),
+            "one".to_string(),
+            1,
+            Some("lvh.me".to_string()),
+        );
+        assert_eq!(setup.station_domain(), Some("myrepo.lvh.me".to_string()));
+    }
+
+    #[test]
+    fn test_station_domain_none() {
+        let setup = WorkspaceSetup::new(
+            PathBuf::from("/repos/myrepo"),
+            PathBuf::from("/ws/one"),
+            "one".to_string(),
+            1,
+            None,
+        );
+        assert_eq!(setup.station_domain(), None);
+    }
+
+    #[test]
+    fn test_station_name_with_prefix() {
+        let setup = WorkspaceSetup::new(
+            PathBuf::from("/repos/myrepo"),
+            PathBuf::from("/ws/one"),
+            "one".to_string(),
+            1,
+            None,
+        );
+        assert_eq!(setup.station_name(Some("api")), "api.one");
+        assert_eq!(setup.station_name(None), "one");
+    }
+
+    #[test]
+    fn test_collect_proxy_station_names() {
+        let actions = vec![
+            ParsedAction {
+                action: Action::Proxy {
+                    port: 80,
+                    upstream: AttrValue::Literal("3000".to_string()),
+                    tls: false,
+                    name: None,
+                },
+                on_fail: OnFail::Exit,
+            },
+            ParsedAction {
+                action: Action::Proxy {
+                    port: 443,
+                    upstream: AttrValue::Literal("4443".to_string()),
+                    tls: true,
+                    name: Some("api".to_string()),
+                },
+                on_fail: OnFail::Exit,
+            },
+            ParsedAction {
+                action: Action::Run {
+                    command: "echo hi".to_string(),
+                    cwd: None,
+                },
+                on_fail: OnFail::Exit,
+            },
+        ];
+        let names = WorkspaceSetup::collect_proxy_station_names(&actions, "one");
+        assert_eq!(names, vec!["api.one", "one"]);
     }
 }

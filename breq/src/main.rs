@@ -147,28 +147,6 @@ enum Commands {
         all: bool,
     },
 
-    /// Setup/refresh Caddy reverse proxy routes for a workspace
-    Proxy {
-        /// Workspace name (e.g., "one", "two")
-        workspace: Option<String>,
-
-        /// List all active proxy routes
-        #[arg(short, long)]
-        list: bool,
-
-        /// Explicit port mapping (port:upstream), can be repeated
-        #[arg(short, long = "port", value_name = "PORT:UPSTREAM")]
-        p: Vec<String>,
-
-        /// Enable TLS on explicit port mappings
-        #[arg(long)]
-        tls: bool,
-
-        /// Segment to use
-        #[arg(short, long)]
-        segment: Option<String>,
-    },
-
     /// Initialize .toren.kdl in the current repository
     Init {
         /// Add .toren.kdl to .git/info/exclude instead of committing it
@@ -305,21 +283,6 @@ fn main() -> Result<()> {
             segment,
         } => cmd_clean(&config, &workspace, kill, push, segment.as_deref()),
         Commands::Cleanup { segment, all } => cmd_cleanup(&config, all, segment),
-        Commands::Proxy {
-            workspace,
-            list,
-            p,
-            tls,
-            segment,
-        } => {
-            if list {
-                cmd_proxy_list(&config)
-            } else {
-                let workspace = workspace
-                    .ok_or_else(|| anyhow::anyhow!("workspace name is required (or use --list)"))?;
-                cmd_proxy(&config, &workspace, p, tls, segment.as_deref())
-            }
-        }
         Commands::Init { stealth } => cmd_init(stealth),
         Commands::Dismiss { reference } => cmd_dismiss(&config, &reference),
     }
@@ -365,7 +328,7 @@ fn cmd_cmd(
         .clone()
         .context("workspace_root not configured in toren.toml")?;
 
-    let workspace_mgr = WorkspaceManager::new(workspace_root);
+    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.local_domain.clone()));
     let segment_mgr = SegmentManager::new(config)?;
     let mut assignment_mgr = AssignmentManager::new()?;
 
@@ -398,7 +361,6 @@ fn cmd_cmd(
                 title: task_title,
             }),
             vars: std::collections::HashMap::new(),
-            config: None,
         };
         toren_lib::render_template(template, &ctx)?
     } else if !std::io::stdin().is_terminal() {
@@ -485,7 +447,6 @@ fn cmd_cmd(
             &segment.name,
             &ws_name,
             ancillary_num,
-            Some(&config.proxy),
         )?;
         eprintln!("Workspace: {}", ws_path.display());
 
@@ -547,7 +508,7 @@ fn cmd_run(
             .workspace_root
             .clone()
             .context("workspace_root not configured")?;
-        let workspace_mgr = WorkspaceManager::new(workspace_root);
+        let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.local_domain.clone()));
 
         let (segment_path, workspace_path, workspace_name) = detect_workspace_context()?;
         let ancillary_num = toren_lib::word_to_number(&workspace_name);
@@ -564,7 +525,6 @@ fn cmd_run(
                     &workspace_path,
                     &workspace_name,
                     ancillary_num.unwrap_or(0),
-                    Some(&config.proxy),
                 )?;
                 eprintln!("Setup complete.");
             }
@@ -578,7 +538,6 @@ fn cmd_run(
                     &segment_path,
                     &workspace_path,
                     &workspace_name,
-                    Some(&config.proxy),
                 )?;
                 eprintln!("Destroy complete.");
             }
@@ -592,7 +551,7 @@ fn cmd_run(
         .clone()
         .context("workspace_root not configured in toren.toml")?;
 
-    let workspace_mgr = WorkspaceManager::new(workspace_root);
+    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.local_domain.clone()));
     let segment_mgr = SegmentManager::new(config)?;
     let segment = resolve_segment(&segment_mgr, segment_name)?;
 
@@ -643,7 +602,6 @@ fn cmd_run(
             &segment.name,
             &ws_name,
             ancillary_num,
-            Some(&config.proxy),
         )?;
 
         assignment_mgr.create(
@@ -786,7 +744,7 @@ fn cmd_list(
 
     // Detect orphaned workspace directories
     if let Some(ref ws_root) = workspace_root {
-        let ws_mgr = WorkspaceManager::new(ws_root.clone());
+        let ws_mgr = WorkspaceManager::new(ws_root.clone(), Some(config.local_domain.clone()));
         let orphans = find_orphaned_workspaces(&ws_mgr, &segments, &assignments);
 
         if !orphans.is_empty() {
@@ -903,7 +861,7 @@ fn cmd_clean(
         .context("workspace_root not configured")?;
 
     let segment_mgr = SegmentManager::new(config)?;
-    let workspace_mgr = WorkspaceManager::new(workspace_root);
+    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.local_domain.clone()));
     let mut assignment_mgr = AssignmentManager::new()?;
 
     let segment = resolve_segment(&segment_mgr, segment_name)?;
@@ -935,7 +893,6 @@ fn cmd_clean(
     let opts = toren_lib::CleanOptions {
         push,
         segment_path: &segment.path,
-        proxy_config: Some(&config.proxy),
         kill,
         auto_commit_message,
     };
@@ -961,7 +918,7 @@ fn cmd_cleanup(config: &Config, all_segments: bool, segment_name: Option<String>
 
     let segment_mgr = SegmentManager::new(config)?;
     let mut assignment_mgr = AssignmentManager::new()?;
-    let ws_mgr = WorkspaceManager::new(workspace_root);
+    let ws_mgr = WorkspaceManager::new(workspace_root, Some(config.local_domain.clone()));
 
     let (assignments, segments): (Vec<_>, Vec<Segment>) = if all_segments {
         let assignments = assignment_mgr.list_active().into_iter().collect();
@@ -1031,129 +988,6 @@ fn cmd_dismiss(config: &Config, reference: &str) -> Result<()> {
             assignment.ancillary_id,
             assignment.external_id.as_deref().unwrap_or("-")
         );
-    }
-
-    Ok(())
-}
-
-// ─── proxy ──────────────────────────────────────────────────────────────────
-
-fn cmd_proxy(
-    config: &Config,
-    workspace: &str,
-    port_mappings: Vec<String>,
-    tls: bool,
-    segment_name: Option<&str>,
-) -> Result<()> {
-    let segment_mgr = SegmentManager::new(config)?;
-    let segment = resolve_segment(&segment_mgr, segment_name)?;
-    let ws_name = workspace.to_lowercase();
-
-    let daemon_url = format!(
-        "http://{}:{}/api/workspaces/proxy",
-        config.host(),
-        config.port()
-    );
-
-    let mut body = serde_json::json!({
-        "segment": segment.name,
-        "workspace": ws_name,
-        "port_mappings": port_mappings,
-    });
-    if tls {
-        body["tls"] = serde_json::json!(true);
-    }
-
-    println!("Refreshing proxy routes for workspace '{}'...", ws_name);
-
-    let agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .http_status_as_error(false)
-            .build(),
-    );
-
-    let resp = agent
-        .post(&daemon_url)
-        .send_json(&body)
-        .with_context(|| {
-            format!(
-                "Failed to connect to daemon at {} (is the daemon running?)",
-                daemon_url
-            )
-        })?;
-
-    let status = resp.status();
-    let resp_body: serde_json::Value = resp
-        .into_body()
-        .read_json()
-        .context("Failed to read daemon response")?;
-
-    if status != 200 {
-        let error = resp_body["error"]
-            .as_str()
-            .unwrap_or("unknown error");
-        anyhow::bail!("Daemon returned HTTP {}: {}", status, error);
-    }
-
-    let count = resp_body["count"].as_u64().unwrap_or(0);
-    if let Some(directives) = resp_body["directives"].as_array() {
-        for d in directives {
-            let host = d["host"].as_str().unwrap_or("?");
-            let upstream = d["upstream"].as_str().unwrap_or("?");
-            let port = d["port"].as_u64().unwrap_or(0);
-            println!("  {} -> {} on :{}", host, upstream, port);
-        }
-    }
-    println!("Registered {} proxy route(s).", count);
-    Ok(())
-}
-
-fn cmd_proxy_list(config: &Config) -> Result<()> {
-    let daemon_url = format!(
-        "http://{}:{}/api/proxy/routes",
-        config.host(),
-        config.port()
-    );
-
-    let agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .http_status_as_error(false)
-            .build(),
-    );
-
-    let resp = agent
-        .get(&daemon_url)
-        .call()
-        .with_context(|| {
-            format!(
-                "Failed to connect to daemon at {} (is the daemon running?)",
-                daemon_url
-            )
-        })?;
-
-    let status = resp.status();
-    let body: serde_json::Value = resp
-        .into_body()
-        .read_json()
-        .context("Failed to read daemon response")?;
-
-    if status != 200 {
-        let error = body["error"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("Daemon returned HTTP {}: {}", status, error);
-    }
-
-    if let Some(routes) = body["routes"].as_array() {
-        if routes.is_empty() {
-            println!("No active proxy routes.");
-        } else {
-            for route in routes {
-                let host = route["host"].as_str().unwrap_or("?");
-                let upstream = route["upstream"].as_str().unwrap_or("?");
-                let port = route["port"].as_u64().unwrap_or(0);
-                println!("  {} -> {} on :{}", host, upstream, port);
-            }
-            println!("{} active route(s).", routes.len());
-        }
     }
 
     Ok(())
