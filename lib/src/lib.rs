@@ -1,3 +1,4 @@
+pub mod alias;
 pub mod assignment;
 pub mod assignment_ops;
 pub mod composite_status;
@@ -14,8 +15,9 @@ pub use assignment::{
     CompletionRecord,
 };
 pub use assignment_ops::{
-    abort_assignment, complete_assignment, prepare_resume, render_auto_commit_message,
-    AbortOptions, AbortResult, CompleteOptions, CompleteResult, ResumeOptions, ResumeResult,
+    abort_assignment, clean_assignment, complete_assignment, prepare_resume,
+    render_auto_commit_message, AbortOptions, AbortResult, CleanOptions, CleanResult,
+    CompleteOptions, CompleteResult, ResumeOptions, ResumeResult,
 };
 pub use composite_status::CompositeStatus;
 pub use config::{Config, IntentsConfig, ProxyConfig};

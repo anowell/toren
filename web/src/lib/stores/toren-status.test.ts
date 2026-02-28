@@ -6,7 +6,7 @@ function makeAssignment(overrides: Partial<Assignment> = {}): Assignment {
 	return {
 		id: 'test',
 		ancillary_id: 'Test One',
-		bead_id: 'breq-test',
+		external_id: 'breq-test',
 		segment: 'test',
 		workspace_path: '/tmp/test',
 		source: { type: 'Prompt' },

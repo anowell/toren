@@ -260,7 +260,7 @@ async function handleSendMessage() {
 							<span class="ancillary-status-dot" class:busy={agentStatus === 'busy'} class:ready={agentStatus === 'ready'}></span>
 							<span class="item-name">{assignment.ancillary_id}</span>
 						</div>
-						<span class="item-bead"><BeadStatusIcon status={beadStatus} /> {stripBeadPrefix(assignment.bead_id)}{#if assignment.bead_title}: {assignment.bead_title}{/if}</span>
+						<span class="item-bead"><BeadStatusIcon status={beadStatus} /> {stripBeadPrefix(assignment.external_id ?? assignment.bead_id ?? '')}{#if (assignment.title ?? assignment.bead_title)}: {assignment.title ?? assignment.bead_title}{/if}</span>
 					</button>
 				{/each}
 			</div>

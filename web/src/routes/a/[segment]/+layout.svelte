@@ -110,7 +110,7 @@ function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment):
 					</div>
 					<div class="card-body">
 						<BeadStatusIcon status={beadStatus} />
-						<span class="bead-label">{stripBeadPrefix(assignment.bead_id)}{#if assignment.bead_title}: {assignment.bead_title}{/if}</span>
+						<span class="bead-label">{stripBeadPrefix(assignment.external_id ?? assignment.bead_id ?? '')}{#if (assignment.title ?? assignment.bead_title)}: {assignment.title ?? assignment.bead_title}{/if}</span>
 					</div>
 					{#if assignment.bead_assignee}
 						<div class="card-footer">

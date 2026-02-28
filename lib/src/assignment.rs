@@ -10,9 +10,10 @@ use tracing::{debug, info};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum AssignmentSource {
-    /// Created from an existing bead
-    Bead,
-    /// Created from a prompt (bead was auto-created)
+    /// Created from an external reference (e.g., bead)
+    #[serde(alias = "Bead")]
+    Reference,
+    /// Created from a prompt (task may have been auto-created)
     Prompt { original_prompt: String },
 }
 
@@ -50,8 +51,9 @@ pub struct CompletionRecord {
     pub assignment_id: String,
     /// Ancillary that worked on it
     pub ancillary_id: String,
-    /// Bead that was assigned
-    pub bead_id: String,
+    /// External identifier (e.g., bead ID)
+    #[serde(alias = "bead_id", default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
     /// Segment name
     pub segment: String,
     /// When the assignment was completed/aborted (RFC 3339)
@@ -70,7 +72,7 @@ pub enum CompletionReason {
     Aborted,
 }
 
-/// An assignment links an ancillary to a bead in a workspace.
+/// An assignment links an ancillary to a workspace.
 /// This is the central work unit shared between CLI (breq) and daemon (toren).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Assignment {
@@ -78,8 +80,9 @@ pub struct Assignment {
     pub id: String,
     /// Ancillary identifier (e.g., "Toren One")
     pub ancillary_id: String,
-    /// Bead identifier (e.g., "breq-a1b2") - always present
-    pub bead_id: String,
+    /// External identifier (e.g., bead ID "breq-a1b2") — optional
+    #[serde(alias = "bead_id", default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
     /// Segment name (e.g., "toren")
     pub segment: String,
     /// Absolute path to the workspace
@@ -92,9 +95,9 @@ pub struct Assignment {
     pub created_at: String,
     /// When the assignment was last updated (RFC 3339)
     pub updated_at: String,
-    /// Title of the associated bead (for display purposes)
-    #[serde(default)]
-    pub bead_title: Option<String>,
+    /// Title for display purposes
+    #[serde(default, alias = "bead_title", skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Claude session ID for cross-interface handoff (breq <-> toren)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -179,8 +182,8 @@ fn capitalize(s: &str) -> String {
 /// Reference type for command disambiguation
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssignmentRef {
-    /// Reference by bead ID (e.g., "breq-a1b2")
-    Bead(String),
+    /// Reference by external ID (e.g., bead ID "breq-a1b2")
+    ExternalId(String),
     /// Reference by ancillary ID (e.g., "Toren One" or just "One")
     Ancillary(String),
 }
@@ -189,12 +192,12 @@ impl AssignmentRef {
     /// Parse a reference string into an AssignmentRef.
     ///
     /// Rules:
-    /// - Contains hyphen -> treat as bead ID
+    /// - Contains hyphen -> treat as external ID
     /// - Contains space -> treat as ancillary name
-    /// - Otherwise -> try ancillary name first, then bead ID
+    /// - Otherwise -> try ancillary name first, then external ID
     pub fn parse(s: &str, segment: &str) -> Self {
         if s.contains('-') {
-            AssignmentRef::Bead(s.to_string())
+            AssignmentRef::ExternalId(s.to_string())
         } else if s.contains(' ') {
             AssignmentRef::Ancillary(s.to_string())
         } else {
@@ -203,13 +206,13 @@ impl AssignmentRef {
                 let full_id = format!("{} {}", capitalize(segment), capitalize(s));
                 AssignmentRef::Ancillary(full_id)
             } else {
-                AssignmentRef::Bead(s.to_string())
+                AssignmentRef::ExternalId(s.to_string())
             }
         }
     }
 }
 
-/// Manages assignments between ancillaries and beads.
+/// Manages assignments between ancillaries.
 /// Persistent storage in ~/.toren/assignments.json.
 /// Used by both CLI (breq) and daemon (toren).
 ///
@@ -319,14 +322,18 @@ impl AssignmentManager {
         Ok(())
     }
 
-    /// Create a new assignment from an existing bead
-    pub fn create_from_bead(
+    /// Create a new assignment.
+    ///
+    /// `external_id` is an optional external reference (e.g., bead ID).
+    /// `source` indicates how the assignment was created.
+    pub fn create(
         &mut self,
         ancillary_id: &str,
-        bead_id: &str,
+        external_id: Option<&str>,
+        source: AssignmentSource,
         segment: &str,
         workspace_path: PathBuf,
-        bead_title: Option<String>,
+        title: Option<String>,
         base_branch: Option<String>,
     ) -> Result<Assignment> {
         let now = chrono::Utc::now().to_rfc3339();
@@ -336,14 +343,14 @@ impl AssignmentManager {
             ancillary_num: ancillary_number(ancillary_id),
             id,
             ancillary_id: ancillary_id.to_string(),
-            bead_id: bead_id.to_string(),
+            external_id: external_id.map(|s| s.to_string()),
             segment: segment.to_string(),
             workspace_path,
-            source: AssignmentSource::Bead,
+            source,
             status: AssignmentStatus::Active,
             created_at: now.clone(),
             updated_at: now,
-            bead_title,
+            title,
             session_id: None,
             base_branch,
         };
@@ -353,13 +360,34 @@ impl AssignmentManager {
         self.save()?;
 
         info!(
-            "Created assignment from bead: {} -> {}",
-            ancillary_id, bead_id
+            "Created assignment: {} -> {:?}",
+            ancillary_id, assignment.external_id
         );
         Ok(assignment)
     }
 
-    /// Create a new assignment from a prompt (auto-creates bead)
+    /// Create a new assignment from an existing bead (backward-compat wrapper).
+    pub fn create_from_bead(
+        &mut self,
+        ancillary_id: &str,
+        bead_id: &str,
+        segment: &str,
+        workspace_path: PathBuf,
+        bead_title: Option<String>,
+        base_branch: Option<String>,
+    ) -> Result<Assignment> {
+        self.create(
+            ancillary_id,
+            Some(bead_id),
+            AssignmentSource::Reference,
+            segment,
+            workspace_path,
+            bead_title,
+            base_branch,
+        )
+    }
+
+    /// Create a new assignment from a prompt (backward-compat wrapper).
     pub fn create_from_prompt(
         &mut self,
         ancillary_id: &str,
@@ -370,36 +398,17 @@ impl AssignmentManager {
         bead_title: Option<String>,
         base_branch: Option<String>,
     ) -> Result<Assignment> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let id = uuid::Uuid::new_v4().to_string();
-
-        let assignment = Assignment {
-            ancillary_num: ancillary_number(ancillary_id),
-            id,
-            ancillary_id: ancillary_id.to_string(),
-            bead_id: bead_id.to_string(),
-            segment: segment.to_string(),
-            workspace_path,
-            source: AssignmentSource::Prompt {
+        self.create(
+            ancillary_id,
+            Some(bead_id),
+            AssignmentSource::Prompt {
                 original_prompt: original_prompt.to_string(),
             },
-            status: AssignmentStatus::Active,
-            created_at: now.clone(),
-            updated_at: now,
+            segment,
+            workspace_path,
             bead_title,
-            session_id: None,
             base_branch,
-        };
-
-        self.assignments
-            .insert(assignment.id.clone(), assignment.clone());
-        self.save()?;
-
-        info!(
-            "Created assignment from prompt: {} -> {}",
-            ancillary_id, bead_id
-        );
-        Ok(assignment)
+        )
     }
 
     /// Update assignment session ID (for cross-interface handoff)
@@ -440,7 +449,7 @@ impl AssignmentManager {
         let record = CompletionRecord {
             assignment_id: assignment.id.clone(),
             ancillary_id: assignment.ancillary_id.clone(),
-            bead_id: assignment.bead_id.clone(),
+            external_id: assignment.external_id.clone(),
             segment: assignment.segment.clone(),
             completed_at: chrono::Utc::now().to_rfc3339(),
             reason,
@@ -484,12 +493,12 @@ impl AssignmentManager {
         self.assignments.get(assignment_id)
     }
 
-    /// Get all assignments for a bead
-    pub fn get_by_bead(&mut self, bead_id: &str) -> Vec<&Assignment> {
+    /// Get all assignments for an external ID
+    pub fn get_by_external_id(&mut self, external_id: &str) -> Vec<&Assignment> {
         self.reload_if_changed();
         self.assignments
             .values()
-            .filter(|a| a.bead_id == bead_id)
+            .filter(|a| a.external_id.as_deref() == Some(external_id))
             .collect()
     }
 
@@ -546,12 +555,12 @@ impl AssignmentManager {
         Ok(removed)
     }
 
-    /// Remove all assignments for a bead
-    pub fn dismiss_bead(&mut self, bead_id: &str) -> Result<Vec<Assignment>> {
+    /// Remove all assignments for an external ID
+    pub fn dismiss_external_id(&mut self, external_id: &str) -> Result<Vec<Assignment>> {
         let ids: Vec<_> = self
             .assignments
             .values()
-            .filter(|a| a.bead_id == bead_id)
+            .filter(|a| a.external_id.as_deref() == Some(external_id))
             .map(|a| a.id.clone())
             .collect();
 
@@ -563,9 +572,9 @@ impl AssignmentManager {
         if !removed.is_empty() {
             self.save()?;
             info!(
-                "Dismissed {} assignment(s) for bead {}",
+                "Dismissed {} assignment(s) for external ID {}",
                 removed.len(),
-                bead_id
+                external_id
             );
         }
 
@@ -657,9 +666,9 @@ impl AssignmentManager {
     pub fn resolve(&mut self, ref_: &AssignmentRef) -> Vec<&Assignment> {
         self.reload_if_changed();
         match ref_ {
-            AssignmentRef::Bead(bead_id) => self.assignments
+            AssignmentRef::ExternalId(ext_id) => self.assignments
                 .values()
-                .filter(|a| a.bead_id == *bead_id)
+                .filter(|a| a.external_id.as_deref() == Some(ext_id.as_str()))
                 .collect(),
             AssignmentRef::Ancillary(ancillary_id) => self.assignments
                 .values()
@@ -720,7 +729,7 @@ mod tests {
     fn test_assignment_ref_parse() {
         assert_eq!(
             AssignmentRef::parse("breq-a1b2", "toren"),
-            AssignmentRef::Bead("breq-a1b2".to_string())
+            AssignmentRef::ExternalId("breq-a1b2".to_string())
         );
         assert_eq!(
             AssignmentRef::parse("Toren One", "toren"),
@@ -732,7 +741,7 @@ mod tests {
         );
         assert_eq!(
             AssignmentRef::parse("a1b2", "toren"),
-            AssignmentRef::Bead("a1b2".to_string())
+            AssignmentRef::ExternalId("a1b2".to_string())
         );
     }
 }

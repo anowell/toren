@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use shellexpand;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +29,9 @@ pub struct Config {
 
     #[serde(default)]
     pub proxy: ProxyConfig,
+
+    #[serde(default = "crate::alias::default_aliases")]
+    pub aliases: HashMap<String, String>,
 }
 
 fn default_server() -> ServerConfig {
@@ -90,43 +94,46 @@ fn default_task_prompt_template() -> String {
     "implement bead {{task_id}}".to_string()
 }
 
+/// Intent templates keyed by name (e.g., "act", "plan", "review").
+/// Additional custom intents can be added via config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentsConfig {
-    #[serde(default = "default_intent_act")]
-    pub act: String,
-    #[serde(default = "default_intent_plan")]
-    pub plan: String,
-    #[serde(default = "default_intent_review")]
-    pub review: String,
+    #[serde(flatten)]
+    pub entries: HashMap<String, String>,
+}
+
+impl IntentsConfig {
+    /// Get an intent template by name, falling back to default if not found.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.entries.get(name).map(|s| s.as_str())
+    }
 }
 
 impl Default for IntentsConfig {
     fn default() -> Self {
-        Self {
-            act: default_intent_act(),
-            plan: default_intent_plan(),
-            review: default_intent_review(),
-        }
+        let mut entries = HashMap::new();
+        entries.insert("act".to_string(), default_intent_act());
+        entries.insert("plan".to_string(), default_intent_plan());
+        entries.insert("review".to_string(), default_intent_review());
+        Self { entries }
     }
 }
 
 fn default_intent_act() -> String {
-    "Implement bead {{ task.id }}: {{ task.title }}\n\n\
-     Complete the task as specified. When done, summarize changes in a bead comment."
+    "Implement {{ task.id }}: {{ task.title }}\n\n\
+     Complete the task as specified. When done, summarize changes."
         .to_string()
 }
 
 fn default_intent_plan() -> String {
-    "Design an approach for bead {{ task.id }}: {{ task.title }}\n\n\
-     Investigate the codebase, explore options, and propose a design. \
-     Update the bead's design field with your proposal."
+    "Design an approach for {{ task.id }}: {{ task.title }}\n\n\
+     Investigate the codebase, explore options, and propose a design."
         .to_string()
 }
 
 fn default_intent_review() -> String {
-    "Review the implementation of bead {{ task.id }}: {{ task.title }}\n\n\
-     Verify completeness, check for issues, and assess confidence. \
-     Add review comments to the bead."
+    "Review the implementation of {{ task.id }}: {{ task.title }}\n\n\
+     Verify completeness, check for issues, and assess confidence."
         .to_string()
 }
 
@@ -294,6 +301,7 @@ impl Default for Config {
             ancillary: AncillaryConfig::default(),
             intents: IntentsConfig::default(),
             proxy: ProxyConfig::default(),
+            aliases: crate::alias::default_aliases(),
         }
     }
 }

@@ -337,7 +337,7 @@ async fn connect_via_assignment(
                 let ws_name = working_dir
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or(&assignment.bead_id);
+                    .unwrap_or(assignment.external_id.as_deref().unwrap_or("unknown"));
 
                 if let Err(e) = ws_mgr.create_workspace(&seg_path, &assignment.segment, ws_name) {
                     return Err(Some(format!("Failed to recreate workspace: {}", e)));
@@ -362,24 +362,28 @@ async fn connect_via_assignment(
         ancillary_id.to_string(),
         assignment.segment.clone(),
         session_token.to_string(),
-        Some(assignment.bead_id.clone()),
+        assignment.external_id.clone(),
         working_dir.clone(),
     );
 
-    // Generate instruction from bead
-    let instruction = match tasks::fetch_task(&assignment.bead_id, working_dir) {
-        Ok(task) => {
-            let prompt =
-                tasks::generate_prompt(&task, &state.config.ancillary.task_prompt_template);
-            state
-                .ancillaries
-                .set_instruction(ancillary_id, Some(prompt.clone()));
-            Some(prompt)
+    // Generate instruction from external ID (bead)
+    let instruction = if let Some(ref ext_id) = assignment.external_id {
+        match tasks::fetch_task(ext_id, working_dir) {
+            Ok(task) => {
+                let prompt =
+                    tasks::generate_prompt(&task, &state.config.ancillary.task_prompt_template);
+                state
+                    .ancillaries
+                    .set_instruction(ancillary_id, Some(prompt.clone()));
+                Some(prompt)
+            }
+            Err(e) => {
+                warn!("Failed to fetch task {}: {}", ext_id, e);
+                None
+            }
         }
-        Err(e) => {
-            warn!("Failed to fetch task {}: {}", assignment.bead_id, e);
-            None
-        }
+    } else {
+        None
     };
 
     // Touch assignment timestamp on connect
@@ -389,7 +393,7 @@ async fn connect_via_assignment(
         session_id: session_token.to_string(),
         ancillary_id: Some(ancillary_id.to_string()),
         assignment_id: Some(assignment.id.clone()),
-        bead_id: Some(assignment.bead_id.clone()),
+        bead_id: assignment.external_id.clone(),
         working_dir: Some(working_dir.display().to_string()),
         instruction,
     };

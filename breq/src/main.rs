@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use colored::Colorize;
+use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use toren_lib::{
-    AssignmentManager, AssignmentRef, Config, Segment, SegmentManager,
+    AssignmentManager, AssignmentRef, AssignmentSource, Config, Segment, SegmentManager,
     WorkspaceManager,
 };
 use tracing::info;
@@ -34,7 +35,7 @@ impl FormatTime for ShortTime {
 
 #[derive(Parser)]
 #[command(name = "breq")]
-#[command(about = "Spawn Claude ancillaries for bead-driven development")]
+#[command(about = "Composable workspace orchestration for Claude ancillaries")]
 struct Cli {
     /// Increase verbosity (-v for DEBUG, -vv for TRACE)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -50,23 +51,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Assign work to a Claude ancillary (from bead or prompt)
-    #[command(visible_alias = "a")]
-    Assign {
-        /// Bead ID to assign (optional if using --prompt)
-        bead: Option<String>,
+    /// Start a Claude session in a workspace (create workspace if needed)
+    Cmd {
+        /// Reuse existing workspace (by name, e.g. "one", "three")
+        workspace: Option<String>,
 
-        /// Create assignment from a prompt (auto-creates bead)
-        #[arg(short, long, conflicts_with = "bead")]
+        /// Prompt for the Claude session
+        #[arg(short, long)]
         prompt: Option<String>,
 
-        /// Title for prompt-based assignment (defaults to first line of prompt)
-        #[arg(long, requires = "prompt")]
-        title: Option<String>,
+        /// Intent template to use (e.g., "act", "plan", "review")
+        #[arg(short, long)]
+        intent: Option<String>,
 
-        /// Intent for handling the bead
-        #[arg(short, long, default_value = "act")]
-        intent: Intent,
+        /// Tag assignment with an external identifier (e.g., bead ID)
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Resume previous Claude session (uses --resume if session_id exists)
+        #[arg(long)]
+        resume: bool,
 
         /// Segment to use (defaults to current directory's segment)
         #[arg(short, long)]
@@ -77,100 +81,70 @@ enum Commands {
         danger: bool,
     },
 
-    /// List assignments (defaults to current segment)
-    List {
-        /// List assignments from all segments
-        #[arg(short, long)]
-        all: bool,
-
-        /// List assignments from a specific segment
-        #[arg(short, long, conflicts_with = "all")]
-        segment: Option<String>,
-    },
-
-    /// Show detailed assignment information
-    Show {
-        /// Bead ID or ancillary reference
-        reference: String,
-    },
-
-    /// Continue work on an existing assignment (recreates workspace if missing)
-    Resume {
-        /// Bead ID or ancillary reference
-        reference: String,
-
-        /// Additional instructions
-        #[arg(short, long)]
-        instruction: Option<String>,
-
-        /// Skip permission prompts
-        #[arg(long)]
-        danger: bool,
-    },
-
-    /// Discard workspace and optionally close bead
-    Abort {
-        /// Bead ID or ancillary reference
-        reference: String,
-
-        /// Also close the bead
-        #[arg(long)]
-        close: bool,
-
-        /// Kill processes running in the workspace before cleanup
-        #[arg(long)]
-        kill: bool,
-    },
-
-    /// Complete work: cleanup workspace, close bead, print revision for integration
-    Complete {
-        /// Bead ID or ancillary reference
-        reference: String,
-
-        /// Also push the commits
-        #[arg(long)]
-        push: bool,
-
-        /// Keep bead open instead of closing
-        #[arg(long)]
-        keep_open: bool,
-
-        /// Kill processes running in the workspace before cleanup
-        #[arg(long)]
-        kill: bool,
-    },
-
-    /// Remove orphaned workspace directories (exist on disk but not tracked by VCS)
-    Cleanup {
-        /// Segment to clean up (defaults to current directory's segment)
-        #[arg(short, long)]
-        segment: Option<String>,
-
-        /// Clean up all segments
-        #[arg(short, long, conflicts_with = "segment")]
-        all: bool,
-    },
-
-    /// Workspace management commands
-    #[command(visible_alias = "ws")]
-    Workspace {
-        #[command(subcommand)]
-        command: WorkspaceCommands,
-    },
-
-    /// Navigate to a workspace directory or run a command in it
+    /// Navigate to a workspace or run a command in it
     #[command(visible_alias = "g")]
-    Go {
-        /// Workspace name (e.g. "one", "two") or ancillary reference
-        workspace: String,
+    Run {
+        /// Workspace name (e.g. "one", "two")
+        workspace: Option<String>,
 
-        /// Segment to use (defaults to current directory's segment)
+        /// Run a specific hook (setup or destroy)
+        #[arg(long)]
+        hook: Option<HookArg>,
+
+        /// Segment to use
         #[arg(short, long)]
         segment: Option<String>,
 
         /// Command to run in the workspace directory (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
+    },
+
+    /// List active assignments
+    List {
+        /// Workspace or external ID to show detail for
+        reference: Option<String>,
+
+        /// List from all segments
+        #[arg(short, long)]
+        all: bool,
+
+        /// List from a specific segment
+        #[arg(short, long, conflicts_with = "all")]
+        segment: Option<String>,
+
+        /// Show detailed assignment info
+        #[arg(long)]
+        detail: bool,
+    },
+
+    /// Teardown a workspace (bead-free), output JSON to stdout
+    Clean {
+        /// Workspace name (e.g. "one", "three")
+        workspace: String,
+
+        /// Kill processes running in the workspace
+        #[arg(long)]
+        kill: bool,
+
+        /// Push changes before cleanup
+        #[arg(long)]
+        push: bool,
+
+        /// Segment to use
+        #[arg(short, long)]
+        segment: Option<String>,
+    },
+
+    /// Remove orphaned workspace directories
+    Cleanup {
+        /// Segment to clean up
+        #[arg(short, long)]
+        segment: Option<String>,
+
+        /// Clean up all segments
+        #[arg(short, long, conflicts_with = "segment")]
+        all: bool,
     },
 
     /// Setup/refresh Caddy reverse proxy routes for a workspace
@@ -190,7 +164,7 @@ enum Commands {
         #[arg(long)]
         tls: bool,
 
-        /// Segment to use (defaults to current directory's segment)
+        /// Segment to use
         #[arg(short, long)]
         segment: Option<String>,
     },
@@ -201,39 +175,81 @@ enum Commands {
         #[arg(long)]
         stealth: bool,
     },
+
+    /// Remove assignment record without workspace cleanup
+    Dismiss {
+        /// Workspace or external ID reference
+        reference: String,
+    },
 }
 
-#[derive(Subcommand)]
-enum WorkspaceCommands {
-    /// Run setup hooks for current workspace
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum HookArg {
     Setup,
-
-    /// Run destroy hooks for current workspace
     Destroy,
 }
 
-#[derive(Clone, Copy, ValueEnum, Default)]
-enum Intent {
-    /// Execute: implement feature, fix bug, complete task
-    #[default]
-    Act,
-    /// Design: propose approach, investigate, explore options
-    Plan,
-    /// Verify: assess completeness, check for issues
-    Review,
-}
+fn main() -> Result<()> {
+    let raw_args: Vec<String> = std::env::args().collect();
 
-impl Intent {
-    fn template<'a>(&self, intents: &'a toren_lib::IntentsConfig) -> &'a str {
-        match self {
-            Intent::Act => &intents.act,
-            Intent::Plan => &intents.plan,
-            Intent::Review => &intents.review,
+    // Pre-parse: check for alias match before clap gets involved
+    if raw_args.len() > 1 {
+        // Skip global flags to find the subcommand
+        let mut subcmd_idx = 1;
+        while subcmd_idx < raw_args.len() {
+            let arg = &raw_args[subcmd_idx];
+            if arg == "-v" || arg == "-vv" || arg == "-vvv" || arg == "--verbose" {
+                subcmd_idx += 1;
+                continue;
+            }
+            if arg == "--config" {
+                subcmd_idx += 2; // skip --config <path>
+                continue;
+            }
+            break;
+        }
+
+        if subcmd_idx < raw_args.len() {
+            let subcmd = &raw_args[subcmd_idx];
+            // Try loading config for alias check (silently ignore config errors)
+            if let Ok(config) = Config::load() {
+                if let Some(template) = config.aliases.get(subcmd) {
+                    let alias_args = &raw_args[subcmd_idx + 1..];
+                    let expanded = toren_lib::alias::expand_alias(template, alias_args);
+
+                    // Set up logging if -v flags were used
+                    let verbose_count: usize = raw_args[1..subcmd_idx]
+                        .iter()
+                        .map(|a| match a.as_str() {
+                            "-vvv" => 3,
+                            "-vv" => 2,
+                            "-v" | "--verbose" => 1,
+                            _ => 0,
+                        })
+                        .sum();
+                    if verbose_count > 0 {
+                        let log_level = match verbose_count {
+                            1 => tracing::Level::DEBUG,
+                            _ => tracing::Level::TRACE,
+                        };
+                        tracing_subscriber::fmt()
+                            .with_max_level(log_level)
+                            .with_target(false)
+                            .with_timer(ShortTime)
+                            .init();
+                    }
+
+                    info!("Alias '{}' -> {}", subcmd, expanded);
+                    let code = toren_lib::alias::execute_alias(
+                        &expanded,
+                        &std::collections::HashMap::new(),
+                    )?;
+                    std::process::exit(code);
+                }
+            }
         }
     }
-}
 
-fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let log_level = match cli.verbose {
@@ -252,46 +268,43 @@ fn main() -> Result<()> {
     let config = Config::load_from(cli.config.as_deref())?;
 
     match cli.command {
-        Commands::Assign {
-            bead,
+        Commands::Cmd {
+            workspace,
             prompt,
-            title,
             intent,
+            id,
+            resume,
             segment,
             danger,
-        } => cmd_assign(
+        } => cmd_cmd(
             &config,
-            bead,
+            workspace,
             prompt,
-            title,
             intent,
+            id,
+            resume,
             segment.as_deref(),
             danger,
         ),
-        Commands::List { all, segment } => cmd_list(&config, all, segment),
-        Commands::Show { reference } => cmd_show(&config, &reference),
-        Commands::Resume {
-            reference,
-            instruction,
-            danger,
-        } => cmd_resume(&config, &reference, instruction.as_deref(), danger),
-        Commands::Abort { reference, close, kill } => cmd_abort(&config, &reference, close, kill),
-        Commands::Complete {
-            reference,
-            push,
-            keep_open,
-            kill,
-        } => cmd_complete(&config, &reference, push, keep_open, kill),
-        Commands::Cleanup { segment, all } => cmd_cleanup(&config, all, segment),
-        Commands::Go {
+        Commands::Run {
             workspace,
+            hook,
             segment,
             cmd,
-        } => cmd_go(&config, &workspace, segment.as_deref(), cmd),
-        Commands::Workspace { command } => match command {
-            WorkspaceCommands::Setup => cmd_ws_setup(&config),
-            WorkspaceCommands::Destroy => cmd_ws_destroy(&config),
-        },
+        } => cmd_run(&config, workspace, hook, segment.as_deref(), cmd),
+        Commands::List {
+            reference,
+            all,
+            segment,
+            detail,
+        } => cmd_list(&config, reference, all, segment, detail),
+        Commands::Clean {
+            workspace,
+            kill,
+            push,
+            segment,
+        } => cmd_clean(&config, &workspace, kill, push, segment.as_deref()),
+        Commands::Cleanup { segment, all } => cmd_cleanup(&config, all, segment),
         Commands::Proxy {
             workspace,
             list,
@@ -308,11 +321,11 @@ fn main() -> Result<()> {
             }
         }
         Commands::Init { stealth } => cmd_init(stealth),
+        Commands::Dismiss { reference } => cmd_dismiss(&config, &reference),
     }
 }
 
 /// Helper to find segment from current directory or specified name.
-/// Segments are resolved dynamically - any directory under a segment root is valid.
 fn resolve_segment(segment_mgr: &SegmentManager, segment_name: Option<&str>) -> Result<Segment> {
     if let Some(name) = segment_name {
         segment_mgr
@@ -329,18 +342,20 @@ fn resolve_segment(segment_mgr: &SegmentManager, segment_name: Option<&str>) -> 
     }
 }
 
-/// Generate workspace name for a bead assignment.
-/// Uses the ancillary number word (e.g. "one", "two") so workspaces can be reused.
-fn workspace_name_for_assignment(ancillary_number: u32) -> String {
-    toren_lib::number_to_word(ancillary_number).to_lowercase()
+/// Generate workspace name from ancillary number word.
+fn workspace_name_for_number(n: u32) -> String {
+    toren_lib::number_to_word(n).to_lowercase()
 }
 
-fn cmd_assign(
+// ─── cmd ────────────────────────────────────────────────────────────────────
+
+fn cmd_cmd(
     config: &Config,
-    bead: Option<String>,
+    workspace: Option<String>,
     prompt: Option<String>,
-    title: Option<String>,
-    intent: Intent,
+    intent: Option<String>,
+    external_id: Option<String>,
+    resume: bool,
     segment_name: Option<&str>,
     danger: bool,
 ) -> Result<()> {
@@ -356,131 +371,320 @@ fn cmd_assign(
 
     let segment = resolve_segment(&segment_mgr, segment_name)?;
 
-    // Determine bead ID and title - either from existing bead or create from prompt
-    let (bead_id, task_title, original_prompt) = if let Some(ref prompt_text) = prompt {
-        // Create bead from prompt
-        let bead_title = title.unwrap_or_else(|| {
-            // Use first line of prompt as title, truncated
+    // Determine prompt text: -p flag > -i intent template > stdin (if piped) > $EDITOR
+    let prompt_text = if let Some(ref p) = prompt {
+        p.clone()
+    } else if let Some(ref intent_name) = intent {
+        let template = config
+            .intents
+            .get(intent_name)
+            .with_context(|| format!("Unknown intent: {}", intent_name))?;
+
+        // Build task context for template rendering
+        let task_id = external_id.clone().unwrap_or_default();
+        let task_title = external_id.clone().unwrap_or_default();
+        let ctx = toren_lib::WorkspaceContext {
+            ws: toren_lib::WorkspaceInfo {
+                name: String::new(),
+                num: 0,
+                path: String::new(),
+            },
+            repo: toren_lib::RepoInfo {
+                root: segment.path.display().to_string(),
+                name: segment.name.clone(),
+            },
+            task: Some(toren_lib::TaskInfo {
+                id: task_id,
+                title: task_title,
+            }),
+            vars: std::collections::HashMap::new(),
+            config: None,
+        };
+        toren_lib::render_template(template, &ctx)?
+    } else if !std::io::stdin().is_terminal() {
+        // Read from stdin (piped input)
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        let trimmed = buf.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("Empty input from stdin. Provide -p, -i, or pipe a prompt.");
+        }
+        trimmed
+    } else {
+        // Open $EDITOR
+        let text = edit::edit("")
+            .context("Editor returned an error")?;
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("Empty prompt from editor. Provide -p, -i, or pipe a prompt.");
+        }
+        trimmed
+    };
+
+    // Determine workspace: reuse existing or create new
+    if let Some(ref ws_name) = workspace {
+        let ws_name_lower = ws_name.to_lowercase();
+        let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name_lower);
+
+        if !ws_path.exists() {
+            anyhow::bail!("Workspace '{}' not found at {}", ws_name_lower, ws_path.display());
+        }
+
+        // Look up existing assignment for this workspace
+        let ancillary_num = toren_lib::word_to_number(&ws_name_lower).unwrap_or(0);
+        let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
+
+        // Check for existing assignment
+        let existing = assignment_mgr.get_active_for_ancillary(&ancillary_id_str).cloned();
+
+        if resume {
+            if let Some(ref assignment) = existing {
+                if let Some(ref sid) = assignment.session_id {
+                    eprintln!("Resuming session in {}", ws_path.display());
+                    let mut cmd = Command::new("claude");
+                    if danger {
+                        cmd.arg("--dangerously-skip-permissions");
+                    }
+                    cmd.arg("--resume").arg(sid).current_dir(&ws_path);
+                    let err = cmd.exec();
+                    return Err(err).context("Failed to exec claude");
+                }
+            }
+            eprintln!("No session to resume, starting new session");
+        }
+
+        // Reuse workspace — start claude
+        eprintln!("Starting Claude session in {}\n", ws_path.display());
+        let mut cmd = Command::new("claude");
+        if danger {
+            cmd.arg("--dangerously-skip-permissions");
+        }
+        cmd.arg(&prompt_text).current_dir(&ws_path);
+
+        let err = cmd.exec();
+        Err(err).context("Failed to exec claude")
+    } else {
+        // Create new workspace
+        let existing_workspaces = workspace_mgr
+            .list_workspaces(&segment.path)
+            .unwrap_or_default();
+        let ancillary_id_str = assignment_mgr.next_available_ancillary(
+            &segment.name,
+            config.ancillary.pool_size,
+            &existing_workspaces,
+        );
+        let ancillary_num = toren_lib::ancillary_number(&ancillary_id_str).unwrap_or(1);
+        eprintln!("Ancillary: {}", ancillary_id_str);
+
+        let base_branch = workspace_mgr.active_branch(&segment.path);
+        let ws_name = workspace_name_for_number(ancillary_num);
+
+        let (ws_path, _setup_result) = workspace_mgr.create_workspace_with_setup(
+            &segment.path,
+            &segment.name,
+            &ws_name,
+            ancillary_num,
+            Some(&config.proxy),
+        )?;
+        eprintln!("Workspace: {}", ws_path.display());
+
+        // Record assignment
+        let source = if external_id.is_some() {
+            AssignmentSource::Reference
+        } else {
+            AssignmentSource::Prompt {
+                original_prompt: prompt_text.clone(),
+            }
+        };
+
+        let title: Option<String> = Some(
             prompt_text
                 .lines()
                 .next()
-                .unwrap_or(prompt_text)
+                .unwrap_or(&prompt_text)
                 .chars()
                 .take(80)
-                .collect()
-        });
+                .collect(),
+        );
 
-        println!("Creating bead from prompt: {}", bead_title);
-        let new_bead_id = toren_lib::tasks::beads::create_and_claim_bead(
-            &bead_title,
-            Some(prompt_text),
-            "claude",
-            &segment.path,
-        )?;
-        println!("Created bead: {}", new_bead_id);
-
-        (new_bead_id, bead_title, Some(prompt_text.clone()))
-    } else if let Some(bead_id) = bead {
-        // Use existing bead
-        let task = toren_lib::tasks::fetch_task(&bead_id, &segment.path)?;
-        println!("Assigning: {} - {}", task.id, task.title);
-
-        toren_lib::tasks::beads::claim_bead(&bead_id, "claude", &segment.path)?;
-        println!("Claimed bead for claude");
-
-        (bead_id, task.title, None)
-    } else {
-        anyhow::bail!("Either <BEAD> or --prompt must be specified");
-    };
-
-    // Find next available ancillary, accounting for existing workspaces on disk
-    let existing_workspaces = workspace_mgr
-        .list_workspaces(&segment.path)
-        .unwrap_or_default();
-    let ancillary_id = assignment_mgr.next_available_ancillary(
-        &segment.name,
-        config.ancillary.pool_size,
-        &existing_workspaces,
-    );
-    let ancillary_num = toren_lib::ancillary_number(&ancillary_id).unwrap_or(1);
-    println!("Ancillary: {}", ancillary_id);
-
-    // Record base branch (for git worktrees; None for jj)
-    let base_branch = workspace_mgr.active_branch(&segment.path);
-
-    // Generate workspace name from ancillary number word
-    let ws_name = workspace_name_for_assignment(ancillary_num);
-
-    // Create workspace and run setup hooks
-    let (ws_path, _setup_result) = workspace_mgr.create_workspace_with_setup(
-        &segment.path,
-        &segment.name,
-        &ws_name,
-        ancillary_num,
-        Some(&config.proxy),
-    )?;
-    println!("Workspace: {}", ws_path.display());
-
-    // Record assignment
-    if let Some(ref prompt_text) = original_prompt {
-        assignment_mgr.create_from_prompt(
-            &ancillary_id,
-            &bead_id,
-            prompt_text,
+        assignment_mgr.create(
+            &ancillary_id_str,
+            external_id.as_deref(),
+            source,
             &segment.name,
             ws_path.clone(),
-            Some(task_title.clone()),
+            title,
             base_branch,
         )?;
-    } else {
-        assignment_mgr.create_from_bead(
-            &ancillary_id,
-            &bead_id,
-            &segment.name,
-            ws_path.clone(),
-            Some(task_title.clone()),
-            base_branch,
-        )?;
+
+        // Exec into claude
+        eprintln!("Starting Claude session in {}\n", ws_path.display());
+        let mut cmd = Command::new("claude");
+        if danger {
+            cmd.arg("--dangerously-skip-permissions");
+        }
+        cmd.arg(&prompt_text).current_dir(&ws_path);
+
+        let err = cmd.exec();
+        Err(err).context("Failed to exec claude")
     }
-
-    // Build prompt for Claude using config template + minijinja rendering
-    let template = intent.template(&config.intents);
-    let ctx = toren_lib::WorkspaceContext {
-        ws: toren_lib::WorkspaceInfo {
-            name: ws_name.clone(),
-            num: ancillary_num,
-            path: ws_path.display().to_string(),
-        },
-        repo: toren_lib::RepoInfo {
-            root: segment.path.display().to_string(),
-            name: segment.name.clone(),
-        },
-        task: Some(toren_lib::TaskInfo {
-            id: bead_id.clone(),
-            title: task_title.clone(),
-        }),
-        vars: std::collections::HashMap::new(),
-        config: None,
-    };
-    let claude_prompt = toren_lib::render_template(template, &ctx)?;
-
-    // Exec into claude
-    println!("Starting Claude session in {}\n", ws_path.display());
-
-    let mut cmd = Command::new("claude");
-    if danger {
-        cmd.arg("--dangerously-skip-permissions");
-    }
-    cmd.arg(&claude_prompt).current_dir(&ws_path);
-
-    let err = cmd.exec();
-    Err(err).context("Failed to exec claude")
 }
 
-fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -> Result<()> {
+// ─── run ────────────────────────────────────────────────────────────────────
+
+fn cmd_run(
+    config: &Config,
+    workspace: Option<String>,
+    hook: Option<HookArg>,
+    segment_name: Option<&str>,
+    cmd: Vec<String>,
+) -> Result<()> {
+    // Hook mode: run setup/destroy from cwd
+    if let Some(hook_type) = hook {
+        let workspace_root = config
+            .ancillary
+            .workspace_root
+            .clone()
+            .context("workspace_root not configured")?;
+        let workspace_mgr = WorkspaceManager::new(workspace_root);
+
+        let (segment_path, workspace_path, workspace_name) = detect_workspace_context()?;
+        let ancillary_num = toren_lib::word_to_number(&workspace_name);
+
+        match hook_type {
+            HookArg::Setup => {
+                eprintln!(
+                    "Running setup for workspace '{}' in {}",
+                    workspace_name,
+                    workspace_path.display()
+                );
+                workspace_mgr.run_setup(
+                    &segment_path,
+                    &workspace_path,
+                    &workspace_name,
+                    ancillary_num.unwrap_or(0),
+                    Some(&config.proxy),
+                )?;
+                eprintln!("Setup complete.");
+            }
+            HookArg::Destroy => {
+                eprintln!(
+                    "Running destroy for workspace '{}' in {}",
+                    workspace_name,
+                    workspace_path.display()
+                );
+                workspace_mgr.run_destroy(
+                    &segment_path,
+                    &workspace_path,
+                    &workspace_name,
+                    Some(&config.proxy),
+                )?;
+                eprintln!("Destroy complete.");
+            }
+        }
+        return Ok(());
+    }
+
+    let workspace_root = config
+        .ancillary
+        .workspace_root
+        .clone()
+        .context("workspace_root not configured in toren.toml")?;
+
+    let workspace_mgr = WorkspaceManager::new(workspace_root);
+    let segment_mgr = SegmentManager::new(config)?;
+    let segment = resolve_segment(&segment_mgr, segment_name)?;
+
+    if let Some(ref ws_name) = workspace {
+        let ws_name_lower = ws_name.to_lowercase();
+        let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name_lower);
+
+        if !ws_path.exists() {
+            anyhow::bail!("Workspace '{}' not found at {}", ws_name_lower, ws_path.display());
+        }
+
+        let (program, args): (String, Vec<String>) = if cmd.is_empty() {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            (shell, vec![])
+        } else {
+            (cmd[0].clone(), cmd[1..].to_vec())
+        };
+
+        println!("{}", ws_path.display());
+        let err = Command::new(&program)
+            .args(&args)
+            .current_dir(&ws_path)
+            .exec();
+        Err(err).with_context(|| format!("Failed to exec: {}", program))
+    } else if !cmd.is_empty() {
+        // No workspace, command given — run in cwd
+        let (program, args) = (cmd[0].clone(), cmd[1..].to_vec());
+        let err = Command::new(&program).args(&args).exec();
+        Err(err).with_context(|| format!("Failed to exec: {}", program))
+    } else {
+        // No workspace, no command — create new workspace and drop into shell
+        let mut assignment_mgr = AssignmentManager::new()?;
+        let existing_workspaces = workspace_mgr
+            .list_workspaces(&segment.path)
+            .unwrap_or_default();
+        let ancillary_id_str = assignment_mgr.next_available_ancillary(
+            &segment.name,
+            config.ancillary.pool_size,
+            &existing_workspaces,
+        );
+        let ancillary_num = toren_lib::ancillary_number(&ancillary_id_str).unwrap_or(1);
+
+        let base_branch = workspace_mgr.active_branch(&segment.path);
+        let ws_name = workspace_name_for_number(ancillary_num);
+
+        let (ws_path, _) = workspace_mgr.create_workspace_with_setup(
+            &segment.path,
+            &segment.name,
+            &ws_name,
+            ancillary_num,
+            Some(&config.proxy),
+        )?;
+
+        assignment_mgr.create(
+            &ancillary_id_str,
+            None,
+            AssignmentSource::Prompt {
+                original_prompt: "(interactive shell)".to_string(),
+            },
+            &segment.name,
+            ws_path.clone(),
+            None,
+            base_branch,
+        )?;
+
+        eprintln!("Created workspace: {}", ws_path.display());
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        println!("{}", ws_path.display());
+        let err = Command::new(&shell).current_dir(&ws_path).exec();
+        Err(err).context("Failed to exec shell")
+    }
+}
+
+// ─── list ───────────────────────────────────────────────────────────────────
+
+fn cmd_list(
+    config: &Config,
+    reference: Option<String>,
+    all_segments: bool,
+    segment_name: Option<String>,
+    detail: bool,
+) -> Result<()> {
     let workspace_root = config.ancillary.workspace_root.clone();
     let segment_mgr = SegmentManager::new(config)?;
     let mut assignment_mgr = AssignmentManager::new()?;
+
+    // If a specific reference is given and --detail, show detailed info
+    if let Some(ref reference) = reference {
+        if detail {
+            return cmd_list_detail(config, &segment_mgr, &mut assignment_mgr, reference);
+        }
+    }
 
     // Determine which segment(s) to list
     let (assignments, segments, scope_label): (Vec<_>, Vec<Segment>, String) = if all_segments {
@@ -498,7 +702,6 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
             .unwrap_or_default();
         (assignments, segments, name.clone())
     } else {
-        // Default: current segment
         let segment = resolve_segment(&segment_mgr, None)?;
         let name = segment.name.clone();
         let assignments = assignment_mgr
@@ -514,70 +717,28 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
         .map(|(w, _)| w.0 as usize)
         .unwrap_or(80);
 
-    // Fixed column widths: workspace(10) + bead_id(15) + activity(6) + assignee(10) + spaces(4)
-    let fixed_width: usize = 10 + 15 + 6 + 10 + 4;
-    let narrow = term_width < fixed_width + 15;
+    // Fixed column widths: workspace(10) + ext_id(15) + activity(6) + spaces(3)
+    let fixed_width: usize = 10 + 15 + 6 + 3;
 
     for assignment in &assignments {
-        // Fetch composite status signals
-        let segment_path = segment_mgr
-            .find_by_name(&assignment.segment)
-            .map(|s| s.path.clone());
-
-        // 1. Bead status + assignee (from bd)
-        let bead_info = segment_path
-            .as_ref()
-            .and_then(|seg_path| {
-                toren_lib::tasks::beads::fetch_bead_info(&assignment.bead_id, seg_path).ok()
-            });
-
-        // 2. Agent activity (from Claude session log last-entry-type)
+        // Agent activity
         let agent_activity = toren_lib::composite_status::detect_agent_activity(
             &assignment.workspace_path,
         );
 
-        // 3. Has changes (VCS-agnostic)
+        // Has changes
         let has_changes = toren_lib::composite_status::workspace_has_changes(
             &assignment.workspace_path,
             assignment.base_branch.as_deref(),
         );
 
-        // 4. Assignee
-        let assignee = bead_info
-            .as_ref()
-            .map(|b| b.assignee.as_str())
-            .unwrap_or("");
-        let assignee_display = if assignee.is_empty() {
-            String::new()
-        } else {
-            format!("@{}", assignee)
-        };
-
-        // 5. Title — use available terminal width
-        let title_max = if narrow {
-            term_width.saturating_sub(4) // indented on next line
-        } else {
-            term_width.saturating_sub(fixed_width)
-        };
-        let title = bead_info
-            .as_ref()
-            .map(|b| truncate_title(&b.title, title_max))
-            .or_else(|| {
-                segment_path
-                    .as_ref()
-                    .and_then(|seg| toren_lib::tasks::fetch_task(&assignment.bead_id, seg).ok())
-                    .map(|task| truncate_title(&task.title, title_max))
-            })
-            .unwrap_or_else(|| "-".to_string());
-
-        // 6. Workspace name — extract short name, mark dirty with *
+        // Workspace name — extract short name, mark dirty with *
         let ancillary_name = assignment
             .ancillary_id
             .split_whitespace()
             .last()
             .unwrap_or(&assignment.ancillary_id);
 
-        // Pad plain text first, then colorize (ANSI codes break format width)
         let ws_text = if has_changes {
             format!("{:<10}", format!("{} *", ancillary_name))
         } else {
@@ -589,6 +750,12 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
             ws_text.normal()
         };
 
+        // External ID (if any)
+        let ext_id_display = assignment
+            .external_id
+            .as_deref()
+            .unwrap_or("-");
+
         let activity_text = format!("{:<6}", agent_activity);
         let activity_colored = if agent_activity == "busy" {
             activity_text.yellow()
@@ -596,16 +763,23 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
             activity_text.green()
         };
 
-        if narrow {
+        if detail {
+            // In detail mode, show title too
+            let title_max = term_width.saturating_sub(fixed_width);
+            let title = assignment
+                .title
+                .as_deref()
+                .map(|t| truncate_title(t, title_max))
+                .unwrap_or_else(|| "-".to_string());
+
             println!(
-                "{} {:<15} {} {:<10}",
-                ws_colored, assignment.bead_id, activity_colored, assignee_display
+                "{} {:<15} {} {}",
+                ws_colored, ext_id_display, activity_colored, title
             );
-            println!("    {}", title);
         } else {
             println!(
-                "{} {:<15} {} {:<10} {}",
-                ws_colored, assignment.bead_id, activity_colored, assignee_display, title
+                "{} {:<15} {}",
+                ws_colored, ext_id_display, activity_colored
             );
         }
     }
@@ -636,57 +810,147 @@ fn cmd_list(config: &Config, all_segments: bool, segment_name: Option<String>) -
     Ok(())
 }
 
-/// Find workspace directories that exist on disk but are not tracked by VCS
-/// and have no assignment record.
-fn find_orphaned_workspaces(
-    ws_mgr: &WorkspaceManager,
-    segments: &[Segment],
-    assignments: &[&toren_lib::Assignment],
-) -> Vec<(String, String, std::path::PathBuf)> {
-    let mut orphans = Vec::new();
+fn cmd_list_detail(
+    config: &Config,
+    segment_mgr: &SegmentManager,
+    assignment_mgr: &mut AssignmentManager,
+    reference: &str,
+) -> Result<()> {
+    let segment = resolve_segment(segment_mgr, None)?;
+    let ref_ = AssignmentRef::parse(reference, &segment.name);
+    let assignments = assignment_mgr.resolve(&ref_);
 
-    for segment in segments {
-        // Get VCS-tracked workspace names (works for both jj and git)
-        let tracked_workspaces = ws_mgr.list_workspaces(&segment.path).unwrap_or_default();
-
-        // Get assignment workspace paths for this segment
-        let assigned_paths: std::collections::HashSet<_> = assignments
-            .iter()
-            .filter(|a| a.segment.to_lowercase() == segment.name.to_lowercase())
-            .map(|a| a.workspace_path.clone())
-            .collect();
-
-        // Scan workspace directory for this segment
-        let segment_ws_dir = ws_mgr.workspace_path(&segment.name, "");
-        if let Ok(entries) = std::fs::read_dir(&segment_ws_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let ws_name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                };
-
-                // Skip if tracked by VCS
-                if tracked_workspaces.contains(&ws_name) {
-                    continue;
-                }
-
-                // Skip if has an assignment record
-                if assigned_paths.contains(&path) {
-                    continue;
-                }
-
-                // This is an orphaned directory
-                orphans.push((segment.name.clone(), ws_name, path));
-            }
-        }
+    if assignments.is_empty() {
+        anyhow::bail!("No assignment found for: {}", reference);
     }
 
-    orphans
+    for assignment in assignments {
+        println!("Assignment: {}", assignment.id);
+        println!("  Ancillary:    {}", assignment.ancillary_id);
+        if let Some(ref ext_id) = assignment.external_id {
+            println!("  External ID:  {}", ext_id);
+        }
+        println!("  Segment:      {}", assignment.segment);
+        println!("  Status:       {:?}", assignment.status);
+        println!("  Source:       {:?}", assignment.source);
+        println!("  Workspace:    {}", assignment.workspace_path.display());
+        if let Some(ref title) = assignment.title {
+            println!("  Title:        {}", title);
+        }
+        if let Some(ref branch) = assignment.base_branch {
+            println!("  Base:         {}", branch);
+        }
+        if let Some(ref sid) = assignment.session_id {
+            println!("  Session:      {}", sid);
+        }
+        println!("  Created:      {}", assignment.created_at);
+        println!("  Updated:      {}", assignment.updated_at);
+
+        // Show workspace info if exists
+        if assignment.workspace_path.exists() {
+            println!("\nRecent changes:");
+            if assignment.workspace_path.join(".jj").exists() {
+                let _ = Command::new("jj")
+                    .args(["log", "-n", "5"])
+                    .current_dir(&assignment.workspace_path)
+                    .status();
+            } else if assignment.workspace_path.join(".git").exists() {
+                let base = assignment.base_branch.as_deref().unwrap_or("main");
+                let range = format!("{}..HEAD", base);
+                let _ = Command::new("git")
+                    .args(["log", "--oneline", &range])
+                    .current_dir(&assignment.workspace_path)
+                    .status();
+            }
+        } else {
+            println!("\n(Workspace not found)");
+        }
+
+        // Show bead info if external_id present
+        if let Some(ref ext_id) = assignment.external_id {
+            let seg_path = segment_mgr
+                .find_by_name(&assignment.segment)
+                .map(|s| s.path);
+            if let Some(seg_path) = seg_path {
+                println!("\nTask details:");
+                let _ = Command::new("bd")
+                    .args(["show", ext_id])
+                    .current_dir(&seg_path)
+                    .status();
+            }
+        }
+
+        println!();
+    }
+
+    let _ = config; // suppress unused warning
+    Ok(())
 }
+
+// ─── clean ──────────────────────────────────────────────────────────────────
+
+fn cmd_clean(
+    config: &Config,
+    workspace: &str,
+    kill: bool,
+    push: bool,
+    segment_name: Option<&str>,
+) -> Result<()> {
+    let workspace_root = config
+        .ancillary
+        .workspace_root
+        .clone()
+        .context("workspace_root not configured")?;
+
+    let segment_mgr = SegmentManager::new(config)?;
+    let workspace_mgr = WorkspaceManager::new(workspace_root);
+    let mut assignment_mgr = AssignmentManager::new()?;
+
+    let segment = resolve_segment(&segment_mgr, segment_name)?;
+
+    // Resolve workspace name to assignment
+    let ws_name = workspace.to_lowercase();
+    let ancillary_num = toren_lib::word_to_number(&ws_name).unwrap_or(0);
+    let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
+
+    let assignment = assignment_mgr
+        .get_active_for_ancillary(&ancillary_id_str)
+        .cloned()
+        .with_context(|| format!("No assignment found for workspace '{}'", ws_name))?;
+
+    // Render auto-commit message
+    let auto_commit_message = toren_lib::render_auto_commit_message(
+        &config.ancillary,
+        &assignment,
+        &segment.name,
+        &segment.path,
+    );
+
+    eprintln!(
+        "Cleaning workspace: {} ({})",
+        ws_name,
+        assignment.workspace_path.display()
+    );
+
+    let opts = toren_lib::CleanOptions {
+        push,
+        segment_path: &segment.path,
+        proxy_config: Some(&config.proxy),
+        kill,
+        auto_commit_message,
+    };
+
+    let result =
+        toren_lib::clean_assignment(&assignment, &mut assignment_mgr, &workspace_mgr, &opts)?;
+
+    // Structured JSON to stdout
+    let json = serde_json::to_string(&result)?;
+    println!("{}", json);
+
+    Ok(())
+}
+
+// ─── cleanup ────────────────────────────────────────────────────────────────
 
 fn cmd_cleanup(config: &Config, all_segments: bool, segment_name: Option<String>) -> Result<()> {
     let workspace_root = config
@@ -699,7 +963,6 @@ fn cmd_cleanup(config: &Config, all_segments: bool, segment_name: Option<String>
     let mut assignment_mgr = AssignmentManager::new()?;
     let ws_mgr = WorkspaceManager::new(workspace_root);
 
-    // Determine which segment(s) to clean up
     let (assignments, segments): (Vec<_>, Vec<Segment>) = if all_segments {
         let assignments = assignment_mgr.list_active().into_iter().collect();
         let segments = segment_mgr.list_all();
@@ -743,190 +1006,14 @@ fn cmd_cleanup(config: &Config, all_segments: bool, segment_name: Option<String>
     Ok(())
 }
 
-fn truncate_title(title: &str, max_len: usize) -> String {
-    if title.len() <= max_len {
-        title.to_string()
-    } else {
-        format!("{}...", &title[..max_len - 3])
-    }
-}
+// ─── dismiss ────────────────────────────────────────────────────────────────
 
-fn cmd_show(config: &Config, reference: &str) -> Result<()> {
+fn cmd_dismiss(config: &Config, reference: &str) -> Result<()> {
     let segment_mgr = SegmentManager::new(config)?;
     let mut assignment_mgr = AssignmentManager::new()?;
-
     let segment = resolve_segment(&segment_mgr, None)?;
+
     let ref_ = AssignmentRef::parse(reference, &segment.name);
-    let assignments = assignment_mgr.resolve(&ref_);
-
-    if assignments.is_empty() {
-        // Fall back to showing bead directly
-        let bead_id = match &ref_ {
-            AssignmentRef::Bead(id) => id.as_str(),
-            AssignmentRef::Ancillary(_) => {
-                anyhow::bail!("No assignment found for: {}", reference);
-            }
-        };
-
-        let status = Command::new("bd")
-            .args(["show", bead_id])
-            .current_dir(&segment.path)
-            .status()?;
-
-        if !status.success() {
-            anyhow::bail!("Failed to show bead");
-        }
-        return Ok(());
-    }
-
-    for assignment in assignments {
-        println!("Assignment: {}", assignment.id);
-        println!("  Ancillary: {}", assignment.ancillary_id);
-        println!("  Bead:      {}", assignment.bead_id);
-        println!("  Segment:   {}", assignment.segment);
-        println!("  Status:    {:?}", assignment.status);
-        println!("  Source:    {:?}", assignment.source);
-        println!("  Workspace: {}", assignment.workspace_path.display());
-        if let Some(ref branch) = assignment.base_branch {
-            println!("  Base:      {}", branch);
-        }
-        println!("  Created:   {}", assignment.created_at);
-        println!("  Updated:   {}", assignment.updated_at);
-
-        // Show bead info
-        println!("\nBead details:");
-        let _ = Command::new("bd")
-            .args(["show", &assignment.bead_id])
-            .current_dir(
-                assignment
-                    .workspace_path
-                    .parent()
-                    .unwrap_or(&assignment.workspace_path),
-            )
-            .status();
-
-        // Show workspace info if exists — use VCS-appropriate log command
-        if assignment.workspace_path.exists() {
-            println!("\nRecent changes:");
-            if assignment.workspace_path.join(".jj").exists() {
-                let _ = Command::new("jj")
-                    .args(["log", "-n", "5"])
-                    .current_dir(&assignment.workspace_path)
-                    .status();
-            } else if assignment.workspace_path.join(".git").exists() {
-                let base = assignment.base_branch.as_deref().unwrap_or("main");
-                let range = format!("{}..HEAD", base);
-                let _ = Command::new("git")
-                    .args(["log", "--oneline", &range])
-                    .current_dir(&assignment.workspace_path)
-                    .status();
-            }
-        } else {
-            println!("\n(Workspace not found - use `breq resume` to recreate)");
-        }
-
-        println!();
-    }
-
-    Ok(())
-}
-
-fn cmd_resume(
-    config: &Config,
-    reference: &str,
-    instruction: Option<&str>,
-    danger: bool,
-) -> Result<()> {
-    let workspace_root = config
-        .ancillary
-        .workspace_root
-        .clone()
-        .context("workspace_root not configured")?;
-
-    let segment_mgr = SegmentManager::new(config)?;
-    let workspace_mgr = WorkspaceManager::new(workspace_root);
-    let mut assignment_mgr = AssignmentManager::new()?;
-
-    let segment = resolve_segment(&segment_mgr, None)?;
-    let ref_ = AssignmentRef::parse(reference, &segment.name);
-
-    // Find assignment (all assignments are active — terminal actions remove them)
-    let assignment = {
-        let assignments = assignment_mgr.resolve(&ref_);
-
-        if assignments.is_empty() {
-            anyhow::bail!("No assignment found for: {}", reference);
-        }
-
-        if assignments.len() > 1 {
-            println!("Multiple assignments found:");
-            for a in &assignments {
-                println!("  {} -> {}", a.ancillary_id, a.bead_id);
-            }
-            anyhow::bail!("Please specify a unique ancillary or bead");
-        }
-
-        assignments[0].clone()
-    };
-
-    // Use shared resume logic
-    let opts = toren_lib::ResumeOptions {
-        instruction,
-        segment_path: &segment.path,
-        segment_name: &segment.name,
-        proxy_config: Some(&config.proxy),
-    };
-
-    let result =
-        toren_lib::prepare_resume(&assignment, &mut assignment_mgr, &workspace_mgr, &opts)?;
-
-    if result.workspace_recreated {
-        println!(
-            "Workspace recreated: {}",
-            assignment.workspace_path.display()
-        );
-    }
-
-    println!(
-        "Resuming session in workspace: {}\n",
-        assignment.workspace_path.display()
-    );
-
-    // Check if we have a session_id for --resume handoff
-    let session_id = assignment_mgr
-        .get(&assignment.id)
-        .and_then(|a| a.session_id.clone());
-
-    let mut cmd = Command::new("claude");
-    if danger {
-        cmd.arg("--dangerously-skip-permissions");
-    }
-    if let Some(sid) = session_id {
-        cmd.arg("--resume").arg(&sid);
-    } else {
-        cmd.arg(&result.prompt);
-    }
-    cmd.current_dir(&assignment.workspace_path);
-
-    let err = cmd.exec();
-    Err(err).context("Failed to exec claude")
-}
-
-fn cmd_abort(config: &Config, reference: &str, close: bool, kill: bool) -> Result<()> {
-    let workspace_root = config
-        .ancillary
-        .workspace_root
-        .clone()
-        .context("workspace_root not configured")?;
-
-    let segment_mgr = SegmentManager::new(config)?;
-    let workspace_mgr = WorkspaceManager::new(workspace_root);
-    let mut assignment_mgr = AssignmentManager::new()?;
-
-    let segment = resolve_segment(&segment_mgr, None)?;
-    let ref_ = AssignmentRef::parse(reference, &segment.name);
-
-    // Get all assignments (active or not) to abort
     let assignments: Vec<_> = assignment_mgr
         .resolve(&ref_)
         .iter()
@@ -934,391 +1021,22 @@ fn cmd_abort(config: &Config, reference: &str, close: bool, kill: bool) -> Resul
         .collect();
 
     if assignments.is_empty() {
-        // No assignment found - handle as bead reference for cleanup
-        let bead_id = match &ref_ {
-            AssignmentRef::Bead(id) => id.clone(),
-            AssignmentRef::Ancillary(anc) => {
-                // Try to find workspace by ancillary name
-                let ws_name = anc.split_whitespace().last().unwrap_or(anc).to_lowercase();
-                let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name);
-                if ws_path.exists() {
-                    println!("Cleaning up orphaned workspace: {}", ws_path.display());
-                    workspace_mgr.cleanup_workspace(
-                        &segment.path,
-                        &segment.name,
-                        &ws_name,
-                        None,
-                        toren_lib::workspace::CleanupMode::Abort,
-                    )?;
-                    println!("Workspace removed.");
-                } else {
-                    println!("No assignment or workspace found for: {}", reference);
-                }
-                return Ok(());
-            }
-        };
-
-        // Try to cleanup workspace if it exists (orphaned workspace case)
-        let _ = workspace_mgr.cleanup_workspace(
-            &segment.path,
-            &segment.name,
-            &bead_id,
-            None,
-            toren_lib::workspace::CleanupMode::Abort,
-        );
-
-        if close {
-            println!("Closing bead {}...", bead_id);
-            toren_lib::tasks::beads::update_bead_status(&bead_id, "closed", &segment.path)?;
-            info!("Bead closed.");
-        } else {
-            // Unassign and reopen
-            let _ = toren_lib::tasks::beads::update_bead_assignee(&bead_id, "", &segment.path);
-            toren_lib::tasks::beads::update_bead_status(&bead_id, "open", &segment.path)?;
-            println!("Bead {} unassigned and returned to open.", bead_id);
-        }
-        return Ok(());
+        anyhow::bail!("No assignment found for: {}", reference);
     }
-
-    // Process each assignment using shared abort logic
-    let opts = toren_lib::AbortOptions {
-        close_bead: close,
-        segment_path: &segment.path,
-        proxy_config: Some(&config.proxy),
-        kill,
-    };
 
     for assignment in &assignments {
+        assignment_mgr.remove(&assignment.id)?;
         println!(
-            "Aborting: {} -> {}",
-            assignment.ancillary_id, assignment.bead_id
+            "Dismissed: {} ({})",
+            assignment.ancillary_id,
+            assignment.external_id.as_deref().unwrap_or("-")
         );
-
-        toren_lib::abort_assignment(assignment, &mut assignment_mgr, &workspace_mgr, &opts)?;
-
-        if close {
-            println!("Bead {} closed.", assignment.bead_id);
-        } else {
-            println!(
-                "Bead {} unassigned and returned to open.",
-                assignment.bead_id
-            );
-        }
     }
 
     Ok(())
 }
 
-fn cmd_complete(config: &Config, reference: &str, push: bool, keep_open: bool, kill: bool) -> Result<()> {
-    let workspace_root = config
-        .ancillary
-        .workspace_root
-        .clone()
-        .context("workspace_root not configured")?;
-
-    let segment_mgr = SegmentManager::new(config)?;
-    let workspace_mgr = WorkspaceManager::new(workspace_root);
-    let mut assignment_mgr = AssignmentManager::new()?;
-
-    let segment = resolve_segment(&segment_mgr, None)?;
-    let ref_ = AssignmentRef::parse(reference, &segment.name);
-
-    // Find the assignment
-    let assignment = {
-        let assignments = assignment_mgr.resolve_active(&ref_);
-
-        if assignments.is_empty() {
-            // No assignment found - check if this is a bead reference
-            let bead_id = match &ref_ {
-                AssignmentRef::Bead(id) => id.clone(),
-                AssignmentRef::Ancillary(_) => {
-                    anyhow::bail!("No active assignment found for: {}", reference);
-                }
-            };
-
-            // No assignment, just close the bead if requested
-            if !keep_open {
-                println!("No assignment found, closing bead {}...", bead_id);
-                toren_lib::tasks::beads::update_bead_status(&bead_id, "closed", &segment.path)?;
-                info!("Bead closed.");
-            } else {
-                println!("No assignment found for bead {}.", bead_id);
-            }
-            return Ok(());
-        }
-
-        if assignments.len() > 1 {
-            println!("Multiple active assignments found:");
-            for a in &assignments {
-                println!("  {} -> {}", a.ancillary_id, a.bead_id);
-            }
-            anyhow::bail!("Please specify a unique reference");
-        }
-
-        assignments[0].clone()
-    };
-
-    println!(
-        "Completing: {} -> {}",
-        assignment.ancillary_id, assignment.bead_id
-    );
-
-    // Show changes before cleanup (interactive output for CLI)
-    if assignment.workspace_path.exists() {
-        println!("\nChanges:");
-        if assignment.workspace_path.join(".jj").exists() {
-            let output = Command::new("jj")
-                .args(["log", "-r", "@"])
-                .current_dir(&assignment.workspace_path)
-                .output();
-
-            if let Ok(output) = output {
-                if !output.stdout.is_empty() {
-                    print!("{}", String::from_utf8_lossy(&output.stdout));
-                }
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                for line in stderr.lines() {
-                    if !line.contains("working copy is stale")
-                        && !line.contains("workspace update-stale")
-                    {
-                        eprintln!("{}", line);
-                    }
-                }
-            }
-        } else if assignment.workspace_path.join(".git").exists() {
-            let base = assignment.base_branch.as_deref().unwrap_or("main");
-            let range = format!("{}..HEAD", base);
-            let _ = Command::new("git")
-                .args(["log", "--oneline", &range])
-                .current_dir(&assignment.workspace_path)
-                .status();
-        }
-    } else {
-        println!("(Workspace already cleaned up)");
-    }
-
-    // Render auto-commit message
-    let auto_commit_message = toren_lib::render_auto_commit_message(
-        &config.ancillary,
-        &assignment,
-        &segment.name,
-        &segment.path,
-    );
-
-    // Use shared complete logic
-    let opts = toren_lib::CompleteOptions {
-        push,
-        keep_open,
-        segment_path: &segment.path,
-        proxy_config: Some(&config.proxy),
-        kill,
-        auto_commit_message,
-    };
-
-    let result =
-        toren_lib::complete_assignment(&assignment, &mut assignment_mgr, &workspace_mgr, &opts)?;
-
-    if !keep_open {
-        println!("Bead closed.");
-    }
-
-    // Print workspace info (commits in this workspace)
-    if !result.workspace_info.is_empty() {
-        println!("\nWorkspace commits:");
-        for commit in &result.workspace_info {
-            println!(
-                "  {} {}",
-                &commit.id[..12.min(commit.id.len())],
-                commit.summary
-            );
-        }
-    }
-
-    // Print integration instructions
-    if let Some(rev) = result.revision {
-        if !result.pushed {
-            // Detect VCS type for appropriate instructions
-            let repo_type = workspace_mgr.repo_type(&segment.path);
-            match repo_type {
-                Some(toren_lib::workspace::RepoType::Git) => {
-                    if let Some(ref base) = assignment.base_branch {
-                        println!(
-                            "\nBranch preserved. To integrate: git merge {}",
-                            assignment
-                                .workspace_path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown")
-                        );
-                        println!("  (branched from {})", base);
-                    }
-                }
-                _ => {
-                    println!("\nCommit preserved at: {}", &rev[..12.min(rev.len())]);
-                    println!(
-                        "To integrate: jj rebase -r {} -d main",
-                        &rev[..12.min(rev.len())]
-                    );
-                }
-            }
-        } else {
-            println!("Pushed.");
-        }
-    }
-
-    Ok(())
-}
-
-/// Detect workspace context from current directory.
-/// Supports both jj workspaces and git worktrees.
-fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
-    let cwd = std::env::current_dir()?;
-
-    // Check for jj workspace
-    if cwd.join(".jj").exists() {
-        return detect_jj_workspace_context(&cwd);
-    }
-
-    // Check for git worktree (.git file, not directory)
-    let git_entry = cwd.join(".git");
-    if git_entry.exists() && git_entry.is_file() {
-        return detect_git_worktree_context(&cwd);
-    }
-
-    anyhow::bail!(
-        "Not in a VCS workspace. Run this command from within a jj workspace or git worktree."
-    );
-}
-
-/// Detect jj workspace context from current directory
-fn detect_jj_workspace_context(
-    cwd: &std::path::Path,
-) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
-    let output = Command::new("jj")
-        .args(["workspace", "root"])
-        .current_dir(cwd)
-        .output()
-        .context("Failed to run jj workspace root")?;
-
-    if !output.status.success() {
-        anyhow::bail!("Failed to determine workspace root");
-    }
-
-    let workspace_path =
-        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
-
-    let workspace_name = workspace_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("Invalid workspace path")?
-        .to_string();
-
-    // Find the repo root (segment path) - look for .toren.kdl or .jj (repo root)
-    let mut segment_path = None;
-    let mut check_path = workspace_path.parent();
-    while let Some(parent) = check_path {
-        if parent.join(".toren.kdl").exists() {
-            segment_path = Some(parent.to_path_buf());
-            break;
-        }
-        // Also check if this is the repo root (has .jj and is not the workspace)
-        if parent.join(".jj").exists() && parent != workspace_path {
-            segment_path = Some(parent.to_path_buf());
-            break;
-        }
-        check_path = parent.parent();
-    }
-
-    let segment_path = segment_path
-        .context("Could not find segment root. Ensure you're in a breq-managed workspace.")?;
-
-    Ok((segment_path, workspace_path, workspace_name))
-}
-
-/// Detect git worktree context from current directory
-fn detect_git_worktree_context(
-    cwd: &std::path::Path,
-) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(cwd)
-        .output()
-        .context("Failed to run git rev-parse --show-toplevel")?;
-
-    if !output.status.success() {
-        anyhow::bail!("Failed to determine git worktree root");
-    }
-
-    let workspace_path =
-        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
-
-    let workspace_name = workspace_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("Invalid workspace path")?
-        .to_string();
-
-    // Find the segment path by walking up — look for .toren.kdl or .git directory
-    let mut segment_path = None;
-    let mut check_path = workspace_path.parent();
-    while let Some(parent) = check_path {
-        if parent.join(".toren.kdl").exists() {
-            segment_path = Some(parent.to_path_buf());
-            break;
-        }
-        // Check if this is the main git repo root (.git is a directory, not a file)
-        if parent.join(".git").is_dir() && parent != workspace_path {
-            segment_path = Some(parent.to_path_buf());
-            break;
-        }
-        check_path = parent.parent();
-    }
-
-    let segment_path = segment_path
-        .context("Could not find segment root. Ensure you're in a breq-managed workspace.")?;
-
-    Ok((segment_path, workspace_path, workspace_name))
-}
-
-fn cmd_go(
-    config: &Config,
-    workspace: &str,
-    segment_name: Option<&str>,
-    cmd: Vec<String>,
-) -> Result<()> {
-    let workspace_root = config
-        .ancillary
-        .workspace_root
-        .clone()
-        .context("workspace_root not configured in toren.toml")?;
-
-    let workspace_mgr = WorkspaceManager::new(workspace_root);
-    let segment_mgr = SegmentManager::new(config)?;
-    let segment = resolve_segment(&segment_mgr, segment_name)?;
-
-    // Resolve workspace name: could be a word like "one" or an ancillary reference
-    let ws_name = workspace.to_lowercase();
-    let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name);
-
-    if !ws_path.exists() {
-        anyhow::bail!("Workspace '{}' not found at {}", ws_name, ws_path.display());
-    }
-
-    let (program, args): (String, Vec<String>) = if cmd.is_empty() {
-        // No command: spawn an interactive shell in the workspace
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        (shell, vec![])
-    } else {
-        (cmd[0].clone(), cmd[1..].to_vec())
-    };
-
-    println!("{}", ws_path.display());
-    let err = Command::new(&program)
-        .args(&args)
-        .current_dir(&ws_path)
-        .exec();
-    Err(err).with_context(|| format!("Failed to exec: {}", program))
-}
+// ─── proxy ──────────────────────────────────────────────────────────────────
 
 fn cmd_proxy(
     config: &Config,
@@ -1441,41 +1159,11 @@ fn cmd_proxy_list(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ws_setup(config: &Config) -> Result<()> {
-    let workspace_root = config
-        .ancillary
-        .workspace_root
-        .clone()
-        .context("workspace_root not configured")?;
-
-    let workspace_mgr = WorkspaceManager::new(workspace_root);
-
-    let (segment_path, workspace_path, workspace_name) = detect_workspace_context()?;
-    // Infer ancillary number from workspace name (e.g., "one" -> 1)
-    let ancillary_num = toren_lib::word_to_number(&workspace_name);
-
-    println!(
-        "Running setup for workspace '{}' in {}",
-        workspace_name,
-        workspace_path.display()
-    );
-
-    workspace_mgr.run_setup(
-        &segment_path,
-        &workspace_path,
-        &workspace_name,
-        ancillary_num.unwrap_or(0),
-        Some(&config.proxy),
-    )?;
-
-    println!("Setup complete.");
-    Ok(())
-}
+// ─── init ───────────────────────────────────────────────────────────────────
 
 fn cmd_init(stealth: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
-    // Must be in a VCS repo
     let has_jj = cwd.join(".jj").exists();
     let has_git = cwd.join(".git").exists();
 
@@ -1507,7 +1195,6 @@ fn cmd_init(stealth: bool) -> Result<()> {
             );
         }
     } else {
-        // Git repo
         let output = Command::new("git")
             .args(["rev-parse", "--show-toplevel"])
             .current_dir(&cwd)
@@ -1538,9 +1225,7 @@ fn cmd_init(stealth: bool) -> Result<()> {
     let mut copy_entries: Vec<String> = Vec::new();
     let mut share_entries: Vec<String> = Vec::new();
 
-    // Check for .beads directory
     if cwd.join(".beads").exists() {
-        // If .beads is tracked by VCS, skip it - workspaces will get it from the repo
         let is_tracked = std::process::Command::new("git")
             .args(["ls-files", "--error-unmatch", ".beads"])
             .current_dir(&cwd)
@@ -1554,7 +1239,6 @@ fn cmd_init(stealth: bool) -> Result<()> {
         }
     }
 
-    // Discover build artifact directories from .gitignore
     let well_known_artifacts = [
         "target",
         "node_modules",
@@ -1579,10 +1263,8 @@ fn cmd_init(stealth: bool) -> Result<()> {
                 continue;
             }
 
-            // Check if this gitignored entry matches a well-known artifact dir
             for artifact in &well_known_artifacts {
                 if line == *artifact || line.ends_with(&format!("/{}", artifact)) {
-                    // Check if the directory actually exists in the repo
                     let artifact_path = cwd.join(line);
                     if artifact_path.is_dir() {
                         let entry = line.to_string();
@@ -1595,7 +1277,6 @@ fn cmd_init(stealth: bool) -> Result<()> {
         }
     }
 
-    // Also check for well-known artifacts that exist even if not in .gitignore
     for artifact in &well_known_artifacts {
         let artifact_path = cwd.join(artifact);
         if artifact_path.is_dir() {
@@ -1606,7 +1287,6 @@ fn cmd_init(stealth: bool) -> Result<()> {
         }
     }
 
-    // Generate .toren.kdl content
     let mut kdl = String::from("setup {\n");
     for entry in &share_entries {
         kdl.push_str(&format!("    share src=\"{}\"\n", entry));
@@ -1627,7 +1307,6 @@ fn cmd_init(stealth: bool) -> Result<()> {
         println!("  copy src=\"{}\"", entry);
     }
 
-    // Stealth mode: add to .git/info/exclude
     if stealth {
         let git_info_dir = cwd.join(".git").join("info");
         if git_info_dir.exists() {
@@ -1651,25 +1330,162 @@ fn cmd_init(stealth: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ws_destroy(config: &Config) -> Result<()> {
-    let workspace_root = config
-        .ancillary
-        .workspace_root
-        .clone()
-        .context("workspace_root not configured")?;
+// ─── helpers ────────────────────────────────────────────────────────────────
 
-    let workspace_mgr = WorkspaceManager::new(workspace_root);
+/// Find workspace directories that exist on disk but are not tracked by VCS
+/// and have no assignment record.
+fn find_orphaned_workspaces(
+    ws_mgr: &WorkspaceManager,
+    segments: &[Segment],
+    assignments: &[&toren_lib::Assignment],
+) -> Vec<(String, String, std::path::PathBuf)> {
+    let mut orphans = Vec::new();
 
-    let (segment_path, workspace_path, workspace_name) = detect_workspace_context()?;
+    for segment in segments {
+        let tracked_workspaces = ws_mgr.list_workspaces(&segment.path).unwrap_or_default();
 
-    println!(
-        "Running destroy for workspace '{}' in {}",
-        workspace_name,
-        workspace_path.display()
+        let assigned_paths: std::collections::HashSet<_> = assignments
+            .iter()
+            .filter(|a| a.segment.to_lowercase() == segment.name.to_lowercase())
+            .map(|a| a.workspace_path.clone())
+            .collect();
+
+        let segment_ws_dir = ws_mgr.workspace_path(&segment.name, "");
+        if let Ok(entries) = std::fs::read_dir(&segment_ws_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let ws_name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+
+                if tracked_workspaces.contains(&ws_name) {
+                    continue;
+                }
+                if assigned_paths.contains(&path) {
+                    continue;
+                }
+
+                orphans.push((segment.name.clone(), ws_name, path));
+            }
+        }
+    }
+
+    orphans
+}
+
+fn truncate_title(title: &str, max_len: usize) -> String {
+    if title.chars().count() <= max_len {
+        title.to_string()
+    } else if max_len > 3 {
+        let end: String = title.chars().take(max_len - 3).collect();
+        format!("{}...", end)
+    } else {
+        title.chars().take(max_len).collect()
+    }
+}
+
+/// Detect workspace context from current directory.
+fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let cwd = std::env::current_dir()?;
+
+    if cwd.join(".jj").exists() {
+        return detect_jj_workspace_context(&cwd);
+    }
+
+    let git_entry = cwd.join(".git");
+    if git_entry.exists() && git_entry.is_file() {
+        return detect_git_worktree_context(&cwd);
+    }
+
+    anyhow::bail!(
+        "Not in a VCS workspace. Run this command from within a jj workspace or git worktree."
     );
+}
 
-    workspace_mgr.run_destroy(&segment_path, &workspace_path, &workspace_name, Some(&config.proxy))?;
+fn detect_jj_workspace_context(
+    cwd: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let output = Command::new("jj")
+        .args(["workspace", "root"])
+        .current_dir(cwd)
+        .output()
+        .context("Failed to run jj workspace root")?;
 
-    println!("Destroy complete.");
-    Ok(())
+    if !output.status.success() {
+        anyhow::bail!("Failed to determine workspace root");
+    }
+
+    let workspace_path =
+        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+    let workspace_name = workspace_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("Invalid workspace path")?
+        .to_string();
+
+    let mut segment_path = None;
+    let mut check_path = workspace_path.parent();
+    while let Some(parent) = check_path {
+        if parent.join(".toren.kdl").exists() {
+            segment_path = Some(parent.to_path_buf());
+            break;
+        }
+        if parent.join(".jj").exists() && parent != workspace_path {
+            segment_path = Some(parent.to_path_buf());
+            break;
+        }
+        check_path = parent.parent();
+    }
+
+    let segment_path = segment_path
+        .context("Could not find segment root. Ensure you're in a breq-managed workspace.")?;
+
+    Ok((segment_path, workspace_path, workspace_name))
+}
+
+fn detect_git_worktree_context(
+    cwd: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .context("Failed to run git rev-parse --show-toplevel")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to determine git worktree root");
+    }
+
+    let workspace_path =
+        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+    let workspace_name = workspace_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("Invalid workspace path")?
+        .to_string();
+
+    let mut segment_path = None;
+    let mut check_path = workspace_path.parent();
+    while let Some(parent) = check_path {
+        if parent.join(".toren.kdl").exists() {
+            segment_path = Some(parent.to_path_buf());
+            break;
+        }
+        if parent.join(".git").is_dir() && parent != workspace_path {
+            segment_path = Some(parent.to_path_buf());
+            break;
+        }
+        check_path = parent.parent();
+    }
+
+    let segment_path = segment_path
+        .context("Could not find segment root. Ensure you're in a breq-managed workspace.")?;
+
+    Ok((segment_path, workspace_path, workspace_name))
 }

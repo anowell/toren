@@ -557,8 +557,8 @@ async fn compute_composite_status(
         segments.find_by_name(&assignment.segment).map(|s| s.path.clone())
     };
 
-    let (bead_status, bead_assignee) = if let Some(seg_path) = segment_path {
-        match toren_lib::tasks::beads::fetch_bead_info(&assignment.bead_id, &seg_path) {
+    let (bead_status, bead_assignee) = if let (Some(seg_path), Some(ref ext_id)) = (segment_path, &assignment.external_id) {
+        match toren_lib::tasks::beads::fetch_bead_info(ext_id, &seg_path) {
             Ok(info) => (info.status, info.assignee),
             Err(_) => ("unknown".to_string(), String::new()),
         }
@@ -623,7 +623,7 @@ async fn assignments_get(
         .get(&id)
         .cloned()
         .or_else(|| assignments.get_active_for_ancillary(&id).cloned())
-        .or_else(|| assignments.get_by_bead(&id).into_iter().next().cloned());
+        .or_else(|| assignments.get_by_external_id(&id).into_iter().next().cloned());
 
     drop(assignments);
 
@@ -845,9 +845,9 @@ async fn assignments_delete(
         ));
     }
 
-    // Try by bead ID
+    // Try by external ID
     let dismissed = assignments
-        .dismiss_bead(&id)
+        .dismiss_external_id(&id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if !dismissed.is_empty() {
@@ -871,9 +871,9 @@ fn resolve_assignment(assignments: &mut AssignmentManager, id: &str) -> Option<A
     if let Some(a) = assignments.get_active_for_ancillary(id) {
         return Some(a.clone());
     }
-    // Try by bead ID (first match of any status)
-    let by_bead = assignments.get_by_bead(id);
-    if let Some(a) = by_bead.into_iter().next() {
+    // Try by external ID (first match)
+    let by_ext = assignments.get_by_external_id(id);
+    if let Some(a) = by_ext.into_iter().next() {
         return Some(a.clone());
     }
     None

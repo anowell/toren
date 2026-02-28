@@ -46,20 +46,26 @@ export interface Ancillary {
 export type AssignmentStatus = 'active';
 
 export interface AssignmentSource {
-	type: 'Bead' | 'Prompt';
+	type: 'Reference' | 'Bead' | 'Prompt';
 	original_prompt?: string;
 }
 
 export interface Assignment {
 	id: string;
 	ancillary_id: string;
-	bead_id: string;
+	/** External identifier (e.g., bead ID). New canonical field. */
+	external_id?: string;
+	/** @deprecated Use external_id. Kept for backward compat with daemon responses. */
+	bead_id?: string;
 	segment: string;
 	workspace_path: string;
 	source: AssignmentSource;
 	status: AssignmentStatus;
 	created_at: string;
 	updated_at: string;
+	/** Display title. New canonical field. */
+	title?: string;
+	/** @deprecated Use title. Kept for backward compat. */
 	bead_title?: string;
 	session_id?: string;
 	ancillary_num?: number;
@@ -117,7 +123,7 @@ export type WorkOp =
 	| { type: 'command_start'; command: string; args: string[] }
 	| { type: 'command_output'; stdout?: string; stderr?: string }
 	| { type: 'command_exit'; code: number }
-	| { type: 'assignment_started'; bead_id: string }
+	| { type: 'assignment_started'; bead_id: string; external_id?: string }
 	| { type: 'assignment_completed' }
 	| { type: 'assignment_failed'; error: string }
 	| { type: 'status_change'; status: string }

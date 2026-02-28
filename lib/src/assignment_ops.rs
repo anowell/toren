@@ -1,9 +1,10 @@
 //! Shared assignment lifecycle operations used by both breq CLI and toren daemon.
 //!
-//! These functions implement the complete/abort/resume logic so both interfaces
+//! These functions implement the complete/abort/resume/clean logic so both interfaces
 //! behave identically.
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::path::Path;
 use tracing::info;
 
@@ -81,6 +82,35 @@ pub struct ResumeResult {
     pub setup_result: SetupResult,
 }
 
+/// Options for cleaning an assignment (bead-free workspace teardown)
+pub struct CleanOptions<'a> {
+    /// Whether to push changes before cleanup
+    pub push: bool,
+    /// Segment path for running workspace hooks
+    pub segment_path: &'a Path,
+    /// Proxy configuration (for destroy hooks)
+    pub proxy_config: Option<&'a ProxyConfig>,
+    /// Whether to kill processes running in the workspace
+    pub kill: bool,
+    /// Auto-commit message (rendered template). If Some, auto-commit before capture.
+    pub auto_commit_message: Option<String>,
+}
+
+/// JSON-serializable result from cleaning an assignment
+#[derive(Debug, Serialize)]
+pub struct CleanResult {
+    /// Workspace name (e.g., "three")
+    pub workspace: String,
+    /// External ID if present (e.g., bead ID)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// VCS revision hash captured before cleanup
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// Segment name
+    pub segment: String,
+}
+
 /// Render the auto-commit message template for an assignment.
 ///
 /// Uses the `auto_commit_message` template from AncillaryConfig, rendered with
@@ -92,10 +122,11 @@ pub fn render_auto_commit_message(
     segment_name: &str,
     segment_path: &std::path::Path,
 ) -> Option<String> {
+    let ext_id = assignment.external_id.clone().unwrap_or_default();
     let task_title = assignment
-        .bead_title
+        .title
         .clone()
-        .unwrap_or_else(|| assignment.bead_id.clone());
+        .unwrap_or_else(|| ext_id.clone());
     let ws_name = assignment
         .workspace_path
         .file_name()
@@ -114,7 +145,7 @@ pub fn render_auto_commit_message(
             name: segment_name.to_string(),
         },
         task: Some(TaskInfo {
-            id: assignment.bead_id.clone(),
+            id: ext_id,
             title: task_title,
         }),
         vars: std::collections::HashMap::new(),
@@ -201,10 +232,12 @@ pub fn complete_assignment(
     )?;
     assignment_mgr.remove(&assignment.id)?;
 
-    // Close bead unless keep_open
+    // Close bead unless keep_open (only if external_id is present)
     if !opts.keep_open {
-        crate::tasks::beads::update_bead_status(&assignment.bead_id, "closed", opts.segment_path)?;
-        info!("Bead {} closed", assignment.bead_id);
+        if let Some(ref ext_id) = assignment.external_id {
+            crate::tasks::beads::update_bead_status(ext_id, "closed", opts.segment_path)?;
+            info!("Bead {} closed", ext_id);
+        }
     }
 
     Ok(result)
@@ -233,19 +266,17 @@ pub fn abort_assignment(
     assignment_mgr.record_completion(assignment, CompletionReason::Aborted, None)?;
     assignment_mgr.remove(&assignment.id)?;
 
-    // Handle bead status
-    if opts.close_bead {
-        crate::tasks::beads::update_bead_status(&assignment.bead_id, "closed", opts.segment_path)?;
-        info!("Bead {} closed", assignment.bead_id);
-    } else {
-        // Unassign and reopen
-        let _ =
-            crate::tasks::beads::update_bead_assignee(&assignment.bead_id, "", opts.segment_path);
-        crate::tasks::beads::update_bead_status(&assignment.bead_id, "open", opts.segment_path)?;
-        info!(
-            "Bead {} unassigned and returned to open",
-            assignment.bead_id
-        );
+    // Handle bead status (only if external_id is present)
+    if let Some(ref ext_id) = assignment.external_id {
+        if opts.close_bead {
+            crate::tasks::beads::update_bead_status(ext_id, "closed", opts.segment_path)?;
+            info!("Bead {} closed", ext_id);
+        } else {
+            // Unassign and reopen
+            let _ = crate::tasks::beads::update_bead_assignee(ext_id, "", opts.segment_path);
+            crate::tasks::beads::update_bead_status(ext_id, "open", opts.segment_path)?;
+            info!("Bead {} unassigned and returned to open", ext_id);
+        }
     }
 
     Ok(AbortResult {
@@ -295,33 +326,118 @@ pub fn prepare_resume(
     // Touch updated_at timestamp (assignment is always Active)
     assignment_mgr.touch(&assignment.id)?;
 
-    // Ensure bead is in_progress and assigned to claude
-    let task_title = match crate::tasks::fetch_task(&assignment.bead_id, opts.segment_path) {
-        Ok(task) => task.title,
-        Err(_) => {
-            // Bead might be closed or not found, try to reopen/reclaim
-            crate::tasks::beads::claim_bead(&assignment.bead_id, "claude", opts.segment_path)?;
-            assignment
-                .bead_title
-                .clone()
-                .unwrap_or_else(|| assignment.bead_id.clone())
+    // Ensure bead is in_progress and assigned to claude (if external_id present)
+    let task_title = if let Some(ref ext_id) = assignment.external_id {
+        match crate::tasks::fetch_task(ext_id, opts.segment_path) {
+            Ok(task) => task.title,
+            Err(_) => {
+                // Bead might be closed or not found, try to reopen/reclaim
+                crate::tasks::beads::claim_bead(ext_id, "claude", opts.segment_path)?;
+                assignment
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| ext_id.clone())
+            }
         }
+    } else {
+        assignment.title.clone().unwrap_or_default()
     };
 
     let prompt = opts
         .instruction
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            format!(
-                "Continue working on bead {}: {}. Review progress and complete remaining work.",
-                assignment.bead_id, task_title
-            )
+            if let Some(ref ext_id) = assignment.external_id {
+                format!(
+                    "Continue working on {}: {}. Review progress and complete remaining work.",
+                    ext_id, task_title
+                )
+            } else {
+                format!(
+                    "Continue working on: {}. Review progress and complete remaining work.",
+                    task_title
+                )
+            }
         });
 
     Ok(ResumeResult {
         prompt,
         workspace_recreated,
         setup_result,
+    })
+}
+
+/// Clean an assignment: auto-commit, capture revision, push (if requested),
+/// cleanup workspace, record completion, remove assignment.
+///
+/// This is the bead-free teardown — no bead status changes. Returns a
+/// JSON-serializable result for structured output.
+pub fn clean_assignment(
+    assignment: &Assignment,
+    assignment_mgr: &mut AssignmentManager,
+    ws_mgr: &WorkspaceManager,
+    opts: &CleanOptions,
+) -> Result<CleanResult> {
+    let ws_name = assignment
+        .workspace_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let mut revision = None;
+
+    if assignment.workspace_path.exists() {
+        // Auto-commit if message provided
+        if let Some(ref message) = opts.auto_commit_message {
+            match ws_mgr.auto_commit(opts.segment_path, &assignment.workspace_path, message) {
+                Ok(committed) => {
+                    if committed {
+                        info!("Auto-committed changes for assignment {}", assignment.id);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Auto-commit failed: {}", e);
+                }
+            }
+        }
+
+        // Capture revision
+        revision = ws_mgr.capture_revision(opts.segment_path, &assignment.workspace_path);
+
+        // Push if requested
+        if opts.push && revision.is_some() {
+            info!("Pushing changes for assignment {}", assignment.id);
+            ws_mgr.push(opts.segment_path, &assignment.workspace_path)?;
+        }
+    }
+
+    // Cleanup workspace
+    let cleanup_mode = CleanupMode::Complete {
+        pushed: opts.push && revision.is_some(),
+    };
+    cleanup_workspace(
+        assignment,
+        ws_mgr,
+        opts.segment_path,
+        opts.proxy_config,
+        opts.kill,
+        cleanup_mode,
+    )?;
+
+    // Record completion and remove assignment
+    assignment_mgr.record_completion(
+        assignment,
+        CompletionReason::Completed,
+        revision.clone(),
+    )?;
+    assignment_mgr.remove(&assignment.id)?;
+
+    Ok(CleanResult {
+        workspace: ws_name,
+        id: assignment.external_id.clone(),
+        revision,
+        segment: assignment.segment.clone(),
     })
 }
 
