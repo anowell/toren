@@ -41,26 +41,11 @@ pub fn execute_alias(expanded: &str, env_vars: &HashMap<String, String>) -> Resu
     Ok(status.code().unwrap_or(1))
 }
 
-/// Default aliases that preserve the beads UX.
+/// Default aliases (empty — built-in plugins replace the old shell aliases).
+///
+/// User-defined `[aliases]` in config.toml still work for custom shell commands.
 pub fn default_aliases() -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert(
-        "assign".to_string(),
-        "bd update $1 --status in_progress --assignee claude && bd show $1 | breq cmd --id $1".to_string(),
-    );
-    m.insert(
-        "complete".to_string(),
-        "breq clean $1 --push 2>/dev/null && bd update $ID --status closed".to_string(),
-    );
-    m.insert(
-        "abort".to_string(),
-        "breq clean $1 2>/dev/null && bd update $ID --status open --assignee ''".to_string(),
-    );
-    m.insert(
-        "show".to_string(),
-        "breq list $1 --detail".to_string(),
-    );
-    m
+    HashMap::new()
 }
 
 #[cfg(test)]

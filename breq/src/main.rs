@@ -224,24 +224,23 @@ fn main() -> Result<()> {
 
         if subcmd_idx < raw_args.len() {
             let subcmd = &raw_args[subcmd_idx];
-            // Try loading config for alias check (silently ignore config errors)
-            if let Ok(config) = Config::load() {
-                if let Some(template) = config.aliases.get(subcmd) {
-                    let alias_args = &raw_args[subcmd_idx + 1..];
-                    let expanded = toren_lib::alias::expand_alias(template, alias_args);
+            let plugin_args: Vec<String> = raw_args[subcmd_idx + 1..].to_vec();
 
-                    // Set up logging if -v flags were used
-                    let verbose_count: usize = raw_args[1..subcmd_idx]
-                        .iter()
-                        .map(|a| match a.as_str() {
-                            "-vvv" => 3,
-                            "-vv" => 2,
-                            "-v" | "--verbose" => 1,
-                            _ => 0,
-                        })
-                        .sum();
-                    if verbose_count > 0 {
-                        let log_level = match verbose_count {
+            // Try loading config for plugin/alias check (silently ignore config errors)
+            if let Ok(config) = Config::load() {
+                // Set up logging helper (shared by plugin and alias paths)
+                let verbose_count: usize = raw_args[1..subcmd_idx]
+                    .iter()
+                    .map(|a| match a.as_str() {
+                        "-vvv" => 3,
+                        "-vv" => 2,
+                        "-v" | "--verbose" => 1,
+                        _ => 0,
+                    })
+                    .sum();
+                let init_logging = |count: usize| {
+                    if count > 0 {
+                        let log_level = match count {
                             1 => tracing::Level::DEBUG,
                             _ => tracing::Level::TRACE,
                         };
@@ -251,7 +250,46 @@ fn main() -> Result<()> {
                             .with_timer(ShortTime)
                             .init();
                     }
+                };
 
+                // 1. Plugin dispatch (highest priority)
+                if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&config.plugins) {
+                    if plugin_mgr.has(subcmd) {
+                        init_logging(verbose_count);
+                        info!("Plugin '{}'", subcmd);
+
+                        // Resolve segment from CWD for plugin context
+                        let (seg_path, seg_name) = resolve_segment_for_plugin(&config);
+
+                        let ctx = toren_lib::PluginContext {
+                            segment_path: seg_path,
+                            segment_name: seg_name,
+                        };
+
+                        match plugin_mgr.run(subcmd, &plugin_args, ctx) {
+                            Ok(toren_lib::PluginResult::Ok) => std::process::exit(0),
+                            Ok(toren_lib::PluginResult::Action(action)) => {
+                                match execute_deferred_action(&config, action) {
+                                    Ok(()) => std::process::exit(0),
+                                    Err(e) => {
+                                        eprintln!("Error: {:#}", e);
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Plugin '{}' error: {:#}", subcmd, e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+
+                // 2. Alias dispatch (shell fallback)
+                if let Some(template) = config.aliases.get(subcmd) {
+                    init_logging(verbose_count);
+
+                    let expanded = toren_lib::alias::expand_alias(template, &plugin_args);
                     info!("Alias '{}' -> {}", subcmd, expanded);
                     let code = toren_lib::alias::execute_alias(
                         &expanded,
@@ -355,6 +393,44 @@ fn resolve_segment(segment_mgr: &SegmentManager, segment_name: Option<&str>) -> 
 /// Generate workspace name from ancillary number word.
 fn workspace_name_for_number(n: u32) -> String {
     toren_lib::number_to_word(n).to_lowercase()
+}
+
+/// Resolve segment path and name from CWD for plugin context (best-effort).
+fn resolve_segment_for_plugin(config: &Config) -> (Option<PathBuf>, Option<String>) {
+    if let Ok(segment_mgr) = SegmentManager::new(config) {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Some(segment) = segment_mgr.resolve_from_path(&cwd) {
+                return (Some(segment.path), Some(segment.name));
+            }
+        }
+    }
+    (None, None)
+}
+
+/// Execute a deferred action returned by a plugin script.
+fn execute_deferred_action(config: &Config, action: toren_lib::DeferredAction) -> Result<()> {
+    match action {
+        toren_lib::DeferredAction::Cmd {
+            task_id,
+            task_title,
+            task_url,
+            prompt,
+            intent,
+        } => {
+            cmd_cmd(
+                config,
+                None,     // workspace (auto-create)
+                prompt,
+                intent,
+                task_id,
+                task_title,
+                task_url,
+                false,    // resume
+                None,     // segment (resolve from CWD)
+                false,    // danger
+            )
+        }
+    }
 }
 
 // ─── cmd ────────────────────────────────────────────────────────────────────

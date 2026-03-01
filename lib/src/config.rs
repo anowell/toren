@@ -30,6 +30,9 @@ pub struct Config {
     #[serde(default)]
     pub tasks: TasksConfig,
 
+    #[serde(default)]
+    pub plugins: PluginsConfig,
+
     #[serde(default = "crate::alias::default_aliases")]
     pub aliases: HashMap<String, String>,
 }
@@ -126,6 +129,31 @@ impl Default for IntentsConfig {
         entries.insert("plan".to_string(), default_intent_plan());
         entries.insert("review".to_string(), default_intent_review());
         Self { entries }
+    }
+}
+
+/// Configuration for the Rhai plugin system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginsConfig {
+    /// Directory for user plugin scripts (default: ~/.toren/plugins)
+    #[serde(default = "default_plugins_dir")]
+    pub dir: String,
+
+    /// List of plugin names to disable
+    #[serde(default)]
+    pub disable: Vec<String>,
+}
+
+fn default_plugins_dir() -> String {
+    "~/.toren/plugins".to_string()
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_plugins_dir(),
+            disable: Vec::new(),
+        }
     }
 }
 
@@ -325,6 +353,7 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             intents: IntentsConfig::default(),
             tasks: TasksConfig::default(),
+            plugins: PluginsConfig::default(),
             aliases: crate::alias::default_aliases(),
         }
     }

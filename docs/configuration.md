@@ -51,12 +51,14 @@ review = """Review the implementation of {{ task.id }}: {{ task.title }}
 
 Verify completeness, check for issues, and assess confidence."""
 
+[plugins]
+# Directory for user Rhai plugin scripts (default: ~/.toren/plugins)
+dir = "~/.toren/plugins"
+
 [aliases]
-# Shell command templates invoked as breq subcommands.
+# Shell command templates invoked as breq subcommands (lower priority than plugins).
 # Positional args: $1, $2, etc. Clean output vars: $ID, $WORKSPACE, $SEGMENT, $REVISION.
-assign = "bd update $1 --status in_progress --assignee claude && bd show $1 | breq cmd --id $1"
-complete = "breq clean $1 --push 2>/dev/null && bd update $ID --status closed"
-abort = "breq clean $1 2>/dev/null && bd update $ID --status open --assignee ''"
+# Note: built-in plugins now handle assign/complete/abort. Custom aliases still work.
 show = "breq list $1 --detail"
 ```
 
@@ -94,9 +96,17 @@ Named prompt templates used with `breq cmd -i <intent>`. The default intents (`a
 
 Template variables: `{{ task.id }}`, `{{ task.title }}`, `{{ task.url }}`, `{{ task.source }}`
 
+### `[plugins]`
+
+Configures the Rhai plugin system. See [plugins.md](plugins.md) for full details on writing plugins.
+
+**`dir`** — Directory for user plugin scripts. Files matching `*.rhai` are loaded as plugins. The filename (without extension) becomes the command name. User plugins override built-ins of the same name. Defaults to `~/.toren/plugins`.
+
+**`disable`** — List of plugin names to disable. Useful for turning off specific built-in plugins.
+
 ### `[aliases]`
 
-Shell command templates that become breq subcommands. For example, with the default aliases, `breq assign my-bead` expands to the shell commands in the `assign` template.
+Shell command templates that become breq subcommands. Aliases have lower priority than plugins — if a plugin and alias share the same name, the plugin wins.
 
 Aliases receive positional arguments (`$1`, `$2`) and environment variables from clean output (`$ID`, `$WORKSPACE`, `$SEGMENT`, `$REVISION`).
 

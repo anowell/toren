@@ -30,6 +30,7 @@ pub struct AppState {
     pub services: Services,
     pub security: Arc<SecurityContext>,
     pub plugins: Arc<PluginManager>,
+    pub rhai_plugins: Arc<toren_lib::PluginManager>,
     pub ancillaries: Arc<AncillaryManager>,
     pub assignments: Arc<RwLock<AssignmentManager>>,
     pub segments: Arc<std::sync::RwLock<SegmentManager>>,
@@ -44,6 +45,7 @@ pub async fn serve(
     services: Services,
     security_ctx: SecurityContext,
     plugin_manager: PluginManager,
+    rhai_plugins: toren_lib::PluginManager,
     ancillary_manager: AncillaryManager,
     assignment_manager: AssignmentManager,
     segment_manager: SegmentManager,
@@ -60,6 +62,7 @@ pub async fn serve(
         services,
         security: Arc::new(security_ctx),
         plugins: Arc::new(plugin_manager),
+        rhai_plugins: Arc::new(rhai_plugins),
         ancillaries: Arc::new(ancillary_manager),
         assignments,
         segments: Arc::new(std::sync::RwLock::new(segment_manager)),
@@ -99,6 +102,10 @@ pub async fn serve(
         )
         .route("/api/assignments/:id/abort", post(assignments_abort))
         .route("/api/assignments/:id/resume", post(assignments_resume))
+        .route(
+            "/api/assignments/:id/action/:name",
+            post(assignment_action),
+        )
         .route("/api/segments/list", get(segments_list))
         .route("/api/segments/create", post(segments_create))
         .route("/api/workspaces/list/:segment", get(workspaces_list))
@@ -992,4 +999,95 @@ async fn assignments_resume(
         "work_started": work_started,
         "assignment": updated_assignment,
     })))
+}
+
+// ==================== Rhai Plugin Action Endpoint ====================
+
+#[derive(Debug, Deserialize)]
+struct AssignmentActionRequest {
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+async fn assignment_action(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+    Json(request): Json<AssignmentActionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Resolve assignment to get segment context
+    let mut assignments = state.assignments.write().await;
+    let assignment = resolve_assignment(&mut assignments, &id).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "Assignment not found"})),
+    ))?;
+    drop(assignments);
+
+    // Check plugin exists
+    if !state.rhai_plugins.has(&name) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Plugin '{}' not found", name)})),
+        ));
+    }
+
+    // Resolve segment path for plugin context
+    let (seg_path, seg_name) = {
+        let segments = state.segments.read().unwrap();
+        match segments.find_by_name(&assignment.segment) {
+            Some(s) => (Some(s.path.clone()), Some(s.name.clone())),
+            None => (None, None),
+        }
+    };
+
+    let ctx = toren_lib::PluginContext {
+        segment_path: seg_path,
+        segment_name: seg_name,
+    };
+
+    // Run plugin in a blocking task (Rhai execution is synchronous)
+    let rhai_plugins = state.rhai_plugins.clone();
+    let args = request.args;
+    let plugin_name = name.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        rhai_plugins.run(&plugin_name, &args, ctx)
+    })
+    .await
+    .map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": format!("Task join error: {}", e)})),
+    ))?;
+
+    match result {
+        Ok(toren_lib::PluginResult::Ok) => Ok(Json(serde_json::json!({
+            "success": true,
+        }))),
+        Ok(toren_lib::PluginResult::Action(deferred)) => {
+            // Daemon can't exec — return action details for caller to handle
+            let action_json = match deferred {
+                toren_lib::DeferredAction::Cmd {
+                    task_id,
+                    task_title,
+                    task_url,
+                    prompt,
+                    intent,
+                } => serde_json::json!({
+                    "type": "cmd",
+                    "task_id": task_id,
+                    "task_title": task_title,
+                    "task_url": task_url,
+                    "prompt": prompt,
+                    "intent": intent,
+                }),
+            };
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "action": action_json,
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{:#}", e)})),
+        )),
+    }
 }

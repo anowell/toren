@@ -14,5 +14,11 @@ workspace_root = "workspaces"
 # Default task source when an ID is provided without a source prefix
 default_source = "beads"
 
+[plugins]
+# Directory for user Rhai plugin scripts (default: ~/.toren/plugins)
+# dir = "~/.toren/plugins"
+# Disable specific plugins by name
+# disable = []
+
 [proxy]
 domain = "lvh.me"
