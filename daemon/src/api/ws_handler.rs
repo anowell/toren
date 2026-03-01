@@ -239,7 +239,7 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
                                 Ok(task) => {
                                     let prompt = tasks::generate_prompt(
                                         &task,
-                                        &state.config.ancillary.task_prompt_template,
+                                        "implement bead {{task_id}}",
                                     );
                                     state.ancillaries.set_instruction(&id, Some(prompt.clone()));
                                     info!("Ancillary {} instruction set from task {}", id, tid);
@@ -371,7 +371,7 @@ async fn connect_via_assignment(
         match tasks::fetch_task(ext_id, working_dir) {
             Ok(task) => {
                 let prompt =
-                    tasks::generate_prompt(&task, &state.config.ancillary.task_prompt_template);
+                    tasks::generate_prompt(&task, "implement bead {{task_id}}");
                 state
                     .ancillaries
                     .set_instruction(ancillary_id, Some(prompt.clone()));

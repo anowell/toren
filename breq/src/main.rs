@@ -297,10 +297,10 @@ fn resolve_segment(segment_mgr: &SegmentManager, segment_name: Option<&str>) -> 
     } else {
         let cwd = std::env::current_dir()?;
         segment_mgr.resolve_from_path(&cwd).with_context(|| {
-            "Current directory is not under any segment root.\n\
-             Configure segment roots in toren.toml:\n\
-             [segments]\n\
-             roots = [\"~/proj\"]"
+            "Current directory is not under any configured segment.\n\
+             Configure segments in ~/.toren/config.toml:\n\
+             [ancillaries]\n\
+             segments = [\"~/proj/*\"]"
         })
     }
 }
@@ -322,13 +322,9 @@ fn cmd_cmd(
     segment_name: Option<&str>,
     danger: bool,
 ) -> Result<()> {
-    let workspace_root = config
-        .ancillary
-        .workspace_root
-        .clone()
-        .context("workspace_root not configured in toren.toml")?;
+    let workspace_root = config.ancillaries.workspace_root.clone();
 
-    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.local_domain.clone()));
+    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
     let segment_mgr = SegmentManager::new(config)?;
     let mut assignment_mgr = AssignmentManager::new()?;
 
@@ -433,7 +429,7 @@ fn cmd_cmd(
             .unwrap_or_default();
         let ancillary_id_str = assignment_mgr.next_available_ancillary(
             &segment.name,
-            config.ancillary.pool_size,
+            config.ancillaries.max_per_segment,
             &existing_workspaces,
         );
         let ancillary_num = toren_lib::ancillary_number(&ancillary_id_str).unwrap_or(1);
@@ -503,12 +499,8 @@ fn cmd_run(
 ) -> Result<()> {
     // Hook mode: run setup/destroy from cwd
     if let Some(hook_type) = hook {
-        let workspace_root = config
-            .ancillary
-            .workspace_root
-            .clone()
-            .context("workspace_root not configured")?;
-        let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.local_domain.clone()));
+        let workspace_root = config.ancillaries.workspace_root.clone();
+        let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
 
         let (segment_path, workspace_path, workspace_name) = detect_workspace_context()?;
         let ancillary_num = toren_lib::word_to_number(&workspace_name);
@@ -545,13 +537,9 @@ fn cmd_run(
         return Ok(());
     }
 
-    let workspace_root = config
-        .ancillary
-        .workspace_root
-        .clone()
-        .context("workspace_root not configured in toren.toml")?;
+    let workspace_root = config.ancillaries.workspace_root.clone();
 
-    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.local_domain.clone()));
+    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
     let segment_mgr = SegmentManager::new(config)?;
     let segment = resolve_segment(&segment_mgr, segment_name)?;
 
@@ -589,7 +577,7 @@ fn cmd_run(
             .unwrap_or_default();
         let ancillary_id_str = assignment_mgr.next_available_ancillary(
             &segment.name,
-            config.ancillary.pool_size,
+            config.ancillaries.max_per_segment,
             &existing_workspaces,
         );
         let ancillary_num = toren_lib::ancillary_number(&ancillary_id_str).unwrap_or(1);
@@ -633,7 +621,7 @@ fn cmd_list(
     segment_name: Option<String>,
     detail: bool,
 ) -> Result<()> {
-    let workspace_root = config.ancillary.workspace_root.clone();
+    let workspace_root = config.ancillaries.workspace_root.clone();
     let segment_mgr = SegmentManager::new(config)?;
     let mut assignment_mgr = AssignmentManager::new()?;
 
@@ -743,8 +731,8 @@ fn cmd_list(
     }
 
     // Detect orphaned workspace directories
-    if let Some(ref ws_root) = workspace_root {
-        let ws_mgr = WorkspaceManager::new(ws_root.clone(), Some(config.local_domain.clone()));
+    {
+        let ws_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
         let orphans = find_orphaned_workspaces(&ws_mgr, &segments, &assignments);
 
         if !orphans.is_empty() {
@@ -854,14 +842,10 @@ fn cmd_clean(
     push: bool,
     segment_name: Option<&str>,
 ) -> Result<()> {
-    let workspace_root = config
-        .ancillary
-        .workspace_root
-        .clone()
-        .context("workspace_root not configured")?;
+    let workspace_root = config.ancillaries.workspace_root.clone();
 
     let segment_mgr = SegmentManager::new(config)?;
-    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.local_domain.clone()));
+    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
     let mut assignment_mgr = AssignmentManager::new()?;
 
     let segment = resolve_segment(&segment_mgr, segment_name)?;
@@ -878,7 +862,7 @@ fn cmd_clean(
 
     // Render auto-commit message
     let auto_commit_message = toren_lib::render_auto_commit_message(
-        &config.ancillary,
+        toren_lib::DEFAULT_AUTO_COMMIT_MESSAGE,
         &assignment,
         &segment.name,
         &segment.path,
@@ -910,15 +894,11 @@ fn cmd_clean(
 // ─── cleanup ────────────────────────────────────────────────────────────────
 
 fn cmd_cleanup(config: &Config, all_segments: bool, segment_name: Option<String>) -> Result<()> {
-    let workspace_root = config
-        .ancillary
-        .workspace_root
-        .clone()
-        .context("workspace_root not configured in toren.toml")?;
+    let workspace_root = config.ancillaries.workspace_root.clone();
 
     let segment_mgr = SegmentManager::new(config)?;
     let mut assignment_mgr = AssignmentManager::new()?;
-    let ws_mgr = WorkspaceManager::new(workspace_root, Some(config.local_domain.clone()));
+    let ws_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
 
     let (assignments, segments): (Vec<_>, Vec<Segment>) = if all_segments {
         let assignments = assignment_mgr.list_active().into_iter().collect();
@@ -1161,10 +1141,101 @@ fn cmd_init(stealth: bool) -> Result<()> {
         }
     }
 
+    // Segment onboarding: check if this repo is discoverable as a segment
+    if let Ok(config) = Config::load() {
+        let segment_mgr = SegmentManager::new(&config)?;
+        if segment_mgr.resolve_from_path(&cwd).is_none() {
+            // Repo not discoverable — offer to add it
+            if let Some(parent) = cwd.parent() {
+                let repo_path = toren_lib::tilde_shorten(&cwd);
+                let parent_glob = format!("{}/*", toren_lib::tilde_shorten(parent));
+
+                if std::io::stdin().is_terminal() {
+                    eprintln!("\nThis repo is not discoverable as a segment.");
+                    eprintln!("Add it to ~/.toren/config.toml?");
+                    eprintln!("  1) Add parent glob: {}", parent_glob);
+                    eprintln!("  2) Add repo path:   {}", repo_path);
+                    eprintln!("  3) Skip");
+                    eprint!("Choice [1/2/3]: ");
+
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    let choice = input.trim();
+
+                    let new_entry = match choice {
+                        "1" => Some(parent_glob),
+                        "2" => Some(repo_path),
+                        _ => None,
+                    };
+
+                    if let Some(entry) = new_entry {
+                        let config_path = dirs::home_dir()
+                            .context("Could not determine home directory")?
+                            .join(".toren/config.toml");
+
+                        add_segment_to_config(&config_path, &entry)?;
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+/// Add a segment entry to ~/.toren/config.toml using toml_edit for
+/// targeted insertion (preserves comments, doesn't expand defaults).
+fn add_segment_to_config(config_path: &std::path::Path, entry: &str) -> Result<()> {
+    use toml_edit::{value, Array, DocumentMut};
+
+    let content = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: DocumentMut = content.parse().unwrap_or_default();
+
+    // Ensure [ancillaries] table exists
+    if !doc.contains_table("ancillaries") {
+        doc["ancillaries"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+
+    let ancillaries = doc["ancillaries"].as_table_mut().unwrap();
+
+    // Get or create the segments array
+    if !ancillaries.contains_key("segments") {
+        let mut arr = Array::new();
+        arr.push(entry);
+        ancillaries["segments"] = value(arr);
+        write_config(config_path, &doc)?;
+        println!("Added '{}' to ~/.toren/config.toml", entry);
+        return Ok(());
+    }
+
+    if let Some(arr) = ancillaries["segments"].as_array_mut() {
+        // Check for duplicates
+        let already_present = arr.iter().any(|v| v.as_str() == Some(entry));
+        if already_present {
+            println!("'{}' already in config", entry);
+            return Ok(());
+        }
+        arr.push(entry);
+    }
+
+    write_config(config_path, &doc)?;
+    println!("Added '{}' to ~/.toren/config.toml", entry);
+    Ok(())
+}
+
+fn write_config(path: &std::path::Path, doc: &toml_edit::DocumentMut) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create config directory")?;
+    }
+    std::fs::write(path, doc.to_string()).context("Failed to write config file")
+}
 
 /// Find workspace directories that exist on disk but are not tracked by VCS
 /// and have no assignment record.

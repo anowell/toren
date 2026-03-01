@@ -3,35 +3,32 @@ use serde::{Deserialize, Serialize};
 use shellexpand;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip)]
     pub config_path: String,
 
+    /// Cached segment paths: (roots, literal_segments).
+    /// Populated once during load/default, avoids repeated glob expansion.
+    #[serde(skip)]
+    pub segment_paths: (Vec<PathBuf>, Vec<PathBuf>),
+
     #[serde(default = "default_server")]
     pub server: ServerConfig,
 
     #[serde(default)]
-    pub segments: SegmentsConfig,
-
-    #[serde(default = "default_approved_directories")]
-    pub approved_directories: Vec<PathBuf>,
+    pub ancillaries: AncillariesConfig,
 
     #[serde(default)]
-    pub auto_approve: AutoApproveConfig,
-
-    #[serde(default)]
-    pub ancillary: AncillaryConfig,
+    pub proxy: ProxyConfig,
 
     #[serde(default)]
     pub intents: IntentsConfig,
 
     #[serde(default = "crate::alias::default_aliases")]
     pub aliases: HashMap<String, String>,
-
-    #[serde(default = "default_local_domain")]
-    pub local_domain: String,
 }
 
 fn default_server() -> ServerConfig {
@@ -41,61 +38,67 @@ fn default_server() -> ServerConfig {
     }
 }
 
-fn default_local_domain() -> String {
-    "lvh.me".to_string()
-}
-
-fn default_approved_directories() -> Vec<PathBuf> {
-    vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
 }
 
-/// Configuration for segment discovery.
-/// Segments are directories under configured roots.
-/// Any subdirectory of a root is automatically a valid segment.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SegmentsConfig {
-    /// Root directories that can contain segments.
-    /// Any immediate child directory under a root is a valid segment.
-    #[serde(default)]
-    pub roots: Vec<PathBuf>,
-}
-
+/// Configuration for ancillary workspaces and segment discovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AncillaryConfig {
-    pub max_concurrent: usize,
-    pub default_model: String,
+pub struct AncillariesConfig {
+    /// Segment globs: discover repos as segments.
+    /// Entries like "~/proj/*" expand via glob; literal paths are used directly.
     #[serde(default)]
-    pub workspace_root: Option<PathBuf>,
-    /// Template for generating prompts from task IDs.
-    /// Available placeholders: {{task_id}}, {{task_provider}}
-    #[serde(default = "default_task_prompt_template")]
-    pub task_prompt_template: String,
-    /// Default pool size for ancillaries per segment
-    #[serde(default = "default_pool_size")]
-    pub pool_size: u32,
-    /// Auto-commit message template rendered on complete.
-    /// Available placeholders: {{ task.id }}, {{ task.title }}
-    /// Skipped if workspace is clean (git) or working commit is empty (jj).
-    #[serde(default = "default_auto_commit_message")]
-    pub auto_commit_message: String,
+    pub segments: Vec<String>,
+
+    /// Where ancillary workspaces are created (default: ~/.toren/workspaces)
+    #[serde(default = "default_workspace_root")]
+    pub workspace_root: PathBuf,
+
+    /// Max ancillaries per segment (default: 10)
+    #[serde(default = "default_max_per_segment")]
+    pub max_per_segment: u32,
 }
 
-fn default_pool_size() -> u32 {
+fn default_workspace_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".toren/workspaces")
+}
+
+fn default_max_per_segment() -> u32 {
     10
 }
 
-fn default_auto_commit_message() -> String {
-    "{{ task.id }}: {{ task.title }}".to_string()
+impl Default for AncillariesConfig {
+    fn default() -> Self {
+        Self {
+            segments: Vec::new(),
+            workspace_root: default_workspace_root(),
+            max_per_segment: default_max_per_segment(),
+        }
+    }
 }
 
-fn default_task_prompt_template() -> String {
-    "implement bead {{task_id}}".to_string()
+/// Proxy configuration for station routes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// Base domain for station routes (default: lvh.me)
+    #[serde(default = "default_proxy_domain")]
+    pub domain: String,
+}
+
+fn default_proxy_domain() -> String {
+    "lvh.me".to_string()
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            domain: default_proxy_domain(),
+        }
+    }
 }
 
 /// Intent templates keyed by name (e.g., "act", "plan", "review").
@@ -141,40 +144,25 @@ fn default_intent_review() -> String {
         .to_string()
 }
 
-impl Default for AncillaryConfig {
-    fn default() -> Self {
-        Self {
-            max_concurrent: 5,
-            default_model: "claude-sonnet-4-5-20250929".to_string(),
-            workspace_root: None,
-            task_prompt_template: default_task_prompt_template(),
-            pool_size: default_pool_size(),
-            auto_commit_message: default_auto_commit_message(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutoApproveConfig {
-    pub non_vcs_commands: bool,
-    pub vcs_commands: bool,
-    pub file_operations: bool,
-}
-
-impl Default for AutoApproveConfig {
-    fn default() -> Self {
-        Self {
-            non_vcs_commands: true,
-            vcs_commands: false,
-            file_operations: false,
-        }
-    }
-}
-
 /// Expand shell-style paths (e.g., `~` to home directory)
-fn expand_path(path: &Path) -> PathBuf {
+pub fn expand_path(path: &Path) -> PathBuf {
     let path_str = path.to_string_lossy();
     PathBuf::from(shellexpand::tilde(&path_str).into_owned())
+}
+
+/// Expand a shell-style string path
+pub fn expand_path_str(path_str: &str) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(path_str).into_owned())
+}
+
+/// Shorten a path by replacing $HOME prefix with ~
+pub fn tilde_shorten(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(relative) = path.strip_prefix(&home) {
+            return format!("~/{}", relative.display());
+        }
+    }
+    path.display().to_string()
 }
 
 impl Config {
@@ -207,22 +195,12 @@ impl Config {
         }
     }
 
-    /// Expand shell-style paths in all path fields
+    /// Expand shell-style paths in all path fields and cache derived values.
     fn expand_paths(&mut self) {
-        // Expand segment roots
-        self.segments.roots = self.segments.roots.iter().map(|p| expand_path(p)).collect();
-
-        // Expand approved directories
-        self.approved_directories = self
-            .approved_directories
-            .iter()
-            .map(|p| expand_path(p))
-            .collect();
-
         // Expand workspace root
-        if let Some(ref ws_root) = self.ancillary.workspace_root {
-            self.ancillary.workspace_root = Some(expand_path(ws_root));
-        }
+        self.ancillaries.workspace_root = expand_path(&self.ancillaries.workspace_root);
+        // Cache segment paths (avoids re-expanding globs on each call)
+        self.segment_paths = self.compute_segment_paths();
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -238,47 +216,92 @@ impl Config {
     }
 
     fn find_config_file() -> Result<PathBuf> {
-        // Try toren.toml in current directory first
-        let local_config = PathBuf::from("toren.toml");
-        if local_config.exists() {
-            return Ok(local_config);
-        }
-
-        // Try .toren/config.toml (legacy)
-        let legacy_config = PathBuf::from(".toren/config.toml");
-        if legacy_config.exists() {
-            return Ok(legacy_config);
-        }
-
-        // Try home directory
         if let Some(home) = dirs::home_dir() {
-            let home_config = home.join(".config/toren/config.toml");
-            if home_config.exists() {
-                return Ok(home_config);
+            let new_config = home.join(".toren/config.toml");
+            if new_config.exists() {
+                return Ok(new_config);
             }
-            // Return home path even if it doesn't exist (we'll create it)
-            return Ok(home_config);
+
+            // Check for old config location and warn
+            let old_config = home.join(".config/toren/config.toml");
+            if old_config.exists() {
+                warn!(
+                    "Found config at old location: {}. Consider migrating to {}",
+                    old_config.display(),
+                    new_config.display()
+                );
+                return Ok(old_config);
+            }
+
+            // Return new path even if it doesn't exist (we'll create it)
+            return Ok(new_config);
         }
 
-        // Fallback to local toren.toml
-        Ok(local_config)
+        // Fallback
+        Ok(PathBuf::from("toren.toml"))
+    }
+
+    /// Get cached segment paths: (roots, literal_segments).
+    /// Roots are parent dirs of glob matches, literal_segments are non-glob entries.
+    pub fn resolve_segment_paths(&self) -> &(Vec<PathBuf>, Vec<PathBuf>) {
+        &self.segment_paths
+    }
+
+    /// Compute segment paths by expanding globs in ancillaries.segments.
+    pub(crate) fn compute_segment_paths(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut roots = Vec::new();
+        let mut literals = Vec::new();
+
+        for pattern in &self.ancillaries.segments {
+            let expanded = shellexpand::tilde(pattern).into_owned();
+
+            if expanded.contains('*') || expanded.contains('?') || expanded.contains('[') {
+                // Glob pattern: expand and collect parent dirs as roots
+                match glob::glob(&expanded) {
+                    Ok(paths) => {
+                        for entry in paths.filter_map(|p| p.ok()) {
+                            if entry.is_dir() {
+                                if let Some(parent) = entry.parent() {
+                                    let canonical = parent
+                                        .canonicalize()
+                                        .unwrap_or_else(|_| parent.to_path_buf());
+                                    if !roots.contains(&canonical) {
+                                        roots.push(canonical);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Invalid glob pattern '{}': {}", pattern, e);
+                    }
+                }
+            } else {
+                // Literal path: treat as direct segment
+                let path = PathBuf::from(&expanded);
+                if path.is_dir() {
+                    let canonical = path.canonicalize().unwrap_or(path);
+                    literals.push(canonical);
+                } else {
+                    warn!("Segment path does not exist: {}", expanded);
+                }
+            }
+        }
+
+        (roots, literals)
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
         Self {
             config_path: String::new(),
+            segment_paths: (Vec::new(), Vec::new()),
             server: default_server(),
-            segments: SegmentsConfig::default(),
-            approved_directories: vec![current_dir],
-            auto_approve: AutoApproveConfig::default(),
-            ancillary: AncillaryConfig::default(),
+            ancillaries: AncillariesConfig::default(),
+            proxy: ProxyConfig::default(),
             intents: IntentsConfig::default(),
             aliases: crate::alias::default_aliases(),
-            local_domain: default_local_domain(),
         }
     }
 }
@@ -291,5 +314,118 @@ impl Config {
 
     pub fn port(&self) -> u16 {
         self.server.port
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn tilde_shorten_under_home() {
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join("projects/myrepo");
+            assert_eq!(tilde_shorten(&path), "~/projects/myrepo");
+        }
+    }
+
+    #[test]
+    fn tilde_shorten_outside_home() {
+        let path = PathBuf::from("/tmp/some/path");
+        assert_eq!(tilde_shorten(&path), "/tmp/some/path");
+    }
+
+    #[test]
+    fn resolve_segment_paths_empty() {
+        let config = Config::default();
+        let (roots, literals) = config.resolve_segment_paths();
+        assert!(roots.is_empty());
+        assert!(literals.is_empty());
+    }
+
+    #[test]
+    fn resolve_segment_paths_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub1 = dir.path().join("repo1");
+        let sub2 = dir.path().join("repo2");
+        std::fs::create_dir_all(&sub1).unwrap();
+        std::fs::create_dir_all(&sub2).unwrap();
+
+        let mut config = Config::default();
+        config.ancillaries.segments = vec![format!("{}/*", dir.path().display())];
+        config.segment_paths = config.compute_segment_paths();
+
+        let (roots, literals) = config.resolve_segment_paths();
+        assert_eq!(roots.len(), 1);
+        assert!(literals.is_empty());
+        // The root should be the parent dir of the matched entries
+        let root_canonical = dir.path().canonicalize().unwrap();
+        assert_eq!(roots[0], root_canonical);
+    }
+
+    #[test]
+    fn resolve_segment_paths_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("myrepo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut config = Config::default();
+        config.ancillaries.segments = vec![repo.display().to_string()];
+        config.segment_paths = config.compute_segment_paths();
+
+        let (roots, literals) = config.resolve_segment_paths();
+        assert!(roots.is_empty());
+        assert_eq!(literals.len(), 1);
+        let repo_canonical = repo.canonicalize().unwrap();
+        assert_eq!(literals[0], repo_canonical);
+    }
+
+    #[test]
+    fn resolve_segment_paths_nonexistent_literal_skipped() {
+        let mut config = Config::default();
+        config.ancillaries.segments = vec!["/nonexistent/path/to/repo".to_string()];
+        config.segment_paths = config.compute_segment_paths();
+
+        let (roots, literals) = config.resolve_segment_paths();
+        assert!(roots.is_empty());
+        assert!(literals.is_empty());
+    }
+
+    #[test]
+    fn default_config_parses() {
+        let config = Config::default();
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.port, 8787);
+        assert_eq!(config.proxy.domain, "lvh.me");
+        assert!(config.ancillaries.segments.is_empty());
+        assert_eq!(config.ancillaries.max_per_segment, 10);
+    }
+
+    #[test]
+    fn parse_new_config_format() {
+        let toml_str = r#"
+[ancillaries]
+segments = ["~/proj/*", "~/myrepo"]
+max_per_segment = 5
+
+[proxy]
+domain = "test.local"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.ancillaries.segments, vec!["~/proj/*", "~/myrepo"]);
+        assert_eq!(config.ancillaries.max_per_segment, 5);
+        assert_eq!(config.proxy.domain, "test.local");
+    }
+
+    #[test]
+    fn find_config_file_prefers_new_location() {
+        // This test validates the logic by checking the function exists and returns a path.
+        // The actual file system state determines the result.
+        let result = Config::find_config_file();
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        // Should end with config.toml
+        assert!(path.to_string_lossy().ends_with("config.toml"));
     }
 }

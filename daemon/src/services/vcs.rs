@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::derive_approved_directories;
 use toren_lib::Config;
 
 pub struct VcsService {
@@ -28,7 +29,7 @@ pub struct VcsStatus {
 impl VcsService {
     pub fn new(config: &Config) -> Result<Self> {
         Ok(Self {
-            approved_directories: config.approved_directories.clone(),
+            approved_directories: derive_approved_directories(config),
         })
     }
 

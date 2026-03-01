@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use super::derive_approved_directories;
 use toren_lib::Config;
 
 pub struct FilesystemService {
@@ -25,7 +26,7 @@ pub struct DirListing {
 impl FilesystemService {
     pub fn new(config: &Config) -> Result<Self> {
         Ok(Self {
-            approved_directories: config.approved_directories.clone(),
+            approved_directories: derive_approved_directories(config),
         })
     }
 

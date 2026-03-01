@@ -1,20 +1,18 @@
 # Segment Management
 
-Toren discovers and manages segments (projects) via `toren.toml`.
+Toren discovers and manages segments (projects) via `~/.toren/config.toml`.
 
 ## Configuration
 
 ```toml
-[segments]
-# Auto-discover subdirectories
-globs = ["examples/*"]
-
-# Where new segments can be created
-roots = ["examples"]
-
-# Explicit paths (optional)
-paths = []
+[ancillaries]
+# Segment globs: discover repos as segments
+segments = ["~/proj/*", "~/work/special-repo"]
 ```
+
+Glob entries (containing `*`, `?`, or `[`) are expanded — each matched directory becomes a segment. Non-glob entries are treated as literal segment paths.
+
+When no segments are configured (or CWD isn't under any), breq infers the segment from the current repo's directory name.
 
 ## API
 
@@ -32,13 +30,16 @@ curl -X POST http://localhost:8787/api/segments/create \
 
 ## Discovery Methods
 
-- **Globs**: Scan directories matching patterns (`examples/*`)
-- **Roots**: Directories where new segments can be created
-- **Paths**: Explicit individual project paths
+- **Globs**: Expand `~/proj/*` to find all subdirectories
+- **Literal paths**: Explicit individual project paths
+- **CWD inference**: Detect repo root from current directory (zero-config)
 
 ## CLI Usage
 
 ```bash
-# Start session in a segment (auto-discovered from config)
-just prompt examples/calculator
+# Initialize a repo for breq (creates .toren.kdl, offers to register segment)
+breq init
+
+# Start a session (segment inferred from CWD)
+breq cmd -p "implement feature X"
 ```

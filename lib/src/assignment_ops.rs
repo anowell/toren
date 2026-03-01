@@ -9,7 +9,6 @@ use std::path::Path;
 use tracing::info;
 
 use crate::assignment::{AssignmentManager, CompletionReason};
-use crate::config::AncillaryConfig;
 use crate::workspace::{CleanupMode, CommitInfo, WorkspaceManager};
 use crate::workspace_setup::{SetupResult, WorkspaceContext, WorkspaceInfo, RepoInfo, TaskInfo};
 use crate::Assignment;
@@ -95,13 +94,15 @@ pub struct CleanResult {
     pub segment: String,
 }
 
+/// Default auto-commit message template.
+pub const DEFAULT_AUTO_COMMIT_MESSAGE: &str = "{{ task.id }}: {{ task.title }}";
+
 /// Render the auto-commit message template for an assignment.
 ///
-/// Uses the `auto_commit_message` template from AncillaryConfig, rendered with
-/// task context (task.id, task.title). Workspace and repo fields are populated
-/// from the assignment when available.
+/// Uses the provided template string, rendered with task context (task.id, task.title).
+/// Workspace and repo fields are populated from the assignment when available.
 pub fn render_auto_commit_message(
-    ancillary_config: &AncillaryConfig,
+    template: &str,
     assignment: &Assignment,
     segment_name: &str,
     segment_path: &std::path::Path,
@@ -134,7 +135,7 @@ pub fn render_auto_commit_message(
         }),
         vars: std::collections::HashMap::new(),
     };
-    crate::workspace_setup::render_template(&ancillary_config.auto_commit_message, &ctx).ok()
+    crate::workspace_setup::render_template(template, &ctx).ok()
 }
 
 /// Complete an assignment: auto-commit, capture revision, optionally push,

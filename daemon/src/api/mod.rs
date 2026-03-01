@@ -573,7 +573,7 @@ async fn assignments_create(
         .unwrap_or_default();
     let ancillary_id = assignments.next_available_ancillary(
         &request.segment,
-        state.config.ancillary.pool_size,
+        state.config.ancillaries.max_per_segment,
         &existing_workspaces,
     );
     let ancillary_num = toren_lib::ancillary_number(&ancillary_id).unwrap_or(1);
@@ -780,9 +780,9 @@ async fn assignments_complete(
         ),
     ))?;
 
-    // Render auto-commit message from config template
+    // Render auto-commit message from hardcoded template
     let auto_commit_message = toren_lib::render_auto_commit_message(
-        &state.config.ancillary,
+        toren_lib::DEFAULT_AUTO_COMMIT_MESSAGE,
         &assignment,
         &assignment.segment,
         &segment_path,

@@ -75,15 +75,14 @@ async fn main() -> Result<()> {
     let segment_manager = SegmentManager::new(&config)?;
     info!("Segment manager initialized");
 
-    // Initialize workspace manager (if workspace_root is configured)
-    let local_domain = Some(config.local_domain.clone());
-    let workspace_manager = config.ancillary.workspace_root.clone().map(|root| {
-        info!(
-            "Workspace manager initialized with root: {}",
-            root.display()
-        );
-        WorkspaceManager::new(root, local_domain.clone())
-    });
+    // Initialize workspace manager
+    let local_domain = Some(config.proxy.domain.clone());
+    let workspace_root = config.ancillaries.workspace_root.clone();
+    info!(
+        "Workspace manager initialized with root: {}",
+        workspace_root.display()
+    );
+    let workspace_manager = Some(WorkspaceManager::new(workspace_root, local_domain));
 
     // Initialize work manager (for embedded ancillary runtime)
     let work_manager = ancillary::WorkManager::new();

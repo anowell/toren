@@ -18,9 +18,10 @@ pub use assignment_ops::{
     abort_assignment, clean_assignment, complete_assignment, prepare_resume,
     render_auto_commit_message, AbortOptions, CleanOptions, CleanResult,
     CompleteOptions, CompleteResult, ResumeOptions, ResumeResult,
+    DEFAULT_AUTO_COMMIT_MESSAGE,
 };
 pub use composite_status::CompositeStatus;
-pub use config::{Config, IntentsConfig};
+pub use config::{Config, AncillariesConfig, IntentsConfig, expand_path, expand_path_str, tilde_shorten};
 pub use segments::{Segment, SegmentManager};
 pub use tasks::{fetch_task, generate_prompt, Task, TaskProvider};
 pub use workspace::{

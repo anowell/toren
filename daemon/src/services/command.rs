@@ -6,6 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+use super::derive_approved_directories;
 use toren_lib::Config;
 
 pub struct CommandService {
@@ -31,7 +32,7 @@ pub enum CommandOutput {
 impl CommandService {
     pub fn new(config: &Config) -> Result<Self> {
         Ok(Self {
-            approved_directories: config.approved_directories.clone(),
+            approved_directories: derive_approved_directories(config),
         })
     }
 
