@@ -93,7 +93,7 @@ impl AncillaryWork {
         {
             let mut log = work_log.write().await;
             let event = log.append(WorkOp::AssignmentStarted {
-                bead_id: assignment.external_id.clone().unwrap_or_default(),
+                task_id: assignment.task_id.clone().unwrap_or_default(),
             })?;
             let _ = event_tx.send(event);
         }
@@ -121,7 +121,7 @@ impl AncillaryWork {
         event_tx: broadcast::Sender<super::work_log::WorkEvent>,
         mut input_rx: mpsc::Receiver<ClientInput>,
     ) {
-        info!("{} starting work on {:?}", ancillary_id, assignment.external_id);
+        info!("{} starting work on {:?}", ancillary_id, assignment.task_id);
 
         // Update status to working
         {
@@ -135,11 +135,11 @@ impl AncillaryWork {
             toren_lib::AssignmentSource::Prompt { original_prompt } => original_prompt.clone(),
             toren_lib::AssignmentSource::Reference => {
                 // Fetch task info and render using the act intent template
-                let ext_id = assignment.external_id.clone().unwrap_or_default();
-                let task_title = assignment
-                    .title
+                let task_id = assignment.task_id.clone().unwrap_or_default();
+                let title = assignment
+                    .task_title
                     .clone()
-                    .unwrap_or_else(|| ext_id.clone());
+                    .unwrap_or_else(|| task_id.clone());
                 let ctx = toren_lib::WorkspaceContext {
                     ws: toren_lib::WorkspaceInfo {
                         name: assignment
@@ -156,8 +156,10 @@ impl AncillaryWork {
                         name: assignment.segment.clone(),
                     },
                     task: Some(toren_lib::TaskInfo {
-                        id: ext_id.clone(),
-                        title: task_title,
+                        id: task_id.clone(),
+                        title,
+                        url: assignment.task_url.clone(),
+                        source: assignment.task_source.clone(),
                     }),
                     vars: std::collections::HashMap::new(),
                 };
@@ -165,7 +167,7 @@ impl AncillaryWork {
                 let template = toren_lib::config::IntentsConfig::default()
                     .entries.get("act").cloned().unwrap_or_default();
                 toren_lib::render_template(&template, &ctx)
-                    .unwrap_or_else(|_| format!("implement {}", ext_id))
+                    .unwrap_or_else(|_| format!("implement {}", task_id))
             }
         };
 
@@ -236,7 +238,7 @@ impl AncillaryWork {
                 }
 
                 // Completed successfully
-                info!("{} completed work on {:?}", ancillary_id, assignment.external_id);
+                info!("{} completed work on {:?}", ancillary_id, assignment.task_id);
                 Self::log_op(&work_log, &event_tx, WorkOp::AssignmentCompleted).await;
                 let mut s = status.write().await;
                 *s = WorkStatus::Completed;

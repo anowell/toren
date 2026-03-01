@@ -5,6 +5,8 @@ import BeadStatusIcon from '$lib/components/BeadStatusIcon.svelte';
 import {
 	getAncillaryDisplayStatus,
 	getBeadDisplayStatus,
+	getTaskId,
+	getTaskTitle,
 	segmentAssignments,
 	stripBeadPrefix,
 	torenStore,
@@ -110,11 +112,11 @@ function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment):
 					</div>
 					<div class="card-body">
 						<BeadStatusIcon status={beadStatus} />
-						<span class="bead-label">{stripBeadPrefix(assignment.external_id ?? assignment.bead_id ?? '')}{#if (assignment.title ?? assignment.bead_title)}: {assignment.title ?? assignment.bead_title}{/if}</span>
+						<span class="bead-label">{stripBeadPrefix(getTaskId(assignment))}{#if getTaskTitle(assignment)}: {getTaskTitle(assignment)}{/if}</span>
 					</div>
-					{#if assignment.bead_assignee}
+					{#if (assignment.task_assignee ?? assignment.bead_assignee)}
 						<div class="card-footer">
-							<span class="assignee-badge">@{assignment.bead_assignee}</span>
+							<span class="assignee-badge">@{assignment.task_assignee ?? assignment.bead_assignee}</span>
 						</div>
 					{/if}
 				</button>

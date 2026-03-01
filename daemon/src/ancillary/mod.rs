@@ -187,7 +187,7 @@ impl WorkManager {
     ) -> Result<Arc<AncillaryWork>> {
         info!(
             "Starting work for {} on {}",
-            ancillary_id, assignment.external_id.as_deref().unwrap_or("-")
+            ancillary_id, assignment.task_id.as_deref().unwrap_or("-")
         );
 
         let assignment_id = assignment.id.clone();

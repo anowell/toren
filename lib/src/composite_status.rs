@@ -17,10 +17,12 @@ pub struct CompositeStatus {
     pub agent_activity: String,
     /// Whether the workspace has changes since trunk (committed or uncommitted)
     pub has_changes: bool,
-    /// Bead status: "open", "in_progress", "closed"
-    pub bead_status: String,
-    /// Bead assignee: e.g. "claude", "anthony", ""
-    pub bead_assignee: String,
+    /// Task status: "open", "in_progress", "closed"
+    #[serde(alias = "bead_status")]
+    pub task_status: String,
+    /// Task assignee: e.g. "claude", "anthony", ""
+    #[serde(alias = "bead_assignee")]
+    pub task_assignee: String,
 }
 
 /// Check if a workspace has changes exclusive to it.

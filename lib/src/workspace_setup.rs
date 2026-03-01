@@ -60,6 +60,12 @@ pub struct TaskInfo {
     pub id: String,
     /// Task title
     pub title: String,
+    /// Task URL (e.g., link to issue tracker)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Task source (e.g., "beads", "github")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Workspace context available to templates

@@ -410,14 +410,14 @@ async fn compute_composite_status(
         assignment.base_branch.as_deref(),
     );
 
-    // 3. Bead status + assignee — from bd
+    // 3. Task status + assignee — from task source (beads for now)
     let segment_path = {
         let segments = state.segments.read().unwrap();
         segments.find_by_name(&assignment.segment).map(|s| s.path.clone())
     };
 
-    let (bead_status, bead_assignee) = if let (Some(seg_path), Some(ref ext_id)) = (segment_path, &assignment.external_id) {
-        match toren_lib::tasks::beads::fetch_bead_info(ext_id, &seg_path) {
+    let (task_status, task_assignee) = if let (Some(seg_path), Some(ref task_id)) = (segment_path, &assignment.task_id) {
+        match toren_lib::tasks::beads::fetch_bead_info(task_id, &seg_path) {
             Ok(info) => (info.status, info.assignee),
             Err(_) => ("unknown".to_string(), String::new()),
         }
@@ -428,8 +428,8 @@ async fn compute_composite_status(
     CompositeStatus {
         agent_activity,
         has_changes,
-        bead_status,
-        bead_assignee,
+        task_status,
+        task_assignee,
     }
 }
 
@@ -437,15 +437,21 @@ async fn compute_composite_status(
 
 #[derive(Debug, Deserialize)]
 struct CreateAssignmentRequest {
-    /// Create from existing bead ID
-    #[serde(default)]
-    bead_id: Option<String>,
-    /// Create from prompt (auto-creates bead)
+    /// Create from existing task ID
+    #[serde(default, alias = "bead_id")]
+    task_id: Option<String>,
+    /// Create from prompt (auto-creates task)
     #[serde(default)]
     prompt: Option<String>,
     /// Title for prompt-based creation
     #[serde(default)]
-    title: Option<String>,
+    task_title: Option<String>,
+    /// Task URL
+    #[serde(default)]
+    task_url: Option<String>,
+    /// Task source (e.g., "beads")
+    #[serde(default)]
+    task_source: Option<String>,
     /// Segment name
     segment: String,
 }
@@ -482,7 +488,7 @@ async fn assignments_get(
         .get(&id)
         .cloned()
         .or_else(|| assignments.get_active_for_ancillary(&id).cloned())
-        .or_else(|| assignments.get_by_external_id(&id).into_iter().next().cloned());
+        .or_else(|| assignments.get_by_task_id(&id).into_iter().next().cloned());
 
     drop(assignments);
 
@@ -518,10 +524,10 @@ async fn assignments_create(
 
     let mut assignments = state.assignments.write().await;
 
-    // Determine bead ID - either from existing or create from prompt
-    let (bead_id, original_prompt, bead_title) = if let Some(ref prompt) = request.prompt {
+    // Determine task ID - either from existing or create from prompt
+    let (task_id, original_prompt, task_title) = if let Some(ref prompt) = request.prompt {
         // Create bead from prompt
-        let title = request.title.clone().unwrap_or_else(|| {
+        let title = request.task_title.clone().unwrap_or_else(|| {
             prompt
                 .lines()
                 .next()
@@ -531,7 +537,7 @@ async fn assignments_create(
                 .collect()
         });
 
-        let new_bead_id = toren_lib::tasks::beads::create_and_claim_bead(
+        let new_task_id = toren_lib::tasks::beads::create_and_claim_bead(
             &title,
             Some(prompt),
             "claude",
@@ -544,26 +550,26 @@ async fn assignments_create(
             )
         })?;
 
-        (new_bead_id, Some(prompt.clone()), Some(title))
-    } else if let Some(bead_id) = request.bead_id.clone() {
+        (new_task_id, Some(prompt.clone()), Some(title))
+    } else if let Some(task_id) = request.task_id.clone() {
         // Claim existing bead
-        toren_lib::tasks::beads::claim_bead(&bead_id, "claude", &segment_path).map_err(|e| {
+        toren_lib::tasks::beads::claim_bead(&task_id, "claude", &segment_path).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": format!("Failed to claim bead: {}", e)})),
             )
         })?;
 
-        // Fetch bead title for display
-        let title = toren_lib::tasks::beads::fetch_bead(&bead_id, &segment_path)
+        // Fetch task title for display
+        let title = toren_lib::tasks::beads::fetch_bead(&task_id, &segment_path)
             .ok()
             .map(|t| t.title);
 
-        (bead_id, None, title)
+        (task_id, None, title)
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Either bead_id or prompt must be specified"})),
+            Json(serde_json::json!({"error": "Either task_id or prompt must be specified"})),
         ));
     };
 
@@ -599,45 +605,38 @@ async fn assignments_create(
             )
         })?;
 
+    // Infer task source (default to "beads" if not specified)
+    let task_source = request.task_source.as_deref().unwrap_or("beads");
+
     // Create assignment
-    let assignment = if let Some(prompt) = original_prompt {
-        assignments
-            .create_from_prompt(
-                &ancillary_id,
-                &bead_id,
-                &prompt,
-                &request.segment,
-                ws_path,
-                bead_title,
-                base_branch,
-            )
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        serde_json::json!({"error": format!("Failed to create assignment: {}", e)}),
-                    ),
-                )
-            })?
+    let source = if let Some(prompt) = original_prompt {
+        toren_lib::AssignmentSource::Prompt {
+            original_prompt: prompt,
+        }
     } else {
-        assignments
-            .create_from_bead(
-                &ancillary_id,
-                &bead_id,
-                &request.segment,
-                ws_path,
-                bead_title,
-                base_branch,
-            )
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        serde_json::json!({"error": format!("Failed to create assignment: {}", e)}),
-                    ),
-                )
-            })?
+        toren_lib::AssignmentSource::Reference
     };
+
+    let assignment = assignments
+        .create(
+            &ancillary_id,
+            Some(&task_id),
+            source,
+            &request.segment,
+            ws_path,
+            task_title,
+            base_branch,
+            request.task_url.as_deref(),
+            Some(task_source),
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({"error": format!("Failed to create assignment: {}", e)}),
+                ),
+            )
+        })?;
 
     let composite = compute_composite_status(&assignment, &state).await;
     Ok(Json(EnrichedAssignment { assignment, composite }))
@@ -695,9 +694,9 @@ async fn assignments_delete(
         ));
     }
 
-    // Try by external ID
+    // Try by task ID
     let dismissed = assignments
-        .dismiss_external_id(&id)
+        .dismiss_task_id(&id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if !dismissed.is_empty() {
@@ -721,9 +720,9 @@ fn resolve_assignment(assignments: &mut AssignmentManager, id: &str) -> Option<A
     if let Some(a) = assignments.get_active_for_ancillary(id) {
         return Some(a.clone());
     }
-    // Try by external ID (first match)
-    let by_ext = assignments.get_by_external_id(id);
-    if let Some(a) = by_ext.into_iter().next() {
+    // Try by task ID (first match)
+    let by_task = assignments.get_by_task_id(id);
+    if let Some(a) = by_task.into_iter().next() {
         return Some(a.clone());
     }
     None

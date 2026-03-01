@@ -51,9 +51,9 @@ pub struct CompletionRecord {
     pub assignment_id: String,
     /// Ancillary that worked on it
     pub ancillary_id: String,
-    /// External identifier (e.g., bead ID)
-    #[serde(alias = "bead_id", default, skip_serializing_if = "Option::is_none")]
-    pub external_id: Option<String>,
+    /// Task identifier (e.g., bead ID)
+    #[serde(alias = "external_id", alias = "bead_id", default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     /// Segment name
     pub segment: String,
     /// When the assignment was completed/aborted (RFC 3339)
@@ -80,9 +80,9 @@ pub struct Assignment {
     pub id: String,
     /// Ancillary identifier (e.g., "Toren One")
     pub ancillary_id: String,
-    /// External identifier (e.g., bead ID "breq-a1b2") — optional
-    #[serde(alias = "bead_id", default, skip_serializing_if = "Option::is_none")]
-    pub external_id: Option<String>,
+    /// Task identifier (e.g., bead ID "breq-a1b2") — optional
+    #[serde(alias = "external_id", alias = "bead_id", default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     /// Segment name (e.g., "toren")
     pub segment: String,
     /// Absolute path to the workspace
@@ -95,9 +95,15 @@ pub struct Assignment {
     pub created_at: String,
     /// When the assignment was last updated (RFC 3339)
     pub updated_at: String,
-    /// Title for display purposes
-    #[serde(default, alias = "bead_title", skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
+    /// Task title for display purposes
+    #[serde(default, alias = "title", alias = "bead_title", skip_serializing_if = "Option::is_none")]
+    pub task_title: Option<String>,
+    /// Task URL (e.g., link to issue tracker)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_url: Option<String>,
+    /// Task source (e.g., "beads", "github")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_source: Option<String>,
     /// Claude session ID for cross-interface handoff (breq <-> toren)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -182,8 +188,8 @@ fn capitalize(s: &str) -> String {
 /// Reference type for command disambiguation
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssignmentRef {
-    /// Reference by external ID (e.g., bead ID "breq-a1b2")
-    ExternalId(String),
+    /// Reference by task ID (e.g., bead ID "breq-a1b2")
+    TaskId(String),
     /// Reference by ancillary ID (e.g., "Toren One" or just "One")
     Ancillary(String),
 }
@@ -192,12 +198,12 @@ impl AssignmentRef {
     /// Parse a reference string into an AssignmentRef.
     ///
     /// Rules:
-    /// - Contains hyphen -> treat as external ID
+    /// - Contains hyphen -> treat as task ID
     /// - Contains space -> treat as ancillary name
-    /// - Otherwise -> try ancillary name first, then external ID
+    /// - Otherwise -> try ancillary name first, then task ID
     pub fn parse(s: &str, segment: &str) -> Self {
         if s.contains('-') {
-            AssignmentRef::ExternalId(s.to_string())
+            AssignmentRef::TaskId(s.to_string())
         } else if s.contains(' ') {
             AssignmentRef::Ancillary(s.to_string())
         } else {
@@ -206,7 +212,7 @@ impl AssignmentRef {
                 let full_id = format!("{} {}", capitalize(segment), capitalize(s));
                 AssignmentRef::Ancillary(full_id)
             } else {
-                AssignmentRef::ExternalId(s.to_string())
+                AssignmentRef::TaskId(s.to_string())
             }
         }
     }
@@ -324,17 +330,19 @@ impl AssignmentManager {
 
     /// Create a new assignment.
     ///
-    /// `external_id` is an optional external reference (e.g., bead ID).
+    /// `task_id` is an optional task reference (e.g., bead ID).
     /// `source` indicates how the assignment was created.
     pub fn create(
         &mut self,
         ancillary_id: &str,
-        external_id: Option<&str>,
+        task_id: Option<&str>,
         source: AssignmentSource,
         segment: &str,
         workspace_path: PathBuf,
-        title: Option<String>,
+        task_title: Option<String>,
         base_branch: Option<String>,
+        task_url: Option<&str>,
+        task_source: Option<&str>,
     ) -> Result<Assignment> {
         let now = chrono::Utc::now().to_rfc3339();
         let id = uuid::Uuid::new_v4().to_string();
@@ -343,14 +351,16 @@ impl AssignmentManager {
             ancillary_num: ancillary_number(ancillary_id),
             id,
             ancillary_id: ancillary_id.to_string(),
-            external_id: external_id.map(|s| s.to_string()),
+            task_id: task_id.map(|s| s.to_string()),
             segment: segment.to_string(),
             workspace_path,
             source,
             status: AssignmentStatus::Active,
             created_at: now.clone(),
             updated_at: now,
-            title,
+            task_title,
+            task_url: task_url.map(|s| s.to_string()),
+            task_source: task_source.map(|s| s.to_string()),
             session_id: None,
             base_branch,
         };
@@ -361,7 +371,7 @@ impl AssignmentManager {
 
         info!(
             "Created assignment: {} -> {:?}",
-            ancillary_id, assignment.external_id
+            ancillary_id, assignment.task_id
         );
         Ok(assignment)
     }
@@ -384,6 +394,8 @@ impl AssignmentManager {
             workspace_path,
             bead_title,
             base_branch,
+            None,
+            Some("beads"),
         )
     }
 
@@ -408,6 +420,8 @@ impl AssignmentManager {
             workspace_path,
             bead_title,
             base_branch,
+            None,
+            Some("beads"),
         )
     }
 
@@ -449,7 +463,7 @@ impl AssignmentManager {
         let record = CompletionRecord {
             assignment_id: assignment.id.clone(),
             ancillary_id: assignment.ancillary_id.clone(),
-            external_id: assignment.external_id.clone(),
+            task_id: assignment.task_id.clone(),
             segment: assignment.segment.clone(),
             completed_at: chrono::Utc::now().to_rfc3339(),
             reason,
@@ -493,12 +507,12 @@ impl AssignmentManager {
         self.assignments.get(assignment_id)
     }
 
-    /// Get all assignments for an external ID
-    pub fn get_by_external_id(&mut self, external_id: &str) -> Vec<&Assignment> {
+    /// Get all assignments for a task ID
+    pub fn get_by_task_id(&mut self, task_id: &str) -> Vec<&Assignment> {
         self.reload_if_changed();
         self.assignments
             .values()
-            .filter(|a| a.external_id.as_deref() == Some(external_id))
+            .filter(|a| a.task_id.as_deref() == Some(task_id))
             .collect()
     }
 
@@ -555,12 +569,12 @@ impl AssignmentManager {
         Ok(removed)
     }
 
-    /// Remove all assignments for an external ID
-    pub fn dismiss_external_id(&mut self, external_id: &str) -> Result<Vec<Assignment>> {
+    /// Remove all assignments for a task ID
+    pub fn dismiss_task_id(&mut self, task_id: &str) -> Result<Vec<Assignment>> {
         let ids: Vec<_> = self
             .assignments
             .values()
-            .filter(|a| a.external_id.as_deref() == Some(external_id))
+            .filter(|a| a.task_id.as_deref() == Some(task_id))
             .map(|a| a.id.clone())
             .collect();
 
@@ -572,9 +586,9 @@ impl AssignmentManager {
         if !removed.is_empty() {
             self.save()?;
             info!(
-                "Dismissed {} assignment(s) for external ID {}",
+                "Dismissed {} assignment(s) for task ID {}",
                 removed.len(),
-                external_id
+                task_id
             );
         }
 
@@ -666,9 +680,9 @@ impl AssignmentManager {
     pub fn resolve(&mut self, ref_: &AssignmentRef) -> Vec<&Assignment> {
         self.reload_if_changed();
         match ref_ {
-            AssignmentRef::ExternalId(ext_id) => self.assignments
+            AssignmentRef::TaskId(task_id) => self.assignments
                 .values()
-                .filter(|a| a.external_id.as_deref() == Some(ext_id.as_str()))
+                .filter(|a| a.task_id.as_deref() == Some(task_id.as_str()))
                 .collect(),
             AssignmentRef::Ancillary(ancillary_id) => self.assignments
                 .values()
@@ -729,7 +743,7 @@ mod tests {
     fn test_assignment_ref_parse() {
         assert_eq!(
             AssignmentRef::parse("breq-a1b2", "toren"),
-            AssignmentRef::ExternalId("breq-a1b2".to_string())
+            AssignmentRef::TaskId("breq-a1b2".to_string())
         );
         assert_eq!(
             AssignmentRef::parse("Toren One", "toren"),
@@ -741,7 +755,56 @@ mod tests {
         );
         assert_eq!(
             AssignmentRef::parse("a1b2", "toren"),
-            AssignmentRef::ExternalId("a1b2".to_string())
+            AssignmentRef::TaskId("a1b2".to_string())
         );
+    }
+
+    #[test]
+    fn test_serde_backward_compat() {
+        // Old format with external_id/title should deserialize into task_id/task_title
+        let json = r#"{
+            "id": "test-id",
+            "ancillary_id": "Toren One",
+            "external_id": "breq-abc",
+            "segment": "toren",
+            "workspace_path": "/tmp/ws",
+            "source": {"type": "Reference"},
+            "status": "active",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "title": "Test Title"
+        }"#;
+        let assignment: Assignment = serde_json::from_str(json).unwrap();
+        assert_eq!(assignment.task_id.as_deref(), Some("breq-abc"));
+        assert_eq!(assignment.task_title.as_deref(), Some("Test Title"));
+
+        // Old format with bead_id/bead_title
+        let json2 = r#"{
+            "id": "test-id2",
+            "ancillary_id": "Toren Two",
+            "bead_id": "breq-def",
+            "segment": "toren",
+            "workspace_path": "/tmp/ws2",
+            "source": {"type": "Reference"},
+            "status": "active",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "bead_title": "Bead Title"
+        }"#;
+        let assignment2: Assignment = serde_json::from_str(json2).unwrap();
+        assert_eq!(assignment2.task_id.as_deref(), Some("breq-def"));
+        assert_eq!(assignment2.task_title.as_deref(), Some("Bead Title"));
+
+        // CompletionRecord backward compat
+        let cr_json = r#"{
+            "assignment_id": "a1",
+            "ancillary_id": "Toren One",
+            "external_id": "breq-xyz",
+            "segment": "toren",
+            "completed_at": "2024-01-01T00:00:00Z",
+            "reason": "completed"
+        }"#;
+        let record: CompletionRecord = serde_json::from_str(cr_json).unwrap();
+        assert_eq!(record.task_id.as_deref(), Some("breq-xyz"));
     }
 }

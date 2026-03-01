@@ -21,9 +21,9 @@ pub use assignment_ops::{
     DEFAULT_AUTO_COMMIT_MESSAGE,
 };
 pub use composite_status::CompositeStatus;
-pub use config::{Config, AncillariesConfig, IntentsConfig, expand_path, expand_path_str, tilde_shorten};
+pub use config::{Config, AncillariesConfig, IntentsConfig, TasksConfig, expand_path, expand_path_str, tilde_shorten};
 pub use segments::{Segment, SegmentManager};
-pub use tasks::{fetch_task, generate_prompt, Task, TaskProvider};
+pub use tasks::{fetch_task, generate_prompt, infer_task_fields, InferredTaskFields, Task, TaskProvider};
 pub use workspace::{
     CleanupMode, CommitInfo, GitWorktreeBackend, JjBackend, RepoType, VcsBackend, WorkspaceManager,
     detect_repo_type,

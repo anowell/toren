@@ -27,6 +27,9 @@ pub struct Config {
     #[serde(default)]
     pub intents: IntentsConfig,
 
+    #[serde(default)]
+    pub tasks: TasksConfig,
+
     #[serde(default = "crate::alias::default_aliases")]
     pub aliases: HashMap<String, String>,
 }
@@ -123,6 +126,26 @@ impl Default for IntentsConfig {
         entries.insert("plan".to_string(), default_intent_plan());
         entries.insert("review".to_string(), default_intent_review());
         Self { entries }
+    }
+}
+
+/// Configuration for task tracking defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TasksConfig {
+    /// Default task source when an ID is provided but source isn't specified
+    #[serde(default = "default_task_source")]
+    pub default_source: String,
+}
+
+fn default_task_source() -> String {
+    "beads".to_string()
+}
+
+impl Default for TasksConfig {
+    fn default() -> Self {
+        Self {
+            default_source: default_task_source(),
+        }
     }
 }
 
@@ -301,6 +324,7 @@ impl Default for Config {
             ancillaries: AncillariesConfig::default(),
             proxy: ProxyConfig::default(),
             intents: IntentsConfig::default(),
+            tasks: TasksConfig::default(),
             aliases: crate::alias::default_aliases(),
         }
     }

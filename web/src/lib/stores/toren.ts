@@ -218,9 +218,20 @@ export function stripBeadPrefix(beadId: string): string {
 	return idx >= 0 ? beadId.slice(idx + 1) : beadId;
 }
 
-/** Derive bead display status from the composite bead_status signal (from bd) */
+/** Get task ID with backward-compat fallback */
+export function getTaskId(assignment: Assignment): string {
+	return assignment.task_id ?? assignment.external_id ?? assignment.bead_id ?? '';
+}
+
+/** Get task title with backward-compat fallback */
+export function getTaskTitle(assignment: Assignment): string {
+	return assignment.task_title ?? assignment.title ?? assignment.bead_title ?? '';
+}
+
+/** Derive bead display status from the composite task_status signal (from provider) */
 export function getBeadDisplayStatus(assignment: Assignment): BeadDisplayStatus {
-	switch (assignment.bead_status) {
+	const status = assignment.task_status ?? assignment.bead_status;
+	switch (status) {
 		case 'open':
 			return 'open';
 		case 'in_progress':

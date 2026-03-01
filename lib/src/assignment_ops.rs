@@ -107,11 +107,11 @@ pub fn render_auto_commit_message(
     segment_name: &str,
     segment_path: &std::path::Path,
 ) -> Option<String> {
-    let ext_id = assignment.external_id.clone().unwrap_or_default();
+    let task_id = assignment.task_id.clone().unwrap_or_default();
     let task_title = assignment
-        .title
+        .task_title
         .clone()
-        .unwrap_or_else(|| ext_id.clone());
+        .unwrap_or_else(|| task_id.clone());
     let ws_name = assignment
         .workspace_path
         .file_name()
@@ -130,8 +130,10 @@ pub fn render_auto_commit_message(
             name: segment_name.to_string(),
         },
         task: Some(TaskInfo {
-            id: ext_id,
+            id: task_id,
             title: task_title,
+            url: assignment.task_url.clone(),
+            source: assignment.task_source.clone(),
         }),
         vars: std::collections::HashMap::new(),
     };
@@ -213,11 +215,11 @@ pub fn complete_assignment(
     )?;
     assignment_mgr.remove(&assignment.id)?;
 
-    // Close bead unless keep_open (only if external_id is present)
+    // Close bead unless keep_open (only if task_id is present)
     if !opts.keep_open {
-        if let Some(ref ext_id) = assignment.external_id {
-            crate::tasks::beads::update_bead_status(ext_id, "closed", opts.segment_path)?;
-            info!("Bead {} closed", ext_id);
+        if let Some(ref task_id) = assignment.task_id {
+            crate::tasks::beads::update_bead_status(task_id, "closed", opts.segment_path)?;
+            info!("Bead {} closed", task_id);
         }
     }
 
@@ -246,16 +248,16 @@ pub fn abort_assignment(
     assignment_mgr.record_completion(assignment, CompletionReason::Aborted, None)?;
     assignment_mgr.remove(&assignment.id)?;
 
-    // Handle bead status (only if external_id is present)
-    if let Some(ref ext_id) = assignment.external_id {
+    // Handle bead status (only if task_id is present)
+    if let Some(ref task_id) = assignment.task_id {
         if opts.close_bead {
-            crate::tasks::beads::update_bead_status(ext_id, "closed", opts.segment_path)?;
-            info!("Bead {} closed", ext_id);
+            crate::tasks::beads::update_bead_status(task_id, "closed", opts.segment_path)?;
+            info!("Bead {} closed", task_id);
         } else {
             // Unassign and reopen
-            let _ = crate::tasks::beads::update_bead_assignee(ext_id, "", opts.segment_path);
-            crate::tasks::beads::update_bead_status(ext_id, "open", opts.segment_path)?;
-            info!("Bead {} unassigned and returned to open", ext_id);
+            let _ = crate::tasks::beads::update_bead_assignee(task_id, "", opts.segment_path);
+            crate::tasks::beads::update_bead_status(task_id, "open", opts.segment_path)?;
+            info!("Bead {} unassigned and returned to open", task_id);
         }
     }
 
@@ -303,31 +305,31 @@ pub fn prepare_resume(
     // Touch updated_at timestamp (assignment is always Active)
     assignment_mgr.touch(&assignment.id)?;
 
-    // Ensure bead is in_progress and assigned to claude (if external_id present)
-    let task_title = if let Some(ref ext_id) = assignment.external_id {
-        match crate::tasks::fetch_task(ext_id, opts.segment_path) {
+    // Ensure bead is in_progress and assigned to claude (if task_id present)
+    let task_title = if let Some(ref task_id) = assignment.task_id {
+        match crate::tasks::fetch_task(task_id, opts.segment_path) {
             Ok(task) => task.title,
             Err(_) => {
                 // Bead might be closed or not found, try to reopen/reclaim
-                crate::tasks::beads::claim_bead(ext_id, "claude", opts.segment_path)?;
+                crate::tasks::beads::claim_bead(task_id, "claude", opts.segment_path)?;
                 assignment
-                    .title
+                    .task_title
                     .clone()
-                    .unwrap_or_else(|| ext_id.clone())
+                    .unwrap_or_else(|| task_id.clone())
             }
         }
     } else {
-        assignment.title.clone().unwrap_or_default()
+        assignment.task_title.clone().unwrap_or_default()
     };
 
     let prompt = opts
         .instruction
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            if let Some(ref ext_id) = assignment.external_id {
+            if let Some(ref task_id) = assignment.task_id {
                 format!(
                     "Continue working on {}: {}. Review progress and complete remaining work.",
-                    ext_id, task_title
+                    task_id, task_title
                 )
             } else {
                 format!(
@@ -411,7 +413,7 @@ pub fn clean_assignment(
 
     Ok(CleanResult {
         workspace: ws_name,
-        id: assignment.external_id.clone(),
+        id: assignment.task_id.clone(),
         revision,
         segment: assignment.segment.clone(),
     })

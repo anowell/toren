@@ -68,7 +68,8 @@ pub enum WorkOp {
 
     // Lifecycle
     AssignmentStarted {
-        bead_id: String,
+        #[serde(alias = "bead_id")]
+        task_id: String,
     },
     AssignmentCompleted,
     AssignmentFailed {
@@ -252,7 +253,7 @@ mod tests {
 
         // Append some events
         log.append(WorkOp::AssignmentStarted {
-            bead_id: "breq-test".to_string(),
+            task_id: "breq-test".to_string(),
         })
         .unwrap();
 

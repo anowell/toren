@@ -32,9 +32,13 @@ domain = "lvh.me"
 host = "127.0.0.1"
 port = 8787
 
+[tasks]
+# Default task source when an ID is provided without a source prefix (e.g., "beads:breq-abc")
+default_source = "beads"
+
 [intents]
 # Named prompt templates for breq cmd -i <name>.
-# Available template variables: {{ task.id }}, {{ task.title }}
+# Available template variables: {{ task.id }}, {{ task.title }}, {{ task.url }}, {{ task.source }}
 act = """Implement {{ task.id }}: {{ task.title }}
 
 Complete the task as specified. When done, summarize changes."""
@@ -80,11 +84,15 @@ Controls how [Station](../station/README.md) reverse proxy routes are set up for
 
 Only used by the toren daemon. Ignored by breq.
 
+### `[tasks]`
+
+**`default_source`** — The default task source used when an ID is provided without a `source:id` prefix. Defaults to `"beads"`. When you run `breq cmd --task-id my-task`, the source is set to this value. To override, use the prefix syntax: `breq cmd --task-id linear:ENG-123`.
+
 ### `[intents]`
 
 Named prompt templates used with `breq cmd -i <intent>`. The default intents (`act`, `plan`, `review`) cover common workflows. You can add custom intents or override defaults.
 
-Template variables: `{{ task.id }}`, `{{ task.title }}`
+Template variables: `{{ task.id }}`, `{{ task.title }}`, `{{ task.url }}`, `{{ task.source }}`
 
 ### `[aliases]`
 

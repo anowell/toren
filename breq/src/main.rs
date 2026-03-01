@@ -64,9 +64,17 @@ enum Commands {
         #[arg(short, long)]
         intent: Option<String>,
 
-        /// Tag assignment with an external identifier (e.g., bead ID)
-        #[arg(long)]
-        id: Option<String>,
+        /// Tag assignment with a task identifier (e.g., bead ID)
+        #[arg(long = "task-id", alias = "id")]
+        task_id: Option<String>,
+
+        /// Task title
+        #[arg(long = "task-title")]
+        task_title: Option<String>,
+
+        /// Task URL
+        #[arg(long = "task-url")]
+        task_url: Option<String>,
 
         /// Resume previous Claude session (uses --resume if session_id exists)
         #[arg(long)]
@@ -90,6 +98,18 @@ enum Commands {
         /// Run a specific hook (setup or destroy)
         #[arg(long)]
         hook: Option<HookArg>,
+
+        /// Tag assignment with a task identifier
+        #[arg(long = "task-id")]
+        task_id: Option<String>,
+
+        /// Task title
+        #[arg(long = "task-title")]
+        task_title: Option<String>,
+
+        /// Task URL
+        #[arg(long = "task-url")]
+        task_url: Option<String>,
 
         /// Segment to use
         #[arg(short, long)]
@@ -154,9 +174,24 @@ enum Commands {
         stealth: bool,
     },
 
+    /// Show a specific field from an assignment (for scripting)
+    Show {
+        /// Workspace name (e.g. "one", "two")
+        workspace: String,
+
+        /// Field path to show (e.g., "task.id", "task.title", "task.url", "task.source",
+        /// "workspace.path", "segment", "ancillary_id", "session_id")
+        #[arg(long)]
+        field: String,
+
+        /// Segment to use
+        #[arg(short, long)]
+        segment: Option<String>,
+    },
+
     /// Remove assignment record without workspace cleanup
     Dismiss {
-        /// Workspace or external ID reference
+        /// Workspace or task ID reference
         reference: String,
     },
 }
@@ -250,7 +285,9 @@ fn main() -> Result<()> {
             workspace,
             prompt,
             intent,
-            id,
+            task_id,
+            task_title,
+            task_url,
             resume,
             segment,
             danger,
@@ -259,7 +296,9 @@ fn main() -> Result<()> {
             workspace,
             prompt,
             intent,
-            id,
+            task_id,
+            task_title,
+            task_url,
             resume,
             segment.as_deref(),
             danger,
@@ -267,9 +306,12 @@ fn main() -> Result<()> {
         Commands::Run {
             workspace,
             hook,
+            task_id,
+            task_title,
+            task_url,
             segment,
             cmd,
-        } => cmd_run(&config, workspace, hook, segment.as_deref(), cmd),
+        } => cmd_run(&config, workspace, hook, task_id, task_title, task_url, segment.as_deref(), cmd),
         Commands::List {
             reference,
             all,
@@ -284,6 +326,11 @@ fn main() -> Result<()> {
         } => cmd_clean(&config, &workspace, kill, push, segment.as_deref()),
         Commands::Cleanup { segment, all } => cmd_cleanup(&config, all, segment),
         Commands::Init { stealth } => cmd_init(stealth),
+        Commands::Show {
+            workspace,
+            field,
+            segment,
+        } => cmd_show(&config, &workspace, &field, segment.as_deref()),
         Commands::Dismiss { reference } => cmd_dismiss(&config, &reference),
     }
 }
@@ -317,7 +364,9 @@ fn cmd_cmd(
     workspace: Option<String>,
     prompt: Option<String>,
     intent: Option<String>,
-    external_id: Option<String>,
+    task_id_arg: Option<String>,
+    task_title_arg: Option<String>,
+    task_url_arg: Option<String>,
     resume: bool,
     segment_name: Option<&str>,
     danger: bool,
@@ -330,6 +379,15 @@ fn cmd_cmd(
 
     let segment = resolve_segment(&segment_mgr, segment_name)?;
 
+    // Infer task fields from CLI args
+    let inferred = toren_lib::infer_task_fields(
+        task_id_arg.as_deref(),
+        task_title_arg.as_deref(),
+        task_url_arg.as_deref(),
+        None, // prompt not known yet
+        &config.tasks.default_source,
+    );
+
     // Determine prompt text: -p flag > -i intent template > stdin (if piped) > $EDITOR
     let prompt_text = if let Some(ref p) = prompt {
         p.clone()
@@ -340,8 +398,8 @@ fn cmd_cmd(
             .with_context(|| format!("Unknown intent: {}", intent_name))?;
 
         // Build task context for template rendering
-        let task_id = external_id.clone().unwrap_or_default();
-        let task_title = external_id.clone().unwrap_or_default();
+        let task_id = inferred.task_id.clone().unwrap_or_default();
+        let task_title = inferred.task_title.clone().unwrap_or_else(|| task_id.clone());
         let ctx = toren_lib::WorkspaceContext {
             ws: toren_lib::WorkspaceInfo {
                 name: String::new(),
@@ -355,6 +413,8 @@ fn cmd_cmd(
             task: Some(toren_lib::TaskInfo {
                 id: task_id,
                 title: task_title,
+                url: inferred.task_url.clone(),
+                source: inferred.task_source.clone(),
             }),
             vars: std::collections::HashMap::new(),
         };
@@ -447,7 +507,7 @@ fn cmd_cmd(
         eprintln!("Workspace: {}", ws_path.display());
 
         // Record assignment
-        let source = if external_id.is_some() {
+        let source = if inferred.task_id.is_some() {
             AssignmentSource::Reference
         } else {
             AssignmentSource::Prompt {
@@ -455,7 +515,8 @@ fn cmd_cmd(
             }
         };
 
-        let title: Option<String> = Some(
+        // Use inferred title, falling back to first 80 chars of prompt
+        let title: Option<String> = inferred.task_title.clone().or_else(|| Some(
             prompt_text
                 .lines()
                 .next()
@@ -463,16 +524,18 @@ fn cmd_cmd(
                 .chars()
                 .take(80)
                 .collect(),
-        );
+        ));
 
         assignment_mgr.create(
             &ancillary_id_str,
-            external_id.as_deref(),
+            inferred.task_id.as_deref(),
             source,
             &segment.name,
             ws_path.clone(),
             title,
             base_branch,
+            inferred.task_url.as_deref(),
+            inferred.task_source.as_deref(),
         )?;
 
         // Exec into claude
@@ -494,6 +557,9 @@ fn cmd_run(
     config: &Config,
     workspace: Option<String>,
     hook: Option<HookArg>,
+    task_id_arg: Option<String>,
+    task_title_arg: Option<String>,
+    task_url_arg: Option<String>,
     segment_name: Option<&str>,
     cmd: Vec<String>,
 ) -> Result<()> {
@@ -592,16 +658,33 @@ fn cmd_run(
             ancillary_num,
         )?;
 
-        assignment_mgr.create(
-            &ancillary_id_str,
+        // Infer task fields from CLI args
+        let inferred = toren_lib::infer_task_fields(
+            task_id_arg.as_deref(),
+            task_title_arg.as_deref(),
+            task_url_arg.as_deref(),
             None,
+            &config.tasks.default_source,
+        );
+
+        let source = if inferred.task_id.is_some() {
+            AssignmentSource::Reference
+        } else {
             AssignmentSource::Prompt {
                 original_prompt: "(interactive shell)".to_string(),
-            },
+            }
+        };
+
+        assignment_mgr.create(
+            &ancillary_id_str,
+            inferred.task_id.as_deref(),
+            source,
             &segment.name,
             ws_path.clone(),
-            None,
+            inferred.task_title,
             base_branch,
+            inferred.task_url.as_deref(),
+            inferred.task_source.as_deref(),
         )?;
 
         eprintln!("Created workspace: {}", ws_path.display());
@@ -696,9 +779,9 @@ fn cmd_list(
             ws_text.normal()
         };
 
-        // External ID (if any)
-        let ext_id_display = assignment
-            .external_id
+        // Task ID (if any)
+        let task_id_display = assignment
+            .task_id
             .as_deref()
             .unwrap_or("-");
 
@@ -709,25 +792,18 @@ fn cmd_list(
             activity_text.green()
         };
 
-        if detail {
-            // In detail mode, show title too
-            let title_max = term_width.saturating_sub(fixed_width);
-            let title = assignment
-                .title
-                .as_deref()
-                .map(|t| truncate_title(t, title_max))
-                .unwrap_or_else(|| "-".to_string());
+        // Always show title; in detail mode show all task fields
+        let title_max = term_width.saturating_sub(fixed_width);
+        let title = assignment
+            .task_title
+            .as_deref()
+            .map(|t| truncate_title(t, title_max))
+            .unwrap_or_else(|| "-".to_string());
 
-            println!(
-                "{} {:<15} {} {}",
-                ws_colored, ext_id_display, activity_colored, title
-            );
-        } else {
-            println!(
-                "{} {:<15} {}",
-                ws_colored, ext_id_display, activity_colored
-            );
-        }
+        println!(
+            "{} {:<15} {} {}",
+            ws_colored, task_id_display, activity_colored, title
+        );
     }
 
     // Detect orphaned workspace directories
@@ -773,16 +849,22 @@ fn cmd_list_detail(
     for assignment in assignments {
         println!("Assignment: {}", assignment.id);
         println!("  Ancillary:    {}", assignment.ancillary_id);
-        if let Some(ref ext_id) = assignment.external_id {
-            println!("  External ID:  {}", ext_id);
+        if let Some(ref task_id) = assignment.task_id {
+            println!("  Task ID:      {}", task_id);
+        }
+        if let Some(ref task_title) = assignment.task_title {
+            println!("  Task Title:   {}", task_title);
+        }
+        if let Some(ref task_url) = assignment.task_url {
+            println!("  Task URL:     {}", task_url);
+        }
+        if let Some(ref task_source) = assignment.task_source {
+            println!("  Task Source:   {}", task_source);
         }
         println!("  Segment:      {}", assignment.segment);
         println!("  Status:       {:?}", assignment.status);
         println!("  Source:       {:?}", assignment.source);
         println!("  Workspace:    {}", assignment.workspace_path.display());
-        if let Some(ref title) = assignment.title {
-            println!("  Title:        {}", title);
-        }
         if let Some(ref branch) = assignment.base_branch {
             println!("  Base:         {}", branch);
         }
@@ -812,15 +894,15 @@ fn cmd_list_detail(
             println!("\n(Workspace not found)");
         }
 
-        // Show bead info if external_id present
-        if let Some(ref ext_id) = assignment.external_id {
+        // Show task details if task_id present
+        if let Some(ref task_id) = assignment.task_id {
             let seg_path = segment_mgr
                 .find_by_name(&assignment.segment)
                 .map(|s| s.path);
             if let Some(seg_path) = seg_path {
                 println!("\nTask details:");
                 let _ = Command::new("bd")
-                    .args(["show", ext_id])
+                    .args(["show", task_id])
                     .current_dir(&seg_path)
                     .status();
             }
@@ -966,10 +1048,49 @@ fn cmd_dismiss(config: &Config, reference: &str) -> Result<()> {
         println!(
             "Dismissed: {} ({})",
             assignment.ancillary_id,
-            assignment.external_id.as_deref().unwrap_or("-")
+            assignment.task_id.as_deref().unwrap_or("-")
         );
     }
 
+    Ok(())
+}
+
+// ─── show ────────────────────────────────────────────────────────────────────
+
+fn cmd_show(
+    config: &Config,
+    workspace: &str,
+    field: &str,
+    segment_name: Option<&str>,
+) -> Result<()> {
+    let segment_mgr = SegmentManager::new(config)?;
+    let mut assignment_mgr = AssignmentManager::new()?;
+    let segment = resolve_segment(&segment_mgr, segment_name)?;
+
+    let ws_name = workspace.to_lowercase();
+    let ancillary_num = toren_lib::word_to_number(&ws_name).unwrap_or(0);
+    let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
+
+    let assignment = assignment_mgr
+        .get_active_for_ancillary(&ancillary_id_str)
+        .with_context(|| format!("No assignment found for workspace '{}'", ws_name))?;
+
+    let value = match field {
+        "task.id" => assignment.task_id.as_deref().unwrap_or("").to_string(),
+        "task.title" => assignment.task_title.as_deref().unwrap_or("").to_string(),
+        "task.url" => assignment.task_url.as_deref().unwrap_or("").to_string(),
+        "task.source" => assignment.task_source.as_deref().unwrap_or("").to_string(),
+        "workspace.path" => assignment.workspace_path.display().to_string(),
+        "segment" => assignment.segment.clone(),
+        "ancillary_id" => assignment.ancillary_id.clone(),
+        "session_id" => assignment.session_id.as_deref().unwrap_or("").to_string(),
+        _ => anyhow::bail!(
+            "Unknown field: {}. Supported: task.id, task.title, task.url, task.source, workspace.path, segment, ancillary_id, session_id",
+            field
+        ),
+    };
+
+    println!("{}", value);
     Ok(())
 }
 

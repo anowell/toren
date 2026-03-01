@@ -10,5 +10,9 @@ port = 8787
 segments = ["examples"]
 workspace_root = "workspaces"
 
+[tasks]
+# Default task source when an ID is provided without a source prefix
+default_source = "beads"
+
 [proxy]
 domain = "lvh.me"

@@ -8,6 +8,8 @@ import { connectionStore } from '$lib/stores/connection';
 import {
 	getAncillaryDisplayStatus,
 	getBeadDisplayStatus,
+	getTaskId,
+	getTaskTitle,
 	segmentAssignments,
 	stripBeadPrefix,
 	torenStore,
@@ -286,7 +288,7 @@ function buildDisplayItems(events: WorkEvent[]): DisplayItem[] {
 			case 'assignment_started':
 				items.push({
 					type: 'status',
-					content: `Started working on ${op.external_id ?? op.bead_id}`,
+					content: `Started working on ${op.task_id ?? op.external_id ?? op.bead_id}`,
 					seq: event.seq,
 				});
 				break;
@@ -368,7 +370,7 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 			{#if beadDisplayStatus}
 				<BeadStatusIcon status={beadDisplayStatus} />
 			{/if}
-			<span class="bead-label">{stripBeadPrefix(currentAssignment.external_id ?? currentAssignment.bead_id ?? '')}{#if (currentAssignment.title ?? currentAssignment.bead_title)}: {currentAssignment.title ?? currentAssignment.bead_title}{/if}</span>
+			<span class="bead-label">{stripBeadPrefix(getTaskId(currentAssignment))}{#if getTaskTitle(currentAssignment)}: {getTaskTitle(currentAssignment)}{/if}</span>
 			<div class="indicator-actions">
 				{#if isDone}
 					<button class="action-btn resume" on:click={handleResume} disabled={lifecycleLoading} title="Resume work">Resume</button>
@@ -553,7 +555,7 @@ $: isDone = workStatus === 'completed' || workStatus.startsWith('failed');
 							<span class="ancillary-status-dot" class:busy={agentStatus === 'busy'} class:ready={agentStatus === 'ready'}></span>
 							<span class="item-name">{assignment.ancillary_id}</span>
 						</div>
-						<span class="item-bead"><BeadStatusIcon status={beadStatus} /> {stripBeadPrefix(assignment.external_id ?? assignment.bead_id ?? '')}{#if (assignment.title ?? assignment.bead_title)}: {assignment.title ?? assignment.bead_title}{/if}</span>
+						<span class="item-bead"><BeadStatusIcon status={beadStatus} /> {stripBeadPrefix(getTaskId(assignment))}{#if getTaskTitle(assignment)}: {getTaskTitle(assignment)}{/if}</span>
 					</button>
 				{/each}
 			</div>

@@ -53,9 +53,11 @@ export interface AssignmentSource {
 export interface Assignment {
 	id: string;
 	ancillary_id: string;
-	/** External identifier (e.g., bead ID). New canonical field. */
+	/** Task identifier (e.g., bead ID). Canonical field. */
+	task_id?: string;
+	/** @deprecated Use task_id */
 	external_id?: string;
-	/** @deprecated Use external_id. Kept for backward compat with daemon responses. */
+	/** @deprecated Use task_id */
 	bead_id?: string;
 	segment: string;
 	workspace_path: string;
@@ -63,16 +65,28 @@ export interface Assignment {
 	status: AssignmentStatus;
 	created_at: string;
 	updated_at: string;
-	/** Display title. New canonical field. */
+	/** Task display title. Canonical field. */
+	task_title?: string;
+	/** @deprecated Use task_title */
 	title?: string;
-	/** @deprecated Use title. Kept for backward compat. */
+	/** @deprecated Use task_title */
 	bead_title?: string;
+	/** Task URL */
+	task_url?: string;
+	/** Task source (e.g., "beads") */
+	task_source?: string;
 	session_id?: string;
 	ancillary_num?: number;
 	// Composite status signals (from API enrichment)
 	agent_activity?: AgentActivity;
 	has_changes?: boolean;
+	/** Task status from provider */
+	task_status?: BeadStatus;
+	/** @deprecated Use task_status */
 	bead_status?: BeadStatus;
+	/** Task assignee from provider */
+	task_assignee?: string;
+	/** @deprecated Use task_assignee */
 	bead_assignee?: string;
 }
 
@@ -123,7 +137,7 @@ export type WorkOp =
 	| { type: 'command_start'; command: string; args: string[] }
 	| { type: 'command_output'; stdout?: string; stderr?: string }
 	| { type: 'command_exit'; code: number }
-	| { type: 'assignment_started'; bead_id: string; external_id?: string }
+	| { type: 'assignment_started'; task_id: string; bead_id?: string; external_id?: string }
 	| { type: 'assignment_completed' }
 	| { type: 'assignment_failed'; error: string }
 	| { type: 'status_change'; status: string }
@@ -157,8 +171,12 @@ export interface HealthResponse {
 
 export interface CreateAssignmentRequest {
 	prompt?: string;
+	task_id?: string;
+	/** @deprecated Use task_id */
 	bead_id?: string;
-	title?: string;
+	task_title?: string;
+	task_url?: string;
+	task_source?: string;
 	segment: string;
 }
 

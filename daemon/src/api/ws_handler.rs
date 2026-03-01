@@ -49,7 +49,7 @@ enum WsResponse {
         #[serde(skip_serializing_if = "Option::is_none")]
         assignment_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        bead_id: Option<String>,
+        task_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         working_dir: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -263,7 +263,7 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
                         session_id: token.clone(),
                         ancillary_id: ancillary_id.clone(),
                         assignment_id: None,
-                        bead_id: None,
+                        task_id: None,
                         working_dir: working_dir_response,
                         instruction,
                     };
@@ -337,7 +337,7 @@ async fn connect_via_assignment(
                 let ws_name = working_dir
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or(assignment.external_id.as_deref().unwrap_or("unknown"));
+                    .unwrap_or(assignment.task_id.as_deref().unwrap_or("unknown"));
 
                 if let Err(e) = ws_mgr.create_workspace(&seg_path, &assignment.segment, ws_name) {
                     return Err(Some(format!("Failed to recreate workspace: {}", e)));
@@ -362,13 +362,13 @@ async fn connect_via_assignment(
         ancillary_id.to_string(),
         assignment.segment.clone(),
         session_token.to_string(),
-        assignment.external_id.clone(),
+        assignment.task_id.clone(),
         working_dir.clone(),
     );
 
-    // Generate instruction from external ID (bead)
-    let instruction = if let Some(ref ext_id) = assignment.external_id {
-        match tasks::fetch_task(ext_id, working_dir) {
+    // Generate instruction from task ID
+    let instruction = if let Some(ref task_id) = assignment.task_id {
+        match tasks::fetch_task(task_id, working_dir) {
             Ok(task) => {
                 let prompt =
                     tasks::generate_prompt(&task, "implement bead {{task_id}}");
@@ -378,7 +378,7 @@ async fn connect_via_assignment(
                 Some(prompt)
             }
             Err(e) => {
-                warn!("Failed to fetch task {}: {}", ext_id, e);
+                warn!("Failed to fetch task {}: {}", task_id, e);
                 None
             }
         }
@@ -393,7 +393,7 @@ async fn connect_via_assignment(
         session_id: session_token.to_string(),
         ancillary_id: Some(ancillary_id.to_string()),
         assignment_id: Some(assignment.id.clone()),
-        bead_id: assignment.external_id.clone(),
+        task_id: assignment.task_id.clone(),
         working_dir: Some(working_dir.display().to_string()),
         instruction,
     };
