@@ -33,6 +33,24 @@ let name = ARGS[0];
 print(`Hello, ${name}!`);
 ```
 
+### Doc comments
+
+Add `///` doc comments at the top of your plugin for help metadata:
+
+```rhai
+/// Short description shown in `breq --help`.
+///
+/// Usage: breq myplugin <arg>
+///
+/// Detailed help text shown by `breq myplugin --help`.
+/// Can span multiple lines.
+
+let arg = ARGS[0];
+```
+
+- The first paragraph (before a blank `///` line) is the **description** — shown in `breq --help`
+- The full text is the **usage** — shown by `breq <plugin> --help`
+
 ### Variables
 
 - **`ARGS`** — Array of positional arguments passed after the command name
@@ -77,46 +95,48 @@ if code != 0 {
 }
 ```
 
-### `breq_show(workspace, field) -> String`
-
-Read a field from an active assignment (native Rust, no subprocess).
-
-Fields: `task_id`/`id`, `task_title`/`title`, `task_url`/`url`, `task_source`/`source`, `workspace`/`workspace_path`, `segment`, `ancillary_id`, `status`.
-
-```rhai
-let id = breq_show("one", "task_id");
-let title = breq_show("one", "title");
-```
-
-### `breq_clean(workspace) -> Map`
-
-Clean a workspace with defaults (no kill, no push). Returns `{ workspace, segment, id?, revision? }`.
-
-```rhai
-let result = breq_clean("one");
-print(`Cleaned ${result.workspace}`);
-```
-
-### `breq_clean_with(workspace, opts) -> Map`
-
-Clean a workspace with options. `opts` is a map with optional `kill` and `push` booleans.
-
-```rhai
-let result = breq_clean_with("one", #{ kill: true, push: true });
-if result.revision != () {
-    print(`Pushed revision: ${result.revision}`);
-}
-```
-
-### `task_infer(id) -> Map`
+### `task(id) -> Map`
 
 Infer task fields from an ID. Splits `source:id` prefixes, fetches title from the task source when possible.
 
 Returns `{ id, title?, url?, source? }`.
 
 ```rhai
-let task = task_infer("breq-abc");
+let task = task("breq-abc");
 print(`Task: ${task.id} - ${task.title}`);
+```
+
+### `ancillary(workspace) -> Map`
+
+Resolve a workspace name to its active assignment and return all fields.
+
+Returns a map with: `id`, `ancillary_id`, `segment`, `workspace_path`, `status`, `task_id`, `task_title`, `task_url`, `task_source`, `session_id`, `ancillary_num`, `base_branch`.
+
+```rhai
+let info = ancillary("one");
+print(`Task: ${info.task_id} in ${info.workspace_path}`);
+```
+
+### `ws_changes(workspace) -> Array`
+
+Get the list of commits/changes in a workspace (relative to its base branch).
+
+Returns an array of `{ id, summary }` maps.
+
+```rhai
+let changes = ws_changes("one");
+for c in changes {
+    print(`${c.id}: ${c.summary}`);
+}
+```
+
+### `config(key) -> String`
+
+Read a config value by dot-separated key path. Returns string representation (strings as-is, numbers/bools stringified, objects as JSON).
+
+```rhai
+let source = config("tasks.default_source");
+let port = config("server.port");
 ```
 
 ### `json_parse(text) -> Dynamic`
@@ -139,7 +159,7 @@ let editor = env("EDITOR");
 
 ### `print(msg)`
 
-Print to stderr (stdout is reserved for structured output).
+Print to stdout.
 
 ## Community plugins
 
@@ -149,39 +169,41 @@ Example plugins for common workflows live in `contrib/plugins/`. To install them
 cp contrib/plugins/*.rhai ~/.toren/plugins/
 ```
 
-### `assign` (beads)
+### `assign`
 
-Claims a bead and starts a Claude session.
+Claims a task and starts a Claude session. Source-agnostic — dispatches status updates based on the task source (beads, github, linear).
 
 ```
-breq assign <bead-id>
+breq assign <task-id>
 ```
 
-1. Sets bead status to `in_progress`, assignee to `claude`
-2. Infers task fields (title, url) from the bead
+1. Infers task fields (source, title, url) from the ID
+2. Updates task status to in-progress via source-specific CLI
 3. Returns a deferred `cmd` action to start Claude
 
-### `complete` (beads)
+### `complete`
 
-Cleans workspace, pushes changes, and closes the bead.
+Cleans workspace, pushes changes, and closes the task.
 
 ```
 breq complete <workspace>
 ```
 
-1. Cleans workspace (auto-commit, push, kill processes)
-2. Closes the bead (`status -> closed`)
+1. Resolves workspace to its active assignment
+2. Cleans workspace (auto-commit, push, kill processes)
+3. Closes the task via source-specific CLI
 
-### `abort` (beads)
+### `abort`
 
-Cleans workspace and reopens the bead.
+Cleans workspace and reopens the task.
 
 ```
 breq abort <workspace>
 ```
 
-1. Cleans workspace (kill processes, no push)
-2. Reopens bead (`status -> open`, unassigns)
+1. Resolves workspace to its active assignment
+2. Cleans workspace (kill processes, no push)
+3. Reopens the task via source-specific CLI
 
 ## Daemon API
 

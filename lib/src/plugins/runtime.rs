@@ -10,8 +10,8 @@ use super::{DeferredAction, PluginContext, PluginResult};
 pub fn create_engine(ctx: Arc<PluginContext>) -> Engine {
     let mut engine = Engine::new();
 
-    // Override print to use stderr (stdout reserved for structured output)
-    engine.on_print(|s| eprintln!("{}", s));
+    // Plugin print goes to stdout
+    engine.on_print(|s| println!("{}", s));
     engine.on_debug(|s, src, pos| {
         if let Some(src) = src {
             eprintln!("[{}:{:?}] {}", src, pos, s);
@@ -25,10 +25,10 @@ pub fn create_engine(ctx: Arc<PluginContext>) -> Engine {
     register_shell_status(&mut engine);
     register_env(&mut engine);
     register_json_parse(&mut engine);
-    register_breq_show(&mut engine, ctx.clone());
-    register_breq_clean(&mut engine, ctx.clone());
-    register_breq_clean_with(&mut engine, ctx.clone());
-    register_task_infer(&mut engine, ctx);
+    register_config(&mut engine);
+    register_task(&mut engine, ctx.clone());
+    register_ancillary(&mut engine, ctx.clone());
+    register_ws_changes(&mut engine, ctx);
 
     engine
 }
@@ -134,113 +134,42 @@ fn register_json_parse(engine: &mut Engine) {
     });
 }
 
-/// `breq_show(workspace, field) -> String` — read assignment field (native Rust, no subprocess).
-fn register_breq_show(engine: &mut Engine, ctx: Arc<PluginContext>) {
-    engine.register_fn("breq_show", move |workspace: &str, field: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-        let mut assignment_mgr = crate::AssignmentManager::new()
-            .map_err(|e| format!("Failed to load assignments: {}", e))?;
+/// `config(key) -> String` — read a config value by dot-separated path.
+fn register_config(engine: &mut Engine) {
+    engine.register_fn("config", |key: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+        let config = crate::Config::load()
+            .map_err(|e| format!("Failed to load config: {}", e))?;
 
-        let segment_name = ctx.segment_name.as_deref().unwrap_or("");
+        let json_value = serde_json::to_value(&config)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
-        // Resolve workspace to assignment
-        let ws_name = workspace.to_lowercase();
-        let ancillary_num = crate::word_to_number(&ws_name).unwrap_or(0);
-        let ancillary_id = crate::ancillary_id(segment_name, ancillary_num);
+        // Traverse dot-path segments
+        let mut current = &json_value;
+        for segment in key.split('.') {
+            match current {
+                serde_json::Value::Object(map) => {
+                    current = map.get(segment)
+                        .ok_or_else(|| format!("Config key not found: {}", key))?;
+                }
+                _ => return Err(format!("Config key not found: {}", key).into()),
+            }
+        }
 
-        let assignment = assignment_mgr
-            .get_active_for_ancillary(&ancillary_id)
-            .ok_or_else(|| format!("No assignment found for workspace '{}'", workspace))?;
-
-        let value = match field {
-            "task_id" | "id" => assignment.task_id.clone().unwrap_or_default(),
-            "task_title" | "title" => assignment.task_title.clone().unwrap_or_default(),
-            "task_url" | "url" => assignment.task_url.clone().unwrap_or_default(),
-            "task_source" | "source" => assignment.task_source.clone().unwrap_or_default(),
-            "workspace" | "workspace_path" => assignment.workspace_path.display().to_string(),
-            "segment" => assignment.segment.clone(),
-            "ancillary_id" => assignment.ancillary_id.clone(),
-            "status" => format!("{:?}", assignment.status),
-            _ => return Err(format!("Unknown field: {}", field).into()),
+        // Convert to string representation
+        let result = match current {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
         };
-        Ok(value)
+        Ok(result)
     });
 }
 
-/// `breq_clean(workspace) -> Map` — clean workspace with defaults, return result map.
-fn register_breq_clean(engine: &mut Engine, ctx: Arc<PluginContext>) {
-    let ctx2 = ctx.clone();
-    engine.register_fn("breq_clean", move |workspace: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
-        do_breq_clean(workspace, false, false, &ctx2)
-    });
-}
-
-/// `breq_clean_with(workspace, opts) -> Map` — clean workspace with options, return result map.
-fn register_breq_clean_with(engine: &mut Engine, ctx: Arc<PluginContext>) {
-    engine.register_fn("breq_clean_with", move |workspace: &str, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
-        let kill = opts.get("kill").and_then(|v| v.as_bool().ok()).unwrap_or(false);
-        let push = opts.get("push").and_then(|v| v.as_bool().ok()).unwrap_or(false);
-        do_breq_clean(workspace, kill, push, &ctx)
-    });
-}
-
-/// Shared implementation for breq_clean and breq_clean_with.
-fn do_breq_clean(workspace: &str, kill: bool, push: bool, ctx: &PluginContext) -> Result<Map, Box<rhai::EvalAltResult>> {
-    let config = crate::Config::load()
-        .map_err(|e| format!("Failed to load config: {}", e))?;
-
-    let workspace_root = config.ancillaries.workspace_root.clone();
-    let ws_mgr = crate::WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
-    let mut assignment_mgr = crate::AssignmentManager::new()
-        .map_err(|e| format!("Failed to load assignments: {}", e))?;
-
-    let segment_name = ctx.segment_name.as_deref().unwrap_or("");
-    let segment_path = ctx.segment_path.as_ref()
-        .ok_or_else(|| "No segment path available".to_string())?;
-
-    // Resolve workspace to assignment
-    let ws_name = workspace.to_lowercase();
-    let ancillary_num = crate::word_to_number(&ws_name).unwrap_or(0);
-    let ancillary_id = crate::ancillary_id(segment_name, ancillary_num);
-
-    let assignment = assignment_mgr
-        .get_active_for_ancillary(&ancillary_id)
-        .cloned()
-        .ok_or_else(|| format!("No assignment found for workspace '{}'", workspace))?;
-
-    // Render auto-commit message
-    let auto_commit_message = crate::render_auto_commit_message(
-        crate::DEFAULT_AUTO_COMMIT_MESSAGE,
-        &assignment,
-        segment_name,
-        segment_path,
-    );
-
-    let opts = crate::CleanOptions {
-        push,
-        segment_path,
-        kill,
-        auto_commit_message,
-    };
-
-    let result = crate::clean_assignment(&assignment, &mut assignment_mgr, &ws_mgr, &opts)
-        .map_err(|e| format!("Clean failed: {}", e))?;
-
-    // Build result map
-    let mut map = Map::new();
-    map.insert("workspace".into(), Dynamic::from(result.workspace));
-    map.insert("segment".into(), Dynamic::from(result.segment));
-    if let Some(id) = result.id {
-        map.insert("id".into(), Dynamic::from(id));
-    }
-    if let Some(rev) = result.revision {
-        map.insert("revision".into(), Dynamic::from(rev));
-    }
-    Ok(map)
-}
-
-/// `task_infer(id) -> Map` — infer task fields from an ID.
-fn register_task_infer(engine: &mut Engine, ctx: Arc<PluginContext>) {
-    engine.register_fn("task_infer", move |id: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
+/// `task(id) -> Map` — infer task fields from an ID.
+fn register_task(engine: &mut Engine, ctx: Arc<PluginContext>) {
+    engine.register_fn("task", move |id: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
         let config = crate::Config::load()
             .map_err(|e| format!("Failed to load config: {}", e))?;
 
@@ -279,6 +208,82 @@ fn register_task_infer(engine: &mut Engine, ctx: Arc<PluginContext>) {
             map.insert("source".into(), Dynamic::from(source));
         }
         Ok(map)
+    });
+}
+
+/// `ancillary(workspace) -> Map` — resolve workspace to assignment, return all fields.
+fn register_ancillary(engine: &mut Engine, ctx: Arc<PluginContext>) {
+    engine.register_fn("ancillary", move |workspace: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
+        let mut assignment_mgr = crate::AssignmentManager::new()
+            .map_err(|e| format!("Failed to load assignments: {}", e))?;
+
+        let segment_name = ctx.segment_name.as_deref().unwrap_or("");
+
+        // Resolve workspace to assignment
+        let ws_name = workspace.to_lowercase();
+        let ancillary_num = crate::word_to_number(&ws_name).unwrap_or(0);
+        let anc_id = crate::ancillary_id(segment_name, ancillary_num);
+
+        let assignment = assignment_mgr
+            .get_active_for_ancillary(&anc_id)
+            .ok_or_else(|| format!("No assignment found for workspace '{}'", workspace))?;
+
+        let mut map = Map::new();
+        map.insert("id".into(), Dynamic::from(assignment.id.clone()));
+        map.insert("ancillary_id".into(), Dynamic::from(assignment.ancillary_id.clone()));
+        map.insert("segment".into(), Dynamic::from(assignment.segment.clone()));
+        map.insert("workspace_path".into(), Dynamic::from(assignment.workspace_path.display().to_string()));
+        map.insert("status".into(), Dynamic::from(format!("{:?}", assignment.status)));
+        map.insert("task_id".into(), Dynamic::from(assignment.task_id.clone().unwrap_or_default()));
+        map.insert("task_title".into(), Dynamic::from(assignment.task_title.clone().unwrap_or_default()));
+        map.insert("task_url".into(), Dynamic::from(assignment.task_url.clone().unwrap_or_default()));
+        map.insert("task_source".into(), Dynamic::from(assignment.task_source.clone().unwrap_or_default()));
+        map.insert("session_id".into(), Dynamic::from(assignment.session_id.clone().unwrap_or_default()));
+        map.insert("ancillary_num".into(), Dynamic::from(assignment.ancillary_num.unwrap_or(0) as i64));
+        map.insert("base_branch".into(), Dynamic::from(assignment.base_branch.clone().unwrap_or_default()));
+        Ok(map)
+    });
+}
+
+/// `ws_changes(workspace) -> Array` — get workspace commit info as array of `{id, summary}` maps.
+fn register_ws_changes(engine: &mut Engine, ctx: Arc<PluginContext>) {
+    engine.register_fn("ws_changes", move |workspace: &str| -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
+        let config = crate::Config::load()
+            .map_err(|e| format!("Failed to load config: {}", e))?;
+        let mut assignment_mgr = crate::AssignmentManager::new()
+            .map_err(|e| format!("Failed to load assignments: {}", e))?;
+
+        let segment_name = ctx.segment_name.as_deref().unwrap_or("");
+        let segment_path = ctx.segment_path.as_ref()
+            .ok_or_else(|| "No segment path available".to_string())?;
+
+        // Resolve workspace to assignment
+        let ws_name = workspace.to_lowercase();
+        let ancillary_num = crate::word_to_number(&ws_name).unwrap_or(0);
+        let anc_id = crate::ancillary_id(segment_name, ancillary_num);
+
+        let assignment = assignment_mgr
+            .get_active_for_ancillary(&anc_id)
+            .ok_or_else(|| format!("No assignment found for workspace '{}'", workspace))?;
+
+        let workspace_root = config.ancillaries.workspace_root.clone();
+        let ws_mgr = crate::WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
+
+        let commits = ws_mgr
+            .workspace_info(segment_path, &assignment.workspace_path, assignment.base_branch.as_deref())
+            .map_err(|e| format!("Failed to get workspace info: {}", e))?;
+
+        let result: rhai::Array = commits
+            .into_iter()
+            .map(|c| {
+                let mut m = Map::new();
+                m.insert("id".into(), Dynamic::from(c.id));
+                m.insert("summary".into(), Dynamic::from(c.summary));
+                Dynamic::from(m)
+            })
+            .collect();
+
+        Ok(result)
     });
 }
 
@@ -389,5 +394,18 @@ mod tests {
         let ast = engine.compile(r#"shell_status("false", [])"#).unwrap();
         let result: i64 = engine.eval_ast(&ast).unwrap();
         assert_ne!(result, 0);
+    }
+
+    #[test]
+    fn test_config_via_engine() {
+        let ctx = Arc::new(PluginContext {
+            segment_path: None,
+            segment_name: None,
+        });
+        let engine = create_engine(ctx);
+        // tasks.default_source should always exist
+        let ast = engine.compile(r#"config("tasks.default_source")"#).unwrap();
+        let result: String = engine.eval_ast(&ast).unwrap();
+        assert!(!result.is_empty());
     }
 }

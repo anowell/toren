@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use colored::Colorize;
 use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
@@ -226,6 +226,30 @@ fn main() -> Result<()> {
             let subcmd = &raw_args[subcmd_idx];
             let plugin_args: Vec<String> = raw_args[subcmd_idx + 1..].to_vec();
 
+            // Top-level help: inject plugin descriptions
+            if subcmd == "--help" || subcmd == "-h" {
+                if let Ok(config) = Config::load() {
+                    if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&config.plugins) {
+                        let plugins = plugin_mgr.list_with_descriptions();
+                        if !plugins.is_empty() {
+                            let mut section = String::from("Plugins:");
+                            for (name, desc) in &plugins {
+                                match desc {
+                                    Some(d) => section.push_str(&format!("\n  {:<16}{}", name, d)),
+                                    None => section.push_str(&format!("\n  {}", name)),
+                                }
+                            }
+                            Cli::command()
+                                .after_help(section)
+                                .print_help()
+                                .ok();
+                            std::process::exit(0);
+                        }
+                    }
+                }
+                // Fall through to normal clap --help if no plugins
+            }
+
             // Try loading config for plugin/alias check (silently ignore config errors)
             if let Ok(config) = Config::load() {
                 // Set up logging helper (shared by plugin and alias paths)
@@ -255,6 +279,16 @@ fn main() -> Result<()> {
                 // 1. Plugin dispatch (highest priority)
                 if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&config.plugins) {
                     if plugin_mgr.has(subcmd) {
+                        // Per-plugin help
+                        if plugin_args.iter().any(|a| a == "--help" || a == "-h") {
+                            if let Some(usage) = plugin_mgr.usage(subcmd) {
+                                println!("{}", usage);
+                            } else {
+                                println!("Plugin '{}' (no help available)", subcmd);
+                            }
+                            std::process::exit(0);
+                        }
+
                         init_logging(verbose_count);
                         info!("Plugin '{}'", subcmd);
 

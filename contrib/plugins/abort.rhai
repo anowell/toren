@@ -1,16 +1,37 @@
-// abort — clean workspace and reopen the bead.
-//
-// Usage: breq abort <workspace>
-//
-// 1. Cleans the workspace (kill processes, remove)
-// 2. Reopens the bead (status -> open, assignee -> "")
+/// Clean workspace and reopen the task.
+///
+/// Usage: breq abort <workspace>
+///
+/// 1. Resolves workspace to its active assignment
+/// 2. Cleans the workspace (kill processes, no push)
+/// 3. Reopens the task via source-specific CLI
+///
+/// Supported sources: beads, github, linear
 
 let ws = ARGS[0];
 
-// Clean workspace with kill (no push)
-let result = breq_clean_with(ws, #{ kill: true, push: false });
+// Get assignment info before cleaning
+let info = ancillary(ws);
+let task_id = info.task_id;
+let source = if info.task_source != "" { info.task_source } else { config("tasks.default_source") };
 
-// Reopen and unassign the bead if we have a task ID
-if result.id != () {
-    shell("bd", ["update", result.id, "--status", "open", "--assignee", ""]);
+// Clean workspace with kill (no push)
+shell("breq", ["clean", ws, "--kill"]);
+
+// Reopen the task if we have a task ID
+if task_id != "" {
+    switch source {
+        "beads" => {
+            shell("bd", ["update", task_id, "--status", "open", "--assignee", ""]);
+        },
+        "github" => {
+            shell("gh", ["issue", "reopen", task_id]);
+        },
+        "linear" => {
+            shell("linear", ["issue", "update", task_id, "--status", "Todo"]);
+        },
+        _ => {
+            print(`Warning: unknown task source '${source}', skipping status update`);
+        },
+    }
 }

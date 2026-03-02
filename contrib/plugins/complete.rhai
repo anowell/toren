@@ -1,16 +1,37 @@
-// complete — clean workspace, push changes, and close the bead.
-//
-// Usage: breq complete <workspace>
-//
-// 1. Cleans the workspace (auto-commit, capture revision, push, remove)
-// 2. Closes the bead (status -> closed)
+/// Clean workspace, push changes, and close the task.
+///
+/// Usage: breq complete <workspace>
+///
+/// 1. Resolves workspace to its active assignment
+/// 2. Cleans the workspace (auto-commit, push, kill processes)
+/// 3. Closes the task via source-specific CLI
+///
+/// Supported sources: beads, github, linear
 
 let ws = ARGS[0];
 
-// Clean workspace with push and kill
-let result = breq_clean_with(ws, #{ kill: true, push: true });
+// Get assignment info before cleaning
+let info = ancillary(ws);
+let task_id = info.task_id;
+let source = if info.task_source != "" { info.task_source } else { config("tasks.default_source") };
 
-// Close the bead if we have a task ID
-if result.id != () {
-    shell("bd", ["update", result.id, "--status", "closed"]);
+// Clean workspace with push and kill
+shell("breq", ["clean", ws, "--kill", "--push"]);
+
+// Close the task if we have a task ID
+if task_id != "" {
+    switch source {
+        "beads" => {
+            shell("bd", ["update", task_id, "--status", "closed"]);
+        },
+        "github" => {
+            shell("gh", ["issue", "close", task_id]);
+        },
+        "linear" => {
+            shell("linear", ["issue", "update", task_id, "--status", "Done"]);
+        },
+        _ => {
+            print(`Warning: unknown task source '${source}', skipping status update`);
+        },
+    }
 }
