@@ -60,6 +60,9 @@ pub struct TaskInfo {
     pub id: String,
     /// Task title
     pub title: String,
+    /// Task description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Task URL (e.g., link to issue tracker)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,

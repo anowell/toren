@@ -26,6 +26,7 @@ pub fn create_engine(ctx: Arc<PluginContext>) -> Engine {
     register_env(&mut engine);
     register_json_parse(&mut engine);
     register_config(&mut engine);
+    register_parse_args(&mut engine);
     register_task(&mut engine, ctx.clone());
     register_ancillary(&mut engine, ctx.clone());
     register_ws_changes(&mut engine, ctx);
@@ -134,6 +135,194 @@ fn register_json_parse(engine: &mut Engine) {
     });
 }
 
+/// `parse_args(args, spec) -> Map` — parse CLI-style arguments according to a spec.
+///
+/// `spec` is a map where each key is a long option name and each value is a config map with:
+/// - `type` (required): `"bool"`, `"string"`, or `"int"`
+/// - `short` (optional): single-char short alias (e.g. `"s"` for `-s`)
+/// - `default_val` (optional): default value if not provided
+///
+/// Returns a map with:
+/// - `args`: array of positional arguments
+/// - `opts`: map of parsed option values keyed by long name
+fn register_parse_args(engine: &mut Engine) {
+    engine.register_fn(
+        "parse_args",
+        |args: rhai::Array, spec: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
+            // Build lookup tables from the spec
+            struct OptSpec {
+                opt_type: String,
+                default: Dynamic,
+            }
+
+            let mut specs_by_long: std::collections::HashMap<String, OptSpec> =
+                std::collections::HashMap::new();
+            let mut short_to_long: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+
+            for (key, value) in spec.iter() {
+                let long = key.to_string();
+                let conf = value
+                    .clone()
+                    .try_cast::<Map>()
+                    .ok_or_else(|| format!("spec for '{}' must be a map", long))?;
+
+                let opt_type = conf
+                    .get("type")
+                    .ok_or_else(|| format!("spec for '{}' missing 'type' field", long))?
+                    .clone()
+                    .into_string()
+                    .map_err(|_| format!("spec for '{}': 'type' must be a string", long))?;
+
+                match opt_type.as_str() {
+                    "bool" | "string" | "int" => {}
+                    other => {
+                        return Err(
+                            format!("spec for '{}': unknown type '{}'", long, other).into()
+                        )
+                    }
+                }
+
+                let default = if let Some(d) = conf.get("default_val") {
+                    d.clone()
+                } else {
+                    match opt_type.as_str() {
+                        "bool" => Dynamic::from(false),
+                        _ => Dynamic::UNIT,
+                    }
+                };
+
+                if let Some(short_val) = conf.get("short") {
+                    let short = short_val
+                        .clone()
+                        .into_string()
+                        .map_err(|_| format!("spec for '{}': 'short' must be a string", long))?;
+                    short_to_long.insert(short, long.clone());
+                }
+
+                specs_by_long.insert(
+                    long.clone(),
+                    OptSpec {
+                        opt_type,
+                        default,
+                    },
+                );
+            }
+
+            // Parse the args
+            let str_args: Vec<String> = args
+                .into_iter()
+                .map(|a| a.into_string().unwrap_or_default())
+                .collect();
+
+            let mut positional: rhai::Array = Vec::new();
+            let mut opts = Map::new();
+
+            // Initialize defaults
+            for (long, spec) in &specs_by_long {
+                opts.insert(long.as_str().into(), spec.default.clone());
+            }
+
+            let mut i = 0;
+            let mut rest_positional = false;
+
+            while i < str_args.len() {
+                let arg = &str_args[i];
+
+                if rest_positional {
+                    positional.push(Dynamic::from(arg.clone()));
+                    i += 1;
+                    continue;
+                }
+
+                if arg == "--" {
+                    rest_positional = true;
+                    i += 1;
+                    continue;
+                }
+
+                if let Some(long_name) = arg.strip_prefix("--") {
+                    // Long option
+                    let spec = specs_by_long.get(long_name).ok_or_else(|| {
+                        format!("unknown option: --{}", long_name)
+                    })?;
+                    match spec.opt_type.as_str() {
+                        "bool" => {
+                            opts.insert(long_name.into(), Dynamic::from(true));
+                        }
+                        "string" => {
+                            i += 1;
+                            let val = str_args.get(i).ok_or_else(|| {
+                                format!("--{} requires a value", long_name)
+                            })?;
+                            opts.insert(long_name.into(), Dynamic::from(val.clone()));
+                        }
+                        "int" => {
+                            i += 1;
+                            let val_str = str_args.get(i).ok_or_else(|| {
+                                format!("--{} requires a value", long_name)
+                            })?;
+                            let val: i64 = val_str.parse().map_err(|_| {
+                                format!("--{}: '{}' is not a valid integer", long_name, val_str)
+                            })?;
+                            opts.insert(long_name.into(), Dynamic::from(val));
+                        }
+                        _ => unreachable!(),
+                    }
+                } else if let Some(short_chars) = arg.strip_prefix('-') {
+                    if short_chars.is_empty() {
+                        // Bare "-" is positional
+                        positional.push(Dynamic::from(arg.clone()));
+                        i += 1;
+                        continue;
+                    }
+                    // Short option
+                    let long_name = short_to_long.get(short_chars).ok_or_else(|| {
+                        format!("unknown option: -{}", short_chars)
+                    })?;
+                    let spec = &specs_by_long[long_name];
+                    match spec.opt_type.as_str() {
+                        "bool" => {
+                            opts.insert(long_name.as_str().into(), Dynamic::from(true));
+                        }
+                        "string" => {
+                            i += 1;
+                            let val = str_args.get(i).ok_or_else(|| {
+                                format!("-{} requires a value", short_chars)
+                            })?;
+                            opts.insert(long_name.as_str().into(), Dynamic::from(val.clone()));
+                        }
+                        "int" => {
+                            i += 1;
+                            let val_str = str_args.get(i).ok_or_else(|| {
+                                format!("-{} requires a value", short_chars)
+                            })?;
+                            let val: i64 = val_str.parse().map_err(|_| {
+                                format!(
+                                    "-{}: '{}' is not a valid integer",
+                                    short_chars, val_str
+                                )
+                            })?;
+                            opts.insert(long_name.as_str().into(), Dynamic::from(val));
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    // Positional argument
+                    positional.push(Dynamic::from(arg.clone()));
+                }
+
+                i += 1;
+            }
+
+            let mut result = Map::new();
+            result.insert("args".into(), Dynamic::from(positional));
+            result.insert("opts".into(), Dynamic::from(opts));
+            Ok(result)
+        },
+    );
+}
+
 /// `config(key) -> String` — read a config value by dot-separated path.
 fn register_config(engine: &mut Engine) {
     engine.register_fn("config", |key: &str| -> Result<String, Box<rhai::EvalAltResult>> {
@@ -181,12 +370,10 @@ fn register_task(engine: &mut Engine, ctx: Arc<PluginContext>) {
             &config.tasks.default_source,
         );
 
-        // Try to fetch the task title from the task source
-        let title = if let Some(ref segment_path) = ctx.segment_path {
+        // Try to fetch the task from the task source
+        let fetched = if let Some(ref segment_path) = ctx.segment_path {
             if let Some(ref task_id) = inferred.task_id {
-                crate::fetch_task(task_id, segment_path)
-                    .ok()
-                    .map(|t| t.title)
+                crate::fetch_task(task_id, segment_path).ok()
             } else {
                 None
             }
@@ -198,8 +385,12 @@ fn register_task(engine: &mut Engine, ctx: Arc<PluginContext>) {
         if let Some(id) = inferred.task_id {
             map.insert("id".into(), Dynamic::from(id));
         }
-        if let Some(t) = title.or(inferred.task_title) {
+        let title = fetched.as_ref().map(|t| t.title.clone()).or(inferred.task_title);
+        if let Some(t) = title {
             map.insert("title".into(), Dynamic::from(t));
+        }
+        if let Some(desc) = fetched.as_ref().and_then(|t| t.description.clone()) {
+            map.insert("description".into(), Dynamic::from(desc));
         }
         if let Some(url) = inferred.task_url {
             map.insert("url".into(), Dynamic::from(url));
@@ -407,5 +598,150 @@ mod tests {
         let ast = engine.compile(r#"config("tasks.default_source")"#).unwrap();
         let result: String = engine.eval_ast(&ast).unwrap();
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_args_bool_flag() {
+        let ctx = Arc::new(PluginContext { segment_path: None, segment_name: None });
+        let engine = create_engine(ctx);
+        let ast = engine.compile(r#"
+            let p = parse_args(["--push"], #{ push: #{ type: "bool" } });
+            [p.opts.push, p.args.len()]
+        "#).unwrap();
+        let result: rhai::Array = engine.eval_ast(&ast).unwrap();
+        assert_eq!(result[0].clone().cast::<bool>(), true);
+        assert_eq!(result[1].clone().cast::<i64>(), 0);
+    }
+
+    #[test]
+    fn test_parse_args_bool_default_false() {
+        let ctx = Arc::new(PluginContext { segment_path: None, segment_name: None });
+        let engine = create_engine(ctx);
+        let ast = engine.compile(r#"
+            let p = parse_args([], #{ push: #{ type: "bool" } });
+            p.opts.push
+        "#).unwrap();
+        let result: bool = engine.eval_ast(&ast).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_parse_args_string_option() {
+        let ctx = Arc::new(PluginContext { segment_path: None, segment_name: None });
+        let engine = create_engine(ctx);
+        let ast = engine.compile(r#"
+            let p = parse_args(["--segment", "toren"], #{ segment: #{ type: "string", short: "s" } });
+            p.opts.segment
+        "#).unwrap();
+        let result: String = engine.eval_ast(&ast).unwrap();
+        assert_eq!(result, "toren");
+    }
+
+    #[test]
+    fn test_parse_args_short_alias() {
+        let ctx = Arc::new(PluginContext { segment_path: None, segment_name: None });
+        let engine = create_engine(ctx);
+        let ast = engine.compile(r#"
+            let p = parse_args(["-s", "toren"], #{ segment: #{ type: "string", short: "s" } });
+            p.opts.segment
+        "#).unwrap();
+        let result: String = engine.eval_ast(&ast).unwrap();
+        assert_eq!(result, "toren");
+    }
+
+    #[test]
+    fn test_parse_args_int_option() {
+        let ctx = Arc::new(PluginContext { segment_path: None, segment_name: None });
+        let engine = create_engine(ctx);
+        let ast = engine.compile(r#"
+            let p = parse_args(["--count", "10"], #{ count: #{ type: "int", default_val: 5 } });
+            p.opts.count
+        "#).unwrap();
+        let result: i64 = engine.eval_ast(&ast).unwrap();
+        assert_eq!(result, 10);
+    }
+
+    #[test]
+    fn test_parse_args_int_default() {
+        let ctx = Arc::new(PluginContext { segment_path: None, segment_name: None });
+        let engine = create_engine(ctx);
+        let ast = engine.compile(r#"
+            let p = parse_args([], #{ count: #{ type: "int", default_val: 5 } });
+            p.opts.count
+        "#).unwrap();
+        let result: i64 = engine.eval_ast(&ast).unwrap();
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn test_parse_args_string_absent_is_unit() {
+        let ctx = Arc::new(PluginContext { segment_path: None, segment_name: None });
+        let engine = create_engine(ctx);
+        let ast = engine.compile(r#"
+            let p = parse_args([], #{ name: #{ type: "string" } });
+            p.opts.name == ()
+        "#).unwrap();
+        let result: bool = engine.eval_ast(&ast).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_parse_args_positional() {
+        let ctx = Arc::new(PluginContext { segment_path: None, segment_name: None });
+        let engine = create_engine(ctx);
+        let ast = engine.compile(r#"
+            let p = parse_args(["foo", "--push", "bar"], #{ push: #{ type: "bool" } });
+            [p.args[0], p.args[1], p.opts.push]
+        "#).unwrap();
+        let result: rhai::Array = engine.eval_ast(&ast).unwrap();
+        assert_eq!(result[0].clone().into_string().unwrap(), "foo");
+        assert_eq!(result[1].clone().into_string().unwrap(), "bar");
+        assert_eq!(result[2].clone().cast::<bool>(), true);
+    }
+
+    #[test]
+    fn test_parse_args_double_dash_stops_parsing() {
+        let ctx = Arc::new(PluginContext { segment_path: None, segment_name: None });
+        let engine = create_engine(ctx);
+        let ast = engine.compile(r#"
+            let p = parse_args(["--", "--push"], #{ push: #{ type: "bool" } });
+            [p.opts.push, p.args[0]]
+        "#).unwrap();
+        let result: rhai::Array = engine.eval_ast(&ast).unwrap();
+        assert_eq!(result[0].clone().cast::<bool>(), false);
+        assert_eq!(result[1].clone().into_string().unwrap(), "--push");
+    }
+
+    #[test]
+    fn test_parse_args_unknown_flag_errors() {
+        let ctx = Arc::new(PluginContext { segment_path: None, segment_name: None });
+        let engine = create_engine(ctx);
+        let ast = engine.compile(r#"
+            parse_args(["--unknown"], #{ push: #{ type: "bool" } })
+        "#).unwrap();
+        let result = engine.eval_ast::<Dynamic>(&ast);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown option"), "Error was: {}", err);
+    }
+
+    #[test]
+    fn test_parse_args_combined() {
+        let ctx = Arc::new(PluginContext { segment_path: None, segment_name: None });
+        let engine = create_engine(ctx);
+        let ast = engine.compile(r#"
+            let p = parse_args(
+                ["task-123", "--push", "-i", "act"],
+                #{
+                    push: #{ type: "bool" },
+                    intent: #{ type: "string", short: "i" },
+                }
+            );
+            [p.args[0], p.opts.push, p.opts.intent]
+        "#).unwrap();
+        let result: rhai::Array = engine.eval_ast(&ast).unwrap();
+        assert_eq!(result[0].clone().into_string().unwrap(), "task-123");
+        assert_eq!(result[1].clone().cast::<bool>(), true);
+        assert_eq!(result[2].clone().into_string().unwrap(), "act");
     }
 }

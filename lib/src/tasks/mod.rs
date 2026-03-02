@@ -122,6 +122,7 @@ pub fn generate_prompt(task: &Task, template: &str) -> String {
         task: Some(crate::workspace_setup::TaskInfo {
             id: task.id.clone(),
             title: task.title.clone(),
+            description: task.description.clone(),
             url: None,
             source: None,
         }),

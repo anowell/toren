@@ -66,12 +66,12 @@ Plugins that need to start a Claude session can't directly exec into another pro
     task_title: "Fix the bug",
     // Optional fields:
     // task_url: "https://...",
-    // prompt: "custom prompt text",
-    // intent: "act",
+    // prompt: "user message text",
+    // intent: "act",  // rendered as system prompt via --append-system-prompt
 }
 ```
 
-The host interprets this after the script completes and calls `breq cmd` with the specified fields.
+The host interprets this after the script completes and calls `breq cmd` with the specified fields. The `intent` and `prompt` are independent and composable — intent becomes a system prompt that frames the session, while prompt is the user message.
 
 ## Host API reference
 
@@ -97,9 +97,9 @@ if code != 0 {
 
 ### `task(id) -> Map`
 
-Infer task fields from an ID. Splits `source:id` prefixes, fetches title from the task source when possible.
+Infer task fields from an ID. Splits `source:id` prefixes, fetches title and description from the task source when possible.
 
-Returns `{ id, title?, url?, source? }`.
+Returns `{ id, title?, description?, url?, source? }`.
 
 ```rhai
 let task = task("breq-abc");
@@ -157,6 +157,30 @@ let home = env("HOME");
 let editor = env("EDITOR");
 ```
 
+### `parse_args(args, spec) -> Map`
+
+Parse CLI-style arguments according to a spec. Returns `{ args, opts }` where `args` is an array of positional arguments and `opts` is a map of parsed option values keyed by long name.
+
+Spec is a map where each key is a long option name and each value is a config map:
+
+- `type` (required): `"bool"`, `"string"`, or `"int"`
+- `short` (optional): single-char short alias (e.g. `"s"` for `-s`)
+- `default_val` (optional): default value if not provided (bool defaults to `false`, string/int default to `()`)
+
+```rhai
+let parsed = parse_args(ARGS, #{
+    push: #{ type: "bool" },
+    segment: #{ type: "string", short: "s" },
+    count: #{ type: "int", default_val: 5 },
+});
+// parsed.args -> positional arguments
+// parsed.opts.push -> true/false
+// parsed.opts.segment -> string or ()
+// parsed.opts.count -> int (5 if not provided)
+```
+
+`--` stops option parsing; everything after it becomes positional. Unknown flags error.
+
 ### `print(msg)`
 
 Print to stdout.
@@ -171,15 +195,17 @@ cp contrib/plugins/*.rhai ~/.toren/plugins/
 
 ### `assign`
 
-Claims a task and starts a Claude session. Source-agnostic — dispatches status updates based on the task source (beads, github, linear).
+Claims a task and starts a Claude session. Source-agnostic — dispatches status updates based on the task source (beads, github, linear). The task description is passed as the user message; the intent (if specified) is rendered as a system prompt.
 
 ```
-breq assign <task-id>
+breq assign <task-id> [--intent <name>]
 ```
 
-1. Infers task fields (source, title, url) from the ID
+Options: `--intent` / `-i` — intent template to use as system prompt (e.g., "act", "plan")
+
+1. Infers task fields (source, title, url, description) from the ID
 2. Updates task status to in-progress via source-specific CLI
-3. Returns a deferred `cmd` action to start Claude
+3. Returns a deferred `cmd` action to start Claude (description as user message, intent as system prompt)
 
 ### `complete`
 

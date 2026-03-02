@@ -132,6 +132,7 @@ pub fn render_auto_commit_message(
         task: Some(TaskInfo {
             id: task_id,
             title: task_title,
+            description: None,
             url: assignment.task_url.clone(),
             source: assignment.task_source.clone(),
         }),

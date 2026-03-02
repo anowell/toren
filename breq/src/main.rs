@@ -498,14 +498,19 @@ fn cmd_cmd(
         &config.tasks.default_source,
     );
 
-    // Determine prompt text: -p flag > -i intent template > stdin (if piped) > $EDITOR
-    let prompt_text = if let Some(ref p) = prompt {
-        p.clone()
-    } else if let Some(ref intent_name) = intent {
+    // 1. System prompt from intent (optional, rendered as --append-system-prompt)
+    let system_prompt = if let Some(ref intent_name) = intent {
         let template = config
             .intents
             .get(intent_name)
             .with_context(|| format!("Unknown intent: {}", intent_name))?;
+
+        // Fetch task description if we have a task_id
+        let task_description = inferred.task_id.as_ref().and_then(|id| {
+            toren_lib::fetch_task(id, &segment.path)
+                .ok()
+                .and_then(|t| t.description)
+        });
 
         // Build task context for template rendering
         let task_id = inferred.task_id.clone().unwrap_or_default();
@@ -523,12 +528,20 @@ fn cmd_cmd(
             task: Some(toren_lib::TaskInfo {
                 id: task_id,
                 title: task_title,
+                description: task_description,
                 url: inferred.task_url.clone(),
                 source: inferred.task_source.clone(),
             }),
             vars: std::collections::HashMap::new(),
         };
-        toren_lib::render_template(template, &ctx)?
+        Some(toren_lib::render_template(template, &ctx)?)
+    } else {
+        None
+    };
+
+    // 2. User message: provided prompt > stdin > $EDITOR
+    let user_message = if let Some(ref p) = prompt {
+        p.clone()
     } else if !std::io::stdin().is_terminal() {
         // Read from stdin (piped input)
         use std::io::Read;
@@ -536,11 +549,20 @@ fn cmd_cmd(
         std::io::stdin().read_to_string(&mut buf)?;
         let trimmed = buf.trim().to_string();
         if trimmed.is_empty() {
-            anyhow::bail!("Empty input from stdin. Provide -p, -i, or pipe a prompt.");
+            anyhow::bail!("Empty input from stdin. Provide -p or pipe a prompt.");
+        }
+        trimmed
+    } else if system_prompt.is_some() {
+        // Intent provides system prompt; open editor for user message
+        let text = edit::edit("")
+            .context("Editor returned an error")?;
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("Empty prompt from editor. Provide -p or pipe a prompt.");
         }
         trimmed
     } else {
-        // Open $EDITOR
+        // No intent, no prompt, no stdin — open editor
         let text = edit::edit("")
             .context("Editor returned an error")?;
         let trimmed = text.trim().to_string();
@@ -588,7 +610,10 @@ fn cmd_cmd(
         if danger {
             cmd.arg("--dangerously-skip-permissions");
         }
-        cmd.arg(&prompt_text).current_dir(&ws_path);
+        if let Some(ref sp) = system_prompt {
+            cmd.arg("--append-system-prompt").arg(sp);
+        }
+        cmd.arg(&user_message).current_dir(&ws_path);
 
         let err = cmd.exec();
         Err(err).context("Failed to exec claude")
@@ -621,16 +646,16 @@ fn cmd_cmd(
             AssignmentSource::Reference
         } else {
             AssignmentSource::Prompt {
-                original_prompt: prompt_text.clone(),
+                original_prompt: user_message.clone(),
             }
         };
 
-        // Use inferred title, falling back to first 80 chars of prompt
+        // Use inferred title, falling back to first 80 chars of user message
         let title: Option<String> = inferred.task_title.clone().or_else(|| Some(
-            prompt_text
+            user_message
                 .lines()
                 .next()
-                .unwrap_or(&prompt_text)
+                .unwrap_or(&user_message)
                 .chars()
                 .take(80)
                 .collect(),
@@ -654,7 +679,10 @@ fn cmd_cmd(
         if danger {
             cmd.arg("--dangerously-skip-permissions");
         }
-        cmd.arg(&prompt_text).current_dir(&ws_path);
+        if let Some(ref sp) = system_prompt {
+            cmd.arg("--append-system-prompt").arg(sp);
+        }
+        cmd.arg(&user_message).current_dir(&ws_path);
 
         let err = cmd.exec();
         Err(err).context("Failed to exec claude")

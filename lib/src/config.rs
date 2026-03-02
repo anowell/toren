@@ -178,19 +178,19 @@ impl Default for TasksConfig {
 }
 
 fn default_intent_act() -> String {
-    "Implement {{ task.id }}: {{ task.title }}\n\n\
+    "Implement {{ task.source }} {{ task.id }}: {{ task.title }}\n\n\
      Complete the task as specified. When done, summarize changes."
         .to_string()
 }
 
 fn default_intent_plan() -> String {
-    "Design an approach for {{ task.id }}: {{ task.title }}\n\n\
+    "Design an approach for {{ task.source }} {{ task.id }}: {{ task.title }}\n\n\
      Investigate the codebase, explore options, and propose a design."
         .to_string()
 }
 
 fn default_intent_review() -> String {
-    "Review the implementation of {{ task.id }}: {{ task.title }}\n\n\
+    "Review the implementation of {{ task.source }} {{ task.id }}: {{ task.title }}\n\n\
      Verify completeness, check for issues, and assess confidence."
         .to_string()
 }

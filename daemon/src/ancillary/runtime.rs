@@ -158,6 +158,7 @@ impl AncillaryWork {
                     task: Some(toren_lib::TaskInfo {
                         id: task_id.clone(),
                         title,
+                        description: None,
                         url: assignment.task_url.clone(),
                         source: assignment.task_source.clone(),
                     }),
