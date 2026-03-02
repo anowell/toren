@@ -9,6 +9,9 @@ port = 8787
 # Any subdirectory matching a glob is automatically a valid segment.
 segments = ["examples"]
 workspace_root = "workspaces"
+# Coding agent to use. Auto-detects from PATH if unset.
+# agent = "claude"
+# agent = "codex:o3"
 
 [tasks]
 # Default task source when an ID is provided without a source prefix

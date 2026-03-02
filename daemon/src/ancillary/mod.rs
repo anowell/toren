@@ -10,7 +10,7 @@ use tokio::sync::RwLock as TokioRwLock;
 use tracing::info;
 
 pub use runtime::{AncillaryWork, ClientInput, WorkStatus};
-use toren_lib::{Assignment, AssignmentManager};
+use toren_lib::{Agent, Assignment, AssignmentManager};
 pub use work_log::WorkEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -184,14 +184,17 @@ impl WorkManager {
         &self,
         ancillary_id: String,
         assignment: Assignment,
+        agent: &Agent,
     ) -> Result<Arc<AncillaryWork>> {
         info!(
-            "Starting work for {} on {}",
-            ancillary_id, assignment.task_id.as_deref().unwrap_or("-")
+            "Starting work for {} on {} (agent: {})",
+            ancillary_id,
+            assignment.task_id.as_deref().unwrap_or("-"),
+            agent,
         );
 
         let assignment_id = assignment.id.clone();
-        let work = AncillaryWork::start(ancillary_id.clone(), assignment).await?;
+        let work = AncillaryWork::start(ancillary_id.clone(), assignment, agent.clone()).await?;
         let work = Arc::new(work);
 
         let mut active = self.active_work.write().await;

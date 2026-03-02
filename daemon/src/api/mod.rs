@@ -17,7 +17,8 @@ use crate::security::SecurityContext;
 use crate::services::Services;
 use tokio::sync::RwLock;
 use toren_lib::{
-    Assignment, AssignmentManager, CompositeStatus, Config, SegmentManager, WorkspaceManager,
+    Agent, Assignment, AssignmentManager, CompositeStatus, Config, SegmentManager,
+    WorkspaceManager,
 };
 
 mod ancillary_ws;
@@ -36,6 +37,7 @@ pub struct AppState {
     pub segments: Arc<std::sync::RwLock<SegmentManager>>,
     pub workspaces: Option<Arc<WorkspaceManager>>,
     pub work_manager: Arc<WorkManager>,
+    pub agent: Arc<Agent>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -51,6 +53,7 @@ pub async fn serve(
     segment_manager: SegmentManager,
     workspace_manager: Option<WorkspaceManager>,
     mut work_manager: WorkManager,
+    agent: Agent,
 ) -> Result<()> {
     let assignments = Arc::new(RwLock::new(assignment_manager));
 
@@ -68,6 +71,7 @@ pub async fn serve(
         segments: Arc::new(std::sync::RwLock::new(segment_manager)),
         workspaces: workspace_manager.map(Arc::new),
         work_manager: Arc::new(work_manager),
+        agent: Arc::new(agent),
     };
 
     let app = Router::new()
@@ -188,6 +192,9 @@ async fn ancillary_ws_handler(
 struct StartWorkRequest {
     /// Assignment ID to start work on
     assignment_id: String,
+    /// Optional agent override (e.g., "claude", "codex:o3"). Uses daemon default if unset.
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 async fn ancillary_start_work(
@@ -221,10 +228,22 @@ async fn ancillary_start_work(
         ));
     }
 
+    // Resolve agent: per-request override or daemon default
+    let agent = if let Some(ref agent_str) = request.agent {
+        Agent::parse(agent_str).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?
+    } else {
+        (*state.agent).clone()
+    };
+
     // Start work
     match state
         .work_manager
-        .start_work(ancillary_id.clone(), assignment)
+        .start_work(ancillary_id.clone(), assignment, &agent)
         .await
     {
         Ok(work) => {
@@ -898,6 +917,9 @@ struct ResumeRequest {
     /// Whether to auto-start SDK work after resume preparation
     #[serde(default = "default_true")]
     start_work: bool,
+    /// Optional agent override (e.g., "claude", "codex:o3"). Uses daemon default if unset.
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -956,6 +978,18 @@ async fn assignments_resume(
         Json(serde_json::json!({"error": "Assignment not found after resume preparation"})),
     ))?;
 
+    // Resolve agent: per-request override or daemon default
+    let agent = if let Some(ref agent_str) = request.agent {
+        Agent::parse(agent_str).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?
+    } else {
+        (*state.agent).clone()
+    };
+
     // Optionally start SDK work
     let work_started = if request.start_work {
         // Check if ancillary already has active work
@@ -974,7 +1008,7 @@ async fn assignments_resume(
 
             match state
                 .work_manager
-                .start_work(assignment.ancillary_id.clone(), resume_assignment)
+                .start_work(assignment.ancillary_id.clone(), resume_assignment, &agent)
                 .await
             {
                 Ok(_) => true,

@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{error, info, warn};
 
 use super::work_log::{WorkLog, WorkOp};
-use toren_lib::Assignment;
+use toren_lib::{Agent, AgentKind, Assignment};
 
 /// Status of an ancillary's work execution
 #[derive(Debug, Clone, PartialEq)]
@@ -69,7 +69,7 @@ pub struct AncillaryWork {
 
 impl AncillaryWork {
     /// Start work on an assignment
-    pub async fn start(ancillary_id: String, assignment: Assignment) -> Result<Self> {
+    pub async fn start(ancillary_id: String, assignment: Assignment, agent: Agent) -> Result<Self> {
         let work_log =
             WorkLog::open(&ancillary_id, &assignment.id).context("Failed to open work log")?;
 
@@ -102,6 +102,7 @@ impl AncillaryWork {
         let task_handle = tokio::spawn(Self::work_loop(
             ancillary_id,
             assignment,
+            agent,
             status,
             work_log,
             event_tx,
@@ -112,16 +113,20 @@ impl AncillaryWork {
         Ok(work)
     }
 
-    /// The main work loop that runs Claude Code
+    /// The main work loop that runs a coding agent
     async fn work_loop(
         ancillary_id: String,
         assignment: Assignment,
+        agent: Agent,
         status: Arc<RwLock<WorkStatus>>,
         work_log: Arc<RwLock<WorkLog>>,
         event_tx: broadcast::Sender<super::work_log::WorkEvent>,
         mut input_rx: mpsc::Receiver<ClientInput>,
     ) {
-        info!("{} starting work on {:?}", ancillary_id, assignment.task_id);
+        info!(
+            "{} starting work on {:?} via {}",
+            ancillary_id, assignment.task_id, agent
+        );
 
         // Update status to working
         {
@@ -172,27 +177,78 @@ impl AncillaryWork {
             }
         };
 
-        // Configure Claude Agent SDK
-        let options = ClaudeAgentOptions::builder()
-            .cwd(assignment.workspace_path.clone())
-            .permission_mode(PermissionMode::BypassPermissions) // For now, auto-approve
-            .max_turns(50u32)
-            .build();
+        match agent.kind {
+            AgentKind::Claude => {
+                // Use the Claude Agent SDK for native streaming
+                Self::run_claude_sdk(
+                    &ancillary_id,
+                    &assignment,
+                    &agent,
+                    &prompt,
+                    &status,
+                    &work_log,
+                    &event_tx,
+                    &mut input_rx,
+                )
+                .await;
+            }
+            _ => {
+                // Subprocess path for non-Claude agents
+                Self::run_subprocess(
+                    &ancillary_id,
+                    &assignment,
+                    &agent,
+                    &prompt,
+                    &status,
+                    &work_log,
+                    &event_tx,
+                    &mut input_rx,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Run work via the Claude Agent SDK (native streaming).
+    async fn run_claude_sdk(
+        ancillary_id: &str,
+        assignment: &Assignment,
+        agent: &Agent,
+        prompt: &str,
+        status: &Arc<RwLock<WorkStatus>>,
+        work_log: &Arc<RwLock<WorkLog>>,
+        event_tx: &broadcast::Sender<super::work_log::WorkEvent>,
+        input_rx: &mut mpsc::Receiver<ClientInput>,
+    ) {
+        let options = if let Some(ref model) = agent.model {
+            ClaudeAgentOptions::builder()
+                .cwd(assignment.workspace_path.clone())
+                .permission_mode(PermissionMode::BypassPermissions)
+                .max_turns(50u32)
+                .model(model.clone())
+                .build()
+        } else {
+            ClaudeAgentOptions::builder()
+                .cwd(assignment.workspace_path.clone())
+                .permission_mode(PermissionMode::BypassPermissions)
+                .max_turns(50u32)
+                .build()
+        };
 
         // Run the query and stream results
-        match query_stream(&prompt, Some(options)).await {
+        match query_stream(prompt, Some(options)).await {
             Ok(mut stream) => {
                 while let Some(result) = stream.next().await {
                     match result {
                         Ok(message) => {
-                            Self::handle_message(&ancillary_id, message, &work_log, &event_tx)
+                            Self::handle_message(ancillary_id, message, work_log, event_tx)
                                 .await;
                         }
                         Err(e) => {
                             error!("{} stream error: {}", ancillary_id, e);
                             Self::log_op(
-                                &work_log,
-                                &event_tx,
+                                work_log,
+                                event_tx,
                                 WorkOp::AssignmentFailed {
                                     error: e.to_string(),
                                 },
@@ -212,8 +268,8 @@ impl AncillaryWork {
                             ClientInput::Interrupt => {
                                 warn!("{} interrupted", ancillary_id);
                                 Self::log_op(
-                                    &work_log,
-                                    &event_tx,
+                                    work_log,
+                                    event_tx,
                                     WorkOp::AssignmentFailed {
                                         error: "Interrupted by user".to_string(),
                                     },
@@ -228,8 +284,8 @@ impl AncillaryWork {
                             ClientInput::Message { content, client_id } => {
                                 // Log user message but can't inject mid-stream with current SDK
                                 Self::log_op(
-                                    &work_log,
-                                    &event_tx,
+                                    work_log,
+                                    event_tx,
                                     WorkOp::UserMessage { content, client_id },
                                 )
                                 .await;
@@ -240,15 +296,15 @@ impl AncillaryWork {
 
                 // Completed successfully
                 info!("{} completed work on {:?}", ancillary_id, assignment.task_id);
-                Self::log_op(&work_log, &event_tx, WorkOp::AssignmentCompleted).await;
+                Self::log_op(work_log, event_tx, WorkOp::AssignmentCompleted).await;
                 let mut s = status.write().await;
                 *s = WorkStatus::Completed;
             }
             Err(e) => {
                 error!("{} failed to start: {}", ancillary_id, e);
                 Self::log_op(
-                    &work_log,
-                    &event_tx,
+                    work_log,
+                    event_tx,
                     WorkOp::AssignmentFailed {
                         error: e.to_string(),
                     },
@@ -258,6 +314,160 @@ impl AncillaryWork {
                 *s = WorkStatus::Failed {
                     error: e.to_string(),
                 };
+            }
+        }
+    }
+
+    /// Run work via subprocess for non-Claude agents.
+    async fn run_subprocess(
+        ancillary_id: &str,
+        assignment: &Assignment,
+        agent: &Agent,
+        prompt: &str,
+        status: &Arc<RwLock<WorkStatus>>,
+        work_log: &Arc<RwLock<WorkLog>>,
+        event_tx: &broadcast::Sender<super::work_log::WorkEvent>,
+        input_rx: &mut mpsc::Receiver<ClientInput>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut cmd = agent.build_daemon_command(prompt, &assignment.workspace_path, None);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        match cmd.spawn() {
+            Ok(mut child) => {
+                // Stream stdout — emit each line as it arrives
+                if let Some(stdout) = child.stdout.take() {
+                    let work_log = work_log.clone();
+                    let event_tx = event_tx.clone();
+                    let aid = ancillary_id.to_string();
+                    tokio::spawn(async move {
+                        let reader = BufReader::new(stdout);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if !line.is_empty() {
+                                Self::log_op(
+                                    &work_log,
+                                    &event_tx,
+                                    WorkOp::AssistantMessage {
+                                        content: line,
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        info!("{} stdout stream ended", aid);
+                    });
+                }
+
+                // Stream stderr
+                if let Some(stderr) = child.stderr.take() {
+                    let aid = ancillary_id.to_string();
+                    tokio::spawn(async move {
+                        let reader = BufReader::new(stderr);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if !line.is_empty() {
+                                info!("{} stderr: {}", aid, line);
+                            }
+                        }
+                    });
+                }
+
+                // Wait for process to complete, with interrupt support
+                loop {
+                    tokio::select! {
+                        exit_result = child.wait() => {
+                            match exit_result {
+                                Ok(exit_status) => {
+                                    if exit_status.success() {
+                                        info!(
+                                            "{} completed work on {:?}",
+                                            ancillary_id, assignment.task_id
+                                        );
+                                        Self::log_op(work_log, event_tx, WorkOp::AssignmentCompleted).await;
+                                        let mut s = status.write().await;
+                                        *s = WorkStatus::Completed;
+                                    } else {
+                                        let err_msg = format!(
+                                            "{} exited with {}",
+                                            agent.kind.binary_name(),
+                                            exit_status
+                                        );
+                                        error!("{} {}", ancillary_id, err_msg);
+                                        Self::log_op(
+                                            work_log,
+                                            event_tx,
+                                            WorkOp::AssignmentFailed { error: err_msg.clone() },
+                                        )
+                                        .await;
+                                        let mut s = status.write().await;
+                                        *s = WorkStatus::Failed { error: err_msg };
+                                    }
+                                }
+                                Err(e) => {
+                                    let err_msg = format!("Failed to wait for {}: {}", agent.kind.binary_name(), e);
+                                    error!("{} {}", ancillary_id, err_msg);
+                                    Self::log_op(
+                                        work_log,
+                                        event_tx,
+                                        WorkOp::AssignmentFailed { error: err_msg.clone() },
+                                    )
+                                    .await;
+                                    let mut s = status.write().await;
+                                    *s = WorkStatus::Failed { error: err_msg };
+                                }
+                            }
+                            return;
+                        }
+                        input = input_rx.recv() => {
+                            match input {
+                                Some(ClientInput::Interrupt) => {
+                                    warn!("{} interrupted, killing subprocess", ancillary_id);
+                                    let _ = child.kill().await;
+                                    Self::log_op(
+                                        work_log,
+                                        event_tx,
+                                        WorkOp::AssignmentFailed {
+                                            error: "Interrupted by user".to_string(),
+                                        },
+                                    )
+                                    .await;
+                                    let mut s = status.write().await;
+                                    *s = WorkStatus::Failed {
+                                        error: "Interrupted".to_string(),
+                                    };
+                                    return;
+                                }
+                                Some(ClientInput::Message { content, client_id }) => {
+                                    Self::log_op(
+                                        work_log,
+                                        event_tx,
+                                        WorkOp::UserMessage { content, client_id },
+                                    )
+                                    .await;
+                                    // Continue waiting — can't inject messages into subprocess
+                                }
+                                None => {
+                                    // Channel closed, continue waiting for process
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let err_msg = format!("Failed to spawn {}: {}", agent.kind.binary_name(), e);
+                error!("{} {}", ancillary_id, err_msg);
+                Self::log_op(
+                    work_log,
+                    event_tx,
+                    WorkOp::AssignmentFailed { error: err_msg.clone() },
+                )
+                .await;
+                let mut s = status.write().await;
+                *s = WorkStatus::Failed { error: err_msg };
             }
         }
     }

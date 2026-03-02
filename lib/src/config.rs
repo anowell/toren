@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
+use crate::agent::Agent;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip)]
@@ -65,6 +67,10 @@ pub struct AncillariesConfig {
     /// Max ancillaries per segment (default: 10)
     #[serde(default = "default_max_per_segment")]
     pub max_per_segment: u32,
+
+    /// Coding agent to use (e.g., "claude", "codex:o3"). Auto-detects if unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 fn default_workspace_root() -> PathBuf {
@@ -83,6 +89,7 @@ impl Default for AncillariesConfig {
             segments: Vec::new(),
             workspace_root: default_workspace_root(),
             max_per_segment: default_max_per_segment(),
+            agent: None,
         }
     }
 }
@@ -367,6 +374,21 @@ impl Config {
 
     pub fn port(&self) -> u16 {
         self.server.port
+    }
+}
+
+impl Config {
+    /// Resolve the coding agent to use.
+    ///
+    /// Priority: CLI override > config file > auto-detect from PATH.
+    pub fn resolve_agent(&self, cli_override: Option<&str>) -> Result<Agent> {
+        if let Some(s) = cli_override {
+            return Agent::parse(s);
+        }
+        if let Some(ref s) = self.ancillaries.agent {
+            return Agent::parse(s);
+        }
+        Agent::detect()
     }
 }
 

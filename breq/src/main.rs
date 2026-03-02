@@ -51,12 +51,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start a Claude session in a workspace (create workspace if needed)
+    /// Start a coding agent session in a workspace (create workspace if needed)
     Cmd {
         /// Reuse existing workspace (by name, e.g. "one", "three")
         workspace: Option<String>,
 
-        /// Prompt for the Claude session
+        /// Prompt for the agent session
         #[arg(short, long)]
         prompt: Option<String>,
 
@@ -76,17 +76,17 @@ enum Commands {
         #[arg(long = "task-url")]
         task_url: Option<String>,
 
-        /// Resume previous Claude session (uses --resume if session_id exists)
-        #[arg(long)]
-        resume: bool,
-
         /// Segment to use (defaults to current directory's segment)
         #[arg(short, long)]
         segment: Option<String>,
 
-        /// Skip permission prompts (passes --dangerously-skip-permissions to claude)
+        /// Agent to use (e.g., "claude", "codex:o3"). Overrides config; auto-detects if unset.
         #[arg(long)]
-        danger: bool,
+        agent: Option<String>,
+
+        /// Additional arguments passed directly to the agent CLI
+        #[arg(last = true)]
+        passthrough: Vec<String>,
     },
 
     /// Navigate to a workspace or run a command in it
@@ -360,9 +360,9 @@ fn main() -> Result<()> {
             task_id,
             task_title,
             task_url,
-            resume,
             segment,
-            danger,
+            agent,
+            passthrough,
         } => cmd_cmd(
             &config,
             workspace,
@@ -371,9 +371,9 @@ fn main() -> Result<()> {
             task_id,
             task_title,
             task_url,
-            resume,
             segment.as_deref(),
-            danger,
+            agent,
+            passthrough,
         ),
         Commands::Run {
             workspace,
@@ -453,15 +453,15 @@ fn execute_deferred_action(config: &Config, action: toren_lib::DeferredAction) -
         } => {
             cmd_cmd(
                 config,
-                None,     // workspace (auto-create)
+                None,       // workspace (auto-create)
                 prompt,
                 intent,
                 task_id,
                 task_title,
                 task_url,
-                false,    // resume
-                None,     // segment (resolve from CWD)
-                false,    // danger
+                None,       // segment (resolve from CWD)
+                None,       // agent (use config/auto-detect)
+                Vec::new(), // passthrough
             )
         }
     }
@@ -477,10 +477,11 @@ fn cmd_cmd(
     task_id_arg: Option<String>,
     task_title_arg: Option<String>,
     task_url_arg: Option<String>,
-    resume: bool,
     segment_name: Option<&str>,
-    danger: bool,
+    agent_str: Option<String>,
+    passthrough: Vec<String>,
 ) -> Result<()> {
+    let agent = config.resolve_agent(agent_str.as_deref())?;
     let workspace_root = config.ancillaries.workspace_root.clone();
 
     let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
@@ -581,42 +582,13 @@ fn cmd_cmd(
             anyhow::bail!("Workspace '{}' not found at {}", ws_name_lower, ws_path.display());
         }
 
-        // Look up existing assignment for this workspace
-        let ancillary_num = toren_lib::word_to_number(&ws_name_lower).unwrap_or(0);
-        let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
-
-        // Check for existing assignment
-        let existing = assignment_mgr.get_active_for_ancillary(&ancillary_id_str).cloned();
-
-        if resume {
-            if let Some(ref assignment) = existing {
-                if let Some(ref sid) = assignment.session_id {
-                    eprintln!("Resuming session in {}", ws_path.display());
-                    let mut cmd = Command::new("claude");
-                    if danger {
-                        cmd.arg("--dangerously-skip-permissions");
-                    }
-                    cmd.arg("--resume").arg(sid).current_dir(&ws_path);
-                    let err = cmd.exec();
-                    return Err(err).context("Failed to exec claude");
-                }
-            }
-            eprintln!("No session to resume, starting new session");
-        }
-
-        // Reuse workspace — start claude
-        eprintln!("Starting Claude session in {}\n", ws_path.display());
-        let mut cmd = Command::new("claude");
-        if danger {
-            cmd.arg("--dangerously-skip-permissions");
-        }
-        if let Some(ref sp) = system_prompt {
-            cmd.arg("--append-system-prompt").arg(sp);
-        }
-        cmd.arg(&user_message).current_dir(&ws_path);
+        // Reuse workspace — start agent session
+        eprintln!("Starting {} session in {}\n", agent, ws_path.display());
+        let mut cmd = agent.build_command(&user_message, &ws_path, system_prompt.as_deref());
+        cmd.args(&passthrough);
 
         let err = cmd.exec();
-        Err(err).context("Failed to exec claude")
+        Err(err).context(format!("Failed to exec {}", agent.kind.binary_name()))
     } else {
         // Create new workspace
         let existing_workspaces = workspace_mgr
@@ -673,19 +645,13 @@ fn cmd_cmd(
             inferred.task_source.as_deref(),
         )?;
 
-        // Exec into claude
-        eprintln!("Starting Claude session in {}\n", ws_path.display());
-        let mut cmd = Command::new("claude");
-        if danger {
-            cmd.arg("--dangerously-skip-permissions");
-        }
-        if let Some(ref sp) = system_prompt {
-            cmd.arg("--append-system-prompt").arg(sp);
-        }
-        cmd.arg(&user_message).current_dir(&ws_path);
+        // Exec into agent
+        eprintln!("Starting {} session in {}\n", agent, ws_path.display());
+        let mut cmd = agent.build_command(&user_message, &ws_path, system_prompt.as_deref());
+        cmd.args(&passthrough);
 
         let err = cmd.exec();
-        Err(err).context("Failed to exec claude")
+        Err(err).context(format!("Failed to exec {}", agent.kind.binary_name()))
     }
 }
 

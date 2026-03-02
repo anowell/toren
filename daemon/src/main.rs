@@ -95,6 +95,10 @@ async fn main() -> Result<()> {
     let work_manager = ancillary::WorkManager::new();
     info!("Work manager initialized");
 
+    // Resolve coding agent
+    let agent = config.resolve_agent(None)?;
+    info!("Coding agent: {}", agent);
+
     // Start API server
     let addr = format!("{}:{}", config.host(), config.port());
     info!("Starting API server on {}", addr);
@@ -111,6 +115,7 @@ async fn main() -> Result<()> {
         segment_manager,
         workspace_manager,
         work_manager,
+        agent,
     )
     .await?;
 

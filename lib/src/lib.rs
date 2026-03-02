@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod alias;
 pub mod assignment;
 pub mod assignment_ops;
@@ -21,6 +22,7 @@ pub use assignment_ops::{
     CompleteOptions, CompleteResult, ResumeOptions, ResumeResult,
     DEFAULT_AUTO_COMMIT_MESSAGE,
 };
+pub use agent::{Agent, AgentKind};
 pub use composite_status::CompositeStatus;
 pub use config::{Config, AncillariesConfig, IntentsConfig, PluginsConfig, TasksConfig, expand_path, expand_path_str, tilde_shorten};
 pub use plugins::{DeferredAction, PluginContext, PluginManager, PluginResult};
