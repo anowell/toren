@@ -884,8 +884,23 @@ fn cmd_list(
         .map(|(w, _)| w.0 as usize)
         .unwrap_or(80);
 
-    // Fixed column widths: workspace(10) + ext_id(15) + activity(6) + spaces(3)
-    let fixed_width: usize = 10 + 15 + 6 + 3;
+    // Compute workspace column width from the longest name we'll display
+    let ws_col_width = assignments
+        .iter()
+        .map(|a| {
+            let name = if all_segments {
+                a.ancillary_id.as_str()
+            } else {
+                a.ancillary_id.split_whitespace().last().unwrap_or(&a.ancillary_id)
+            };
+            // Account for " *" dirty suffix
+            name.len() + 2
+        })
+        .max()
+        .unwrap_or(10);
+
+    // Fixed column widths: workspace(dynamic) + ext_id(15) + activity(6) + spaces(3)
+    let fixed_width: usize = ws_col_width + 15 + 6 + 3;
 
     for assignment in &assignments {
         // Agent activity
@@ -900,16 +915,21 @@ fn cmd_list(
         );
 
         // Workspace name — extract short name, mark dirty with *
-        let ancillary_name = assignment
-            .ancillary_id
-            .split_whitespace()
-            .last()
-            .unwrap_or(&assignment.ancillary_id);
+        // In --all mode, use full ancillary ID for disambiguation
+        let ancillary_name = if all_segments {
+            assignment.ancillary_id.as_str()
+        } else {
+            assignment
+                .ancillary_id
+                .split_whitespace()
+                .last()
+                .unwrap_or(&assignment.ancillary_id)
+        };
 
         let ws_text = if has_changes {
-            format!("{:<10}", format!("{} *", ancillary_name))
+            format!("{:<width$}", format!("{} *", ancillary_name), width = ws_col_width)
         } else {
-            format!("{:<10}", ancillary_name)
+            format!("{:<width$}", ancillary_name, width = ws_col_width)
         };
         let ws_colored = if has_changes {
             ws_text.yellow()

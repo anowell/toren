@@ -611,11 +611,20 @@ impl AssignmentManager {
     }
 
     /// List active assignments (all assignments are active — terminal actions remove them).
-    /// Sorted by ancillary number.
+    /// Sorted by segment name, then ancillary number.
     pub fn list_active(&mut self) -> Vec<&Assignment> {
         self.reload_if_changed();
         let mut assignments: Vec<&Assignment> = self.assignments.values().collect();
-        assignments.sort_by_key(|a| ancillary_number(&a.ancillary_id).unwrap_or(u32::MAX));
+        assignments.sort_by(|a, b| {
+            a.segment
+                .to_lowercase()
+                .cmp(&b.segment.to_lowercase())
+                .then_with(|| {
+                    let na = ancillary_number(&a.ancillary_id).unwrap_or(u32::MAX);
+                    let nb = ancillary_number(&b.ancillary_id).unwrap_or(u32::MAX);
+                    na.cmp(&nb)
+                })
+        });
         assignments
     }
 
