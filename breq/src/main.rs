@@ -51,9 +51,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start a coding agent session in a workspace (create workspace if needed)
-    Cmd {
-        /// Reuse existing workspace (by name, e.g. "one", "three")
+    /// Assign work to a coding agent in a workspace
+    Do {
+        /// Assign to an existing workspace (e.g. "one", "three"); omit to create a new one
         workspace: Option<String>,
 
         /// Prompt for the agent session
@@ -89,9 +89,9 @@ enum Commands {
         passthrough: Vec<String>,
     },
 
-    /// Navigate to a workspace or run a command in it
-    #[command(visible_alias = "g")]
-    Run {
+    /// Open a shell in a workspace, optionally running a command
+    #[command(visible_alias = "sh")]
+    Shell {
         /// Workspace name (e.g. "one", "two")
         workspace: Option<String>,
 
@@ -167,9 +167,9 @@ enum Commands {
         all: bool,
     },
 
-    /// Initialize .toren.kdl in the current repository
+    /// Initialize toren.kdl in the current repository
     Init {
-        /// Add .toren.kdl to .git/info/exclude instead of committing it
+        /// Add toren.kdl to .git/info/exclude instead of committing it
         #[arg(long)]
         stealth: bool,
     },
@@ -353,7 +353,7 @@ fn main() -> Result<()> {
     let config = Config::load_from(cli.config.as_deref())?;
 
     match cli.command {
-        Commands::Cmd {
+        Commands::Do {
             workspace,
             prompt,
             intent,
@@ -363,7 +363,7 @@ fn main() -> Result<()> {
             segment,
             agent,
             passthrough,
-        } => cmd_cmd(
+        } => cmd_do(
             &config,
             workspace,
             prompt,
@@ -375,7 +375,7 @@ fn main() -> Result<()> {
             agent,
             passthrough,
         ),
-        Commands::Run {
+        Commands::Shell {
             workspace,
             hook,
             task_id,
@@ -383,7 +383,7 @@ fn main() -> Result<()> {
             task_url,
             segment,
             cmd,
-        } => cmd_run(&config, workspace, hook, task_id, task_title, task_url, segment.as_deref(), cmd),
+        } => cmd_shell(&config, workspace, hook, task_id, task_title, task_url, segment.as_deref(), cmd),
         Commands::List {
             reference,
             all,
@@ -444,14 +444,14 @@ fn resolve_segment_for_plugin(config: &Config) -> (Option<PathBuf>, Option<Strin
 /// Execute a deferred action returned by a plugin script.
 fn execute_deferred_action(config: &Config, action: toren_lib::DeferredAction) -> Result<()> {
     match action {
-        toren_lib::DeferredAction::Cmd {
+        toren_lib::DeferredAction::Do {
             task_id,
             task_title,
             task_url,
             prompt,
             intent,
         } => {
-            cmd_cmd(
+            cmd_do(
                 config,
                 None,       // workspace (auto-create)
                 prompt,
@@ -467,9 +467,9 @@ fn execute_deferred_action(config: &Config, action: toren_lib::DeferredAction) -
     }
 }
 
-// ─── cmd ────────────────────────────────────────────────────────────────────
+// ─── do ─────────────────────────────────────────────────────────────────────
 
-fn cmd_cmd(
+fn cmd_do(
     config: &Config,
     workspace: Option<String>,
     prompt: Option<String>,
@@ -655,9 +655,9 @@ fn cmd_cmd(
     }
 }
 
-// ─── run ────────────────────────────────────────────────────────────────────
+// ─── shell ──────────────────────────────────────────────────────────────────
 
-fn cmd_run(
+fn cmd_shell(
     config: &Config,
     workspace: Option<String>,
     hook: Option<HookArg>,
@@ -1275,9 +1275,9 @@ fn cmd_init(stealth: bool) -> Result<()> {
         }
     }
 
-    let config_path = cwd.join(".toren.kdl");
-    if config_path.exists() {
-        anyhow::bail!(".toren.kdl already exists. Remove it first to re-initialize.");
+    let config_path = cwd.join("toren.kdl");
+    if config_path.exists() || cwd.join(".toren.kdl").exists() {
+        anyhow::bail!("toren.kdl already exists. Remove it first to re-initialize.");
     }
 
     // Collect setup actions
@@ -1356,8 +1356,8 @@ fn cmd_init(stealth: bool) -> Result<()> {
     kdl.push_str("}\n\ndestroy { }\n");
 
     let total = share_entries.len() + copy_entries.len();
-    std::fs::write(&config_path, &kdl).context("Failed to write .toren.kdl")?;
-    println!("Created .toren.kdl with {} setup entries", total);
+    std::fs::write(&config_path, &kdl).context("Failed to write toren.kdl")?;
+    println!("Created toren.kdl with {} setup entries", total);
 
     for entry in &share_entries {
         println!("  share src=\"{}\"", entry);
@@ -1371,15 +1371,15 @@ fn cmd_init(stealth: bool) -> Result<()> {
         if git_info_dir.exists() {
             let exclude_path = git_info_dir.join("exclude");
             let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-            if !existing.lines().any(|l| l.trim() == ".toren.kdl") {
+            if !existing.lines().any(|l| l.trim() == "toren.kdl") {
                 let mut content = existing;
                 if !content.ends_with('\n') && !content.is_empty() {
                     content.push('\n');
                 }
-                content.push_str(".toren.kdl\n");
+                content.push_str("toren.kdl\n");
                 std::fs::write(&exclude_path, content)
                     .context("Failed to update .git/info/exclude")?;
-                println!("Added .toren.kdl to .git/info/exclude");
+                println!("Added toren.kdl to .git/info/exclude");
             }
         } else {
             println!("Warning: .git/info directory not found, --stealth had no effect");
@@ -1581,7 +1581,7 @@ fn detect_jj_workspace_context(
     let mut segment_path = None;
     let mut check_path = workspace_path.parent();
     while let Some(parent) = check_path {
-        if parent.join(".toren.kdl").exists() {
+        if parent.join("toren.kdl").exists() || parent.join(".toren.kdl").exists() {
             segment_path = Some(parent.to_path_buf());
             break;
         }
@@ -1623,7 +1623,7 @@ fn detect_git_worktree_context(
     let mut segment_path = None;
     let mut check_path = workspace_path.parent();
     while let Some(parent) = check_path {
-        if parent.join(".toren.kdl").exists() {
+        if parent.join("toren.kdl").exists() || parent.join(".toren.kdl").exists() {
             segment_path = Some(parent.to_path_buf());
             break;
         }

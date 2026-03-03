@@ -57,11 +57,11 @@ let arg = ARGS[0];
 
 ### Deferred actions
 
-Plugins that need to start a Claude session can't directly exec into another process. Instead, return a map with `action: "cmd"`:
+Plugins that need to start a coding agent session can't directly exec into another process. Instead, return a map with `action: "do"`:
 
 ```rhai
 #{
-    action: "cmd",
+    action: "do",
     task_id: "breq-123",
     task_title: "Fix the bug",
     // Optional fields:
@@ -71,7 +71,7 @@ Plugins that need to start a Claude session can't directly exec into another pro
 }
 ```
 
-The host interprets this after the script completes and calls `breq cmd` with the specified fields. The `intent` and `prompt` are independent and composable — intent becomes a system prompt that frames the session, while prompt is the user message.
+The host interprets this after the script completes and calls `breq do` with the specified fields. The `intent` and `prompt` are independent and composable — intent becomes a system prompt that frames the session, while prompt is the user message.
 
 ## Host API reference
 
@@ -195,7 +195,7 @@ cp contrib/plugins/*.rhai ~/.toren/plugins/
 
 ### `assign`
 
-Claims a task and starts a Claude session. Source-agnostic — dispatches status updates based on the task source (beads, github, linear). The task description is passed as the user message; the intent (if specified) is rendered as a system prompt.
+Claims a task and starts a coding agent session. Source-agnostic — dispatches status updates based on the task source (beads, github, linear). The task description is passed as the user message; the intent (if specified) is rendered as a system prompt.
 
 ```
 breq assign <task-id> [--intent <name>]
@@ -240,4 +240,4 @@ POST /api/assignments/:id/action/:plugin_name
 Body: { "args": ["arg1", "arg2"] }
 ```
 
-Returns `{ success: true }` or `{ success: true, action: { type: "cmd", ... } }` for deferred actions. The daemon can't exec into Claude, so callers handle deferred actions themselves.
+Returns `{ success: true }` or `{ success: true, action: { type: "do", ... } }` for deferred actions. The daemon can't exec into Claude, so callers handle deferred actions themselves.

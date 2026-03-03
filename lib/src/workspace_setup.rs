@@ -1,7 +1,7 @@
 //! Workspace setup hooks for initializing and tearing down jj workspaces.
 //!
 //! This module implements a lightweight, procedural mechanism for workspace initialization
-//! using `.toren.kdl` configuration files. It supports these primitive actions:
+//! using `toren.kdl` configuration files. It supports these primitive actions:
 //! - `template`: Copy and render files with workspace context
 //! - `copy`: Copy files verbatim
 //! - `run`: Execute shell commands (auto-gets `STATION_DOMAIN` env var)
@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, trace, warn};
 
-const TOREN_CONFIG_FILE: &str = ".toren.kdl";
+const TOREN_CONFIG_FILE: &str = "toren.kdl";
+const TOREN_CONFIG_FILE_HIDDEN: &str = ".toren.kdl";
 
 /// Extract an i64 from a KdlValue (kdl 6.x uses i128 internally)
 fn kdl_value_as_i64(val: &kdl::KdlValue) -> Option<i64> {
@@ -249,7 +250,7 @@ pub struct SetupResult;
 
 // ==================== Config Parsing ====================
 
-/// Configuration parsed from .toren.kdl
+/// Configuration parsed from toren.kdl
 #[derive(Debug, Default)]
 pub struct BreqConfig {
     pub setup: Vec<ParsedAction>,
@@ -258,23 +259,37 @@ pub struct BreqConfig {
 }
 
 impl BreqConfig {
-    /// Check if a .toren.kdl file exists in the given directory
-    pub fn exists(repo_root: &Path) -> bool {
-        repo_root.join(TOREN_CONFIG_FILE).exists()
+    /// Find toren.kdl config file, preferring `toren.kdl` over `.toren.kdl`
+    fn config_path(repo_root: &Path) -> Option<PathBuf> {
+        let preferred = repo_root.join(TOREN_CONFIG_FILE);
+        if preferred.exists() {
+            return Some(preferred);
+        }
+        let hidden = repo_root.join(TOREN_CONFIG_FILE_HIDDEN);
+        if hidden.exists() {
+            return Some(hidden);
+        }
+        None
     }
 
-    /// Parse a .toren.kdl file from the repository root
-    pub fn parse(repo_root: &Path) -> Result<Self> {
-        let config_path = repo_root.join(TOREN_CONFIG_FILE);
+    /// Check if a toren.kdl file exists in the given directory
+    pub fn exists(repo_root: &Path) -> bool {
+        Self::config_path(repo_root).is_some()
+    }
 
-        if !config_path.exists() {
-            trace!(
-                "No {} found at {}",
-                TOREN_CONFIG_FILE,
-                config_path.display()
-            );
-            return Ok(Self::default());
-        }
+    /// Parse a toren.kdl file from the repository root
+    pub fn parse(repo_root: &Path) -> Result<Self> {
+        let config_path = match Self::config_path(repo_root) {
+            Some(p) => p,
+            None => {
+                trace!(
+                    "No {} found at {}",
+                    TOREN_CONFIG_FILE,
+                    repo_root.display()
+                );
+                return Ok(Self::default());
+            }
+        };
 
         trace!("Found config file: {}", config_path.display());
 
@@ -301,7 +316,7 @@ impl BreqConfig {
                     config.vars = Self::parse_vars(node)?;
                 }
                 other => {
-                    warn!("Unknown top-level block in .toren.kdl: {}", other);
+                    warn!("Unknown top-level block in toren.kdl: {}", other);
                 }
             }
         }
@@ -502,7 +517,7 @@ impl BreqConfig {
 
 /// Manages workspace setup state and execution
 pub struct WorkspaceSetup {
-    /// Path to the repository root (where .toren.kdl lives)
+    /// Path to the repository root (where toren.kdl lives)
     repo_root: PathBuf,
     /// Path to the workspace being set up
     workspace_path: PathBuf,

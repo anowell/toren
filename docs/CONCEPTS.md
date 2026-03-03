@@ -46,7 +46,7 @@ Toren (daemon)
 
 ## The breq CLI
 
-`breq` (bead request) manages work assignments between beads (tasks) and ancillaries.
+`breq` manages work assignments between tasks and ancillaries.
 
 ### Core Principle
 
@@ -54,12 +54,14 @@ Toren (daemon)
 
 ### Commands
 
-| Command | Description | Bead Effect |
+| Command | Description | Task Effect |
 |---------|-------------|-------------|
-| `breq assign <bead>` | Deploy ancillary on task | → in_progress |
+| `breq do -p <prompt>` | Assign work to a new workspace | — |
+| `breq do <ws> -p <prompt>` | Assign work to an existing workspace | — |
+| `breq assign <task>` | Claim task and start session | → in_progress |
 | `breq complete <ref>` | Keep commits, cleanup workspace | → closed |
 | `breq abort <ref>` | Discard work, cleanup workspace | → open (unassigned) |
-| `breq abort --close` | Abort and close bead | → closed |
+| `breq abort --close` | Abort and close task | → closed |
 | `breq resume <ref>` | Continue work (recreates workspace if needed) | (reopens if needed) |
 
 ### Workflow Examples

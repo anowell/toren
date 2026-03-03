@@ -1099,14 +1099,14 @@ async fn assignment_action(
         Ok(toren_lib::PluginResult::Action(deferred)) => {
             // Daemon can't exec — return action details for caller to handle
             let action_json = match deferred {
-                toren_lib::DeferredAction::Cmd {
+                toren_lib::DeferredAction::Do {
                     task_id,
                     task_title,
                     task_url,
                     prompt,
                     intent,
                 } => serde_json::json!({
-                    "type": "cmd",
+                    "type": "do",
                     "task_id": task_id,
                     "task_title": task_title,
                     "task_url": task_url,

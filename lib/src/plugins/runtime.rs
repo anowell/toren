@@ -51,19 +51,20 @@ pub fn run_ast(engine: &Engine, ast: &AST, args: &[String]) -> Result<PluginResu
 
 /// Interpret the script's return value.
 ///
-/// If the script returns a map with `action: "cmd"`, it becomes a `DeferredAction::Cmd`.
+/// If the script returns a map with `action: "do"` (or legacy `"cmd"`), it becomes a `DeferredAction::Do`.
 /// Otherwise, it's `PluginResult::Ok`.
 pub fn interpret_result(value: Dynamic) -> Result<PluginResult> {
     if value.is::<Map>() {
         let map = value.cast::<Map>();
         if let Some(action) = map.get("action") {
-            if action.clone().into_string().ok().as_deref() == Some("cmd") {
+            let action_str = action.clone().into_string().ok();
+            if action_str.as_deref() == Some("do") || action_str.as_deref() == Some("cmd") {
                 let get_str = |key: &str| -> Option<String> {
                     map.get(key)
                         .and_then(|v| v.clone().into_string().ok())
                 };
 
-                return Ok(PluginResult::Action(DeferredAction::Cmd {
+                return Ok(PluginResult::Action(DeferredAction::Do {
                     task_id: get_str("task_id"),
                     task_title: get_str("task_title"),
                     task_url: get_str("task_url"),
@@ -489,19 +490,34 @@ mod tests {
     }
 
     #[test]
-    fn test_interpret_result_cmd_action() {
+    fn test_interpret_result_do_action() {
         let mut map = Map::new();
-        map.insert("action".into(), Dynamic::from("cmd"));
+        map.insert("action".into(), Dynamic::from("do"));
         map.insert("task_id".into(), Dynamic::from("breq-123"));
         map.insert("task_title".into(), Dynamic::from("Fix the bug"));
 
         let result = interpret_result(Dynamic::from(map)).unwrap();
         match result {
-            PluginResult::Action(DeferredAction::Cmd { task_id, task_title, .. }) => {
+            PluginResult::Action(DeferredAction::Do { task_id, task_title, .. }) => {
                 assert_eq!(task_id.as_deref(), Some("breq-123"));
                 assert_eq!(task_title.as_deref(), Some("Fix the bug"));
             }
-            _ => panic!("Expected DeferredAction::Cmd"),
+            _ => panic!("Expected DeferredAction::Do"),
+        }
+    }
+
+    #[test]
+    fn test_interpret_result_legacy_cmd_action() {
+        let mut map = Map::new();
+        map.insert("action".into(), Dynamic::from("cmd"));
+        map.insert("task_id".into(), Dynamic::from("breq-456"));
+
+        let result = interpret_result(Dynamic::from(map)).unwrap();
+        match result {
+            PluginResult::Action(DeferredAction::Do { task_id, .. }) => {
+                assert_eq!(task_id.as_deref(), Some("breq-456"));
+            }
+            _ => panic!("Expected DeferredAction::Do from legacy 'cmd'"),
         }
     }
 

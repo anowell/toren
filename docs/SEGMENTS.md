@@ -37,9 +37,9 @@ curl -X POST http://localhost:8787/api/segments/create \
 ## CLI Usage
 
 ```bash
-# Initialize a repo for breq (creates .toren.kdl, offers to register segment)
+# Initialize a repo for breq (creates toren.kdl, offers to register segment)
 breq init
 
 # Start a session (segment inferred from CWD)
-breq cmd -p "implement feature X"
+breq do -p "implement feature X"
 ```

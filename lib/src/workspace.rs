@@ -1052,7 +1052,7 @@ impl WorkspaceManager {
         ws_path.exists() && (ws_path.join(".jj").exists() || ws_path.join(".git").exists())
     }
 
-    /// Run workspace setup hooks if .toren.kdl exists
+    /// Run workspace setup hooks if toren.kdl exists
     pub fn run_setup(
         &self,
         segment_path: &Path,
@@ -1061,7 +1061,7 @@ impl WorkspaceManager {
         ancillary_num: u32,
     ) -> Result<SetupResult> {
         if !BreqConfig::exists(segment_path) {
-            debug!("No .toren.kdl found, skipping setup");
+            debug!("No toren.kdl found, skipping setup");
             return Ok(SetupResult);
         }
 
@@ -1076,7 +1076,7 @@ impl WorkspaceManager {
         setup.run_setup()
     }
 
-    /// Run workspace destroy hooks if .toren.kdl exists
+    /// Run workspace destroy hooks if toren.kdl exists
     pub fn run_destroy(
         &self,
         segment_path: &Path,
@@ -1084,7 +1084,7 @@ impl WorkspaceManager {
         workspace_name: &str,
     ) -> Result<SetupResult> {
         if !BreqConfig::exists(segment_path) {
-            debug!("No .toren.kdl found, skipping destroy");
+            debug!("No toren.kdl found, skipping destroy");
             return Ok(SetupResult);
         }
 
@@ -1110,7 +1110,7 @@ impl WorkspaceManager {
     ) -> Result<(PathBuf, SetupResult)> {
         let ws_path = self.create_workspace(segment_path, segment_name, workspace_name)?;
 
-        // Run setup hooks if .toren.kdl exists - fail if setup fails
+        // Run setup hooks if toren.kdl exists - fail if setup fails
         match self.run_setup(
             segment_path,
             &ws_path,

@@ -64,7 +64,7 @@ Override the Caddy admin API URL (default: `http://localhost:2019`).
 
 ## Toren integration
 
-Station integrates with toren workspaces via `.toren.kdl` configuration. Toren automatically sets `STATION_DOMAIN` to `{repo_name}.{local_domain}` for `run` and `proxy` actions.
+Station integrates with toren workspaces via `toren.kdl` configuration. Toren automatically sets `STATION_DOMAIN` to `{repo_name}.{local_domain}` for `run` and `proxy` actions.
 
 ### Using `proxy` directive (recommended)
 
@@ -90,4 +90,4 @@ destroy {
 
 ### Migration note
 
-The `config.proxy.*` template variables previously available in `.toren.kdl` have been removed. Use `STATION_DOMAIN` (set automatically by toren) or the `proxy` directive instead.
+The `config.proxy.*` template variables previously available in `toren.kdl` have been removed. Use `STATION_DOMAIN` (set automatically by toren) or the `proxy` directive instead.

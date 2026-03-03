@@ -1,10 +1,10 @@
-/// Claim a task and start a Claude session.
+/// Claim a task and start a coding agent session.
 ///
 /// Usage: breq assign <task-id> [--intent <name>]
 ///
 /// 1. Detects task source (from ID prefix or tasks.default_source config)
 /// 2. Updates task status to in-progress via source-specific CLI
-/// 3. Returns a deferred cmd action to start a Claude session
+/// 3. Returns a deferred action to start a coding agent session
 ///
 /// Options:
 ///   --intent, -i   Intent template to use (e.g., "act", "plan")
@@ -37,10 +37,10 @@ switch source {
     },
 }
 
-// Return deferred action to start a Claude session
+// Return deferred action to start a coding agent session
 // The task description serves as the prompt (bead is the prompt)
 let result = #{
-    action: "cmd",
+    action: "do",
     task_id: task.id,
     task_title: task.title,
 };

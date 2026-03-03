@@ -4,7 +4,7 @@ Toren uses a single config file at `~/.toren/config.toml`. All toren state (assi
 
 You can override the config path with `--config <path>`.
 
-For most users, `breq init` in a repo is sufficient — it creates `.toren.kdl` for workspace hooks and offers to register the repo as a segment. No manual config editing needed.
+For most users, `breq init` in a repo is sufficient — it creates `toren.kdl` for workspace hooks and offers to register the repo as a segment. No manual config editing needed.
 
 ## Full Reference
 
@@ -37,7 +37,7 @@ port = 8787
 default_source = "beads"
 
 [intents]
-# Named prompt templates for breq cmd -i <name>.
+# Named prompt templates for breq do -i <name>.
 # Available template variables: {{ task.id }}, {{ task.title }}, {{ task.url }}, {{ task.source }}
 act = """Implement {{ task.id }}: {{ task.title }}
 
@@ -66,7 +66,7 @@ show = "breq list $1 --detail"
 
 ### `[ancillaries]`
 
-**`segments`** — Glob patterns that discover project directories. Each matched directory becomes a segment (a repo breq can manage workspaces for). When you run `breq cmd` from within a repo, breq matches your CWD against these patterns to determine the segment.
+**`segments`** — Glob patterns that discover project directories. Each matched directory becomes a segment (a repo breq can manage workspaces for). When you run `breq do` from within a repo, breq matches your CWD against these patterns to determine the segment.
 
 If no segments are configured, breq infers the segment from the current repo's directory name. You only need explicit segments when managing multiple repos or using `breq list --all`.
 
@@ -78,7 +78,7 @@ If no segments are configured, breq infers the segment from the current repo's d
 
 ### `[proxy]`
 
-Controls how [Station](../station/README.md) reverse proxy routes are set up for workspaces. Only relevant if your `.toren.kdl` uses the `proxy` directive.
+Controls how [Station](../station/README.md) reverse proxy routes are set up for workspaces. Only relevant if your `toren.kdl` uses the `proxy` directive.
 
 **`domain`** — Base domain for routes. Defaults to `lvh.me` (resolves to 127.0.0.1 via wildcard DNS). Workspace routes are computed as `<workspace_name>.<repo_name>.<domain>`.
 
@@ -88,11 +88,11 @@ Only used by the toren daemon. Ignored by breq.
 
 ### `[tasks]`
 
-**`default_source`** — The default task source used when an ID is provided without a `source:id` prefix. Defaults to `"beads"`. When you run `breq cmd --task-id my-task`, the source is set to this value. To override, use the prefix syntax: `breq cmd --task-id linear:ENG-123`.
+**`default_source`** — The default task source used when an ID is provided without a `source:id` prefix. Defaults to `"beads"`. When you run `breq do --task-id my-task`, the source is set to this value. To override, use the prefix syntax: `breq do --task-id linear:ENG-123`.
 
 ### `[intents]`
 
-Named prompt templates used with `breq cmd -i <intent>`. The default intents (`act`, `plan`, `review`) cover common workflows. You can add custom intents or override defaults.
+Named prompt templates used with `breq do -i <intent>`. The default intents (`act`, `plan`, `review`) cover common workflows. You can add custom intents or override defaults.
 
 Template variables: `{{ task.id }}`, `{{ task.title }}`, `{{ task.url }}`, `{{ task.source }}`
 
@@ -110,6 +110,6 @@ Shell command templates that become breq subcommands. Aliases have lower priorit
 
 Aliases receive positional arguments (`$1`, `$2`) and environment variables from clean output (`$ID`, `$WORKSPACE`, `$SEGMENT`, `$REVISION`).
 
-## Workspace Hooks (.toren.kdl)
+## Workspace Hooks (toren.kdl)
 
-Per-repo workspace configuration lives in `.toren.kdl` at the repo root (not in `~/.toren/config.toml`). See the [README](../README.md#workspace-hooks-torenkdl) for details.
+Per-repo workspace configuration lives in `toren.kdl` at the repo root (not in `~/.toren/config.toml`). See the [README](../README.md#workspace-hooks-torenkdl) for details.

@@ -82,12 +82,12 @@ pub enum PluginResult {
 /// A deferred action returned by a plugin script.
 ///
 /// Plugins that need the host to exec into another process (e.g., `claude`)
-/// return a map like `#{ action: "cmd", task_id: "x" }`. The host interprets
+/// return a map like `#{ action: "do", task_id: "x" }`. The host interprets
 /// these after the script completes.
 #[derive(Debug, Clone)]
 pub enum DeferredAction {
-    /// Start a Claude session via `breq cmd`.
-    Cmd {
+    /// Start a coding agent session via `breq do`.
+    Do {
         task_id: Option<String>,
         task_title: Option<String>,
         task_url: Option<String>,
@@ -373,12 +373,12 @@ mod tests {
     fn test_deferred_action_from_script() {
         let engine = rhai::Engine::new();
         let ast = engine
-            .compile(r#"#{ action: "cmd", task_id: "test-123", task_title: "Test task" }"#)
+            .compile(r#"#{ action: "do", task_id: "test-123", task_title: "Test task" }"#)
             .unwrap();
 
         let result = runtime::run_ast(&engine, &ast, &[]).unwrap();
         match result {
-            PluginResult::Action(DeferredAction::Cmd {
+            PluginResult::Action(DeferredAction::Do {
                 task_id,
                 task_title,
                 ..
@@ -386,7 +386,7 @@ mod tests {
                 assert_eq!(task_id.as_deref(), Some("test-123"));
                 assert_eq!(task_title.as_deref(), Some("Test task"));
             }
-            _ => panic!("Expected DeferredAction::Cmd"),
+            _ => panic!("Expected DeferredAction::Do"),
         }
     }
 }
