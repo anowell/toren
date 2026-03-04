@@ -187,12 +187,10 @@ pub fn complete_assignment(
             .unwrap_or_default();
 
         // Push if requested
-        if opts.push {
-            if result.revision.is_some() {
-                info!("Pushing changes for assignment {}", assignment.id);
-                ws_mgr.push(opts.segment_path, &assignment.workspace_path)?;
-                result.pushed = true;
-            }
+        if opts.push && result.revision.is_some() {
+            info!("Pushing changes for assignment {}", assignment.id);
+            ws_mgr.push(opts.segment_path, &assignment.workspace_path)?;
+            result.pushed = true;
         }
     }
 

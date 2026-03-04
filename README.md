@@ -104,7 +104,7 @@ setup {
 
     // Configure reverse proxy from `{{ws.name}}.{{repo.name}}.lvh.me` to your web_port
     // Short for: run "station proxy {{ws.name}} --port 80 --upstream {{vars.web_port}}"
-    proxy http upstream.var="vars.web_port"
+    proxy "http" upstream="{{vars.web_port}}"
 }
 
 destroy {
@@ -119,7 +119,9 @@ destroy {
 - `run "command"` - Execute shell command
 - `proxy` - Register a reverse proxy route via [Station](station/README.md) - basically a shorthand for `run "station proxy {{ws.name}} --port <port> --upstream <upstream>"`
 
-**Template variables:** `{{ ws.name }}`, `{{ ws.num }}`, `{{ ws.path }}`, `{{ repo.root }}`, `{{ repo.name }}`
+All string arguments support `{{ ... }}` template variables.
+
+**Template variables:** `{{ ws.name }}`, `{{ ws.num }}`, `{{ ws.path }}`, `{{ repo.root }}`, `{{ repo.name }}`, `{{ task.id }}`, `{{ task.title }}`, `{{ vars.<name> }}`
 
 ## More
 

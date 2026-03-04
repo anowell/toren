@@ -469,6 +469,7 @@ fn execute_deferred_action(config: &Config, action: toren_lib::DeferredAction) -
 
 // ─── do ─────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_do(
     config: &Config,
     workspace: Option<String>,
@@ -657,6 +658,7 @@ fn cmd_do(
 
 // ─── shell ──────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_shell(
     config: &Config,
     workspace: Option<String>,

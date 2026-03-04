@@ -210,6 +210,7 @@ impl AncillaryWork {
     }
 
     /// Run work via the Claude Agent SDK (native streaming).
+    #[allow(clippy::too_many_arguments)]
     async fn run_claude_sdk(
         ancillary_id: &str,
         assignment: &Assignment,
@@ -319,6 +320,7 @@ impl AncillaryWork {
     }
 
     /// Run work via subprocess for non-Claude agents.
+    #[allow(clippy::too_many_arguments)]
     async fn run_subprocess(
         ancillary_id: &str,
         assignment: &Assignment,

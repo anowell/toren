@@ -332,6 +332,7 @@ impl AssignmentManager {
     ///
     /// `task_id` is an optional task reference (e.g., bead ID).
     /// `source` indicates how the assignment was created.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         &mut self,
         ancillary_id: &str,
@@ -400,6 +401,7 @@ impl AssignmentManager {
     }
 
     /// Create a new assignment from a prompt (backward-compat wrapper).
+    #[allow(clippy::too_many_arguments)]
     pub fn create_from_prompt(
         &mut self,
         ancillary_id: &str,
