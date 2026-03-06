@@ -25,6 +25,7 @@ clonetree = "0.0.2"
 english-numbers = "0.3.3"
 nix = { version = "0.29", features = ["process", "signal"] }
 rhai = { version = "1", features = ["serde", "sync"] }
+ureq = "3"
 which = "7"
 
 [dev-dependencies]

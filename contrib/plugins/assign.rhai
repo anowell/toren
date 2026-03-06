@@ -17,8 +17,8 @@ let parsed = parse_args(ARGS, #{
 let task_id = parsed.args[0];
 
 // Infer task fields (source, title, url) from the ID
-let task = task(task_id);
-let source = if task.source != () { task.source } else { config("tasks.default_source") };
+let task = toren::task(task_id);
+let source = if task.source != () { task.source } else { toren::config("tasks.default_source") };
 
 // Claim the task based on its source
 switch source {

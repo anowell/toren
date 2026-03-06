@@ -17,14 +17,16 @@ use crate::Assignment;
 pub struct CompleteOptions<'a> {
     /// Whether to push changes
     pub push: bool,
-    /// Whether to keep the bead open (default: close it)
-    pub keep_open: bool,
-    /// Segment path for running workspace hooks and bead commands
+    /// Whether to keep the task open (default: close it)
+    pub keep_task_open: bool,
+    /// Segment path for running workspace hooks and task commands
     pub segment_path: &'a Path,
     /// Whether to kill processes running in the workspace
     pub kill: bool,
     /// Auto-commit message (rendered template). If Some, auto-commit before capture.
     pub auto_commit_message: Option<String>,
+    /// Plugin manager for resolver-based task operations
+    pub plugin_mgr: &'a crate::plugins::PluginManager,
 }
 
 /// Result from completing an assignment
@@ -39,22 +41,26 @@ pub struct CompleteResult {
 
 /// Options for aborting an assignment
 pub struct AbortOptions<'a> {
-    /// Whether to close the bead (default: reopen it)
-    pub close_bead: bool,
-    /// Segment path for running workspace hooks and bead commands
+    /// Whether to close the task (default: reopen it)
+    pub close_task: bool,
+    /// Segment path for running workspace hooks and task commands
     pub segment_path: &'a Path,
     /// Whether to kill processes running in the workspace
     pub kill: bool,
+    /// Plugin manager for resolver-based task operations
+    pub plugin_mgr: &'a crate::plugins::PluginManager,
 }
 
 /// Options for preparing a resume
 pub struct ResumeOptions<'a> {
     /// Custom instruction/prompt for the resumed work
     pub instruction: Option<&'a str>,
-    /// Segment path for running workspace hooks and bead commands
+    /// Segment path for running workspace hooks and task commands
     pub segment_path: &'a Path,
     /// Segment name
     pub segment_name: &'a str,
+    /// Plugin manager for resolver-based task operations
+    pub plugin_mgr: &'a crate::plugins::PluginManager,
 }
 
 /// Result from preparing a resume
@@ -214,11 +220,16 @@ pub fn complete_assignment(
     )?;
     assignment_mgr.remove(&assignment.id)?;
 
-    // Close bead unless keep_open (only if task_id is present)
-    if !opts.keep_open {
+    // Close task unless keep_task_open (only if task_id is present)
+    if !opts.keep_task_open {
         if let Some(ref task_id) = assignment.task_id {
-            crate::tasks::beads::update_bead_status(task_id, "closed", opts.segment_path)?;
-            info!("Bead {} closed", task_id);
+            let source = assignment.task_source.as_deref().unwrap_or("beads");
+            let ctx = crate::PluginContext::new(
+                Some(opts.segment_path.to_path_buf()),
+                None,
+            );
+            opts.plugin_mgr.resolve_complete(source, task_id, ctx)?;
+            info!("Task {} closed", task_id);
         }
     }
 
@@ -247,16 +258,19 @@ pub fn abort_assignment(
     assignment_mgr.record_completion(assignment, CompletionReason::Aborted, None)?;
     assignment_mgr.remove(&assignment.id)?;
 
-    // Handle bead status (only if task_id is present)
+    // Handle task status (only if task_id is present)
     if let Some(ref task_id) = assignment.task_id {
-        if opts.close_bead {
-            crate::tasks::beads::update_bead_status(task_id, "closed", opts.segment_path)?;
-            info!("Bead {} closed", task_id);
+        let source = assignment.task_source.as_deref().unwrap_or("beads");
+        let ctx = crate::PluginContext::new(
+            Some(opts.segment_path.to_path_buf()),
+            None,
+        );
+        if opts.close_task {
+            opts.plugin_mgr.resolve_complete(source, task_id, ctx)?;
+            info!("Task {} closed", task_id);
         } else {
-            // Unassign and reopen
-            let _ = crate::tasks::beads::update_bead_assignee(task_id, "", opts.segment_path);
-            crate::tasks::beads::update_bead_status(task_id, "open", opts.segment_path)?;
-            info!("Bead {} unassigned and returned to open", task_id);
+            opts.plugin_mgr.resolve_abort(source, task_id, ctx)?;
+            info!("Task {} unassigned and returned to open", task_id);
         }
     }
 
@@ -304,13 +318,22 @@ pub fn prepare_resume(
     // Touch updated_at timestamp (assignment is always Active)
     assignment_mgr.touch(&assignment.id)?;
 
-    // Ensure bead is in_progress and assigned to claude (if task_id present)
+    // Ensure task is in_progress and assigned to claude (if task_id present)
     let task_title = if let Some(ref task_id) = assignment.task_id {
-        match crate::tasks::fetch_task(task_id, opts.segment_path) {
+        let source = assignment.task_source.as_deref().unwrap_or("beads");
+        let ctx = crate::PluginContext::new(
+            Some(opts.segment_path.to_path_buf()),
+            Some(opts.segment_name.to_string()),
+        );
+        match opts.plugin_mgr.resolve_fetch(source, task_id, ctx) {
             Ok(task) => task.title,
             Err(_) => {
-                // Bead might be closed or not found, try to reopen/reclaim
-                crate::tasks::beads::claim_bead(task_id, "claude", opts.segment_path)?;
+                // Task might be closed or not found, try to reclaim
+                let ctx = crate::PluginContext::new(
+                    Some(opts.segment_path.to_path_buf()),
+                    Some(opts.segment_name.to_string()),
+                );
+                opts.plugin_mgr.resolve_claim(source, task_id, "claude", ctx)?;
                 assignment
                     .task_title
                     .clone()

@@ -295,10 +295,7 @@ fn main() -> Result<()> {
                         // Resolve segment from CWD for plugin context
                         let (seg_path, seg_name) = resolve_segment_for_plugin(&config);
 
-                        let ctx = toren_lib::PluginContext {
-                            segment_path: seg_path,
-                            segment_name: seg_name,
-                        };
+                        let ctx = toren_lib::PluginContext::new(seg_path, seg_name);
 
                         match plugin_mgr.run(subcmd, &plugin_args, ctx) {
                             Ok(toren_lib::PluginResult::Ok) => std::process::exit(0),
@@ -509,7 +506,10 @@ fn cmd_do(
 
         // Fetch task description if we have a task_id
         let task_description = inferred.task_id.as_ref().and_then(|id| {
-            toren_lib::fetch_task(id, &segment.path)
+            let source = inferred.task_source.as_deref().unwrap_or(&config.tasks.default_source);
+            let plugin_mgr = toren_lib::PluginManager::new(&config.plugins).ok()?;
+            let ctx = toren_lib::PluginContext::new(Some(segment.path.clone()), Some(segment.name.clone()));
+            plugin_mgr.resolve_fetch(source, id, ctx)
                 .ok()
                 .and_then(|t| t.description)
         });

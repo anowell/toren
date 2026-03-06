@@ -11,9 +11,9 @@
 let ws = ARGS[0];
 
 // Get assignment info before cleaning
-let info = ancillary(ws);
+let info = toren::assignment(ws);
 let task_id = info.task_id;
-let source = if info.task_source != "" { info.task_source } else { config("tasks.default_source") };
+let source = if info.task_source != "" { info.task_source } else { toren::config("tasks.default_source") };
 
 // Clean workspace with kill (no push)
 shell("breq", ["clean", ws, "--kill"]);

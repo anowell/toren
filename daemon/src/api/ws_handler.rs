@@ -225,7 +225,7 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
 
                         state.ancillaries.register(
                             id.clone(),
-                            seg,
+                            seg.clone(),
                             token.clone(),
                             ws_name.map(|s| s.to_string()),
                             working_dir.clone(),
@@ -235,7 +235,9 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
 
                         // If task_id provided, fetch task and set instruction
                         if let Some(ref tid) = task_id {
-                            match tasks::fetch_task(tid, &working_dir) {
+                            let source = &state.config.tasks.default_source;
+                            let ctx = toren_lib::PluginContext::new(Some(working_dir.clone()), Some(seg.clone()));
+                            match state.rhai_plugins.resolve_fetch(source, tid, ctx) {
                                 Ok(task) => {
                                     let prompt = tasks::generate_prompt(
                                         &task,
@@ -368,7 +370,10 @@ async fn connect_via_assignment(
 
     // Generate instruction from task ID
     let instruction = if let Some(ref task_id) = assignment.task_id {
-        match tasks::fetch_task(task_id, working_dir) {
+        let source = assignment.task_source.as_deref()
+            .unwrap_or(&state.config.tasks.default_source);
+        let ctx = toren_lib::PluginContext::new(Some(working_dir.clone()), None);
+        match state.rhai_plugins.resolve_fetch(source, task_id, ctx) {
             Ok(task) => {
                 let prompt =
                     tasks::generate_prompt(&task, "implement bead {{task_id}}");

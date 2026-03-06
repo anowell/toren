@@ -436,14 +436,16 @@ async fn compute_composite_status(
         assignment.base_branch.as_deref(),
     );
 
-    // 3. Task status + assignee — from task source (beads for now)
+    // 3. Task status + assignee — from task resolver
     let segment_path = {
         let segments = state.segments.read().unwrap();
         segments.find_by_name(&assignment.segment).map(|s| s.path.clone())
     };
 
-    let (task_status, task_assignee) = if let (Some(seg_path), Some(ref task_id)) = (segment_path, &assignment.task_id) {
-        match toren_lib::tasks::beads::fetch_bead_info(task_id, &seg_path) {
+    let (task_status, task_assignee) = if let (Some(ref seg_path), Some(ref task_id)) = (&segment_path, &assignment.task_id) {
+        let source = assignment.task_source.as_deref().unwrap_or("beads");
+        let ctx = toren_lib::PluginContext::new(Some(seg_path.clone()), None);
+        match state.rhai_plugins.resolve_info(source, task_id, ctx) {
             Ok(info) => (info.status, info.assignee),
             Err(_) => ("unknown".to_string(), String::new()),
         }
@@ -551,8 +553,11 @@ async fn assignments_create(
     let mut assignments = state.assignments.write().await;
 
     // Determine task ID - either from existing or create from prompt
+    let default_source = state.config.tasks.default_source.clone();
+    let plugin_mgr = &state.rhai_plugins;
+
     let (task_id, original_prompt, task_title) = if let Some(ref prompt) = request.prompt {
-        // Create bead from prompt
+        // Create task from prompt
         let title = request.task_title.clone().unwrap_or_else(|| {
             prompt
                 .lines()
@@ -563,31 +568,44 @@ async fn assignments_create(
                 .collect()
         });
 
-        let new_task_id = toren_lib::tasks::beads::create_and_claim_bead(
-            &title,
-            Some(prompt),
-            "claude",
-            &segment_path,
-        )
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to create bead: {}", e)})),
-            )
-        })?;
+        let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
+        let new_task_id = plugin_mgr
+            .resolve_create(&default_source, &title, Some(prompt), ctx)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to create task: {}", e)})),
+                )
+            })?;
+
+        // Claim the newly created task
+        let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
+        plugin_mgr
+            .resolve_claim(&default_source, &new_task_id, "claude", ctx)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to claim task: {}", e)})),
+                )
+            })?;
 
         (new_task_id, Some(prompt.clone()), Some(title))
     } else if let Some(task_id) = request.task_id.clone() {
-        // Claim existing bead
-        toren_lib::tasks::beads::claim_bead(&task_id, "claude", &segment_path).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Failed to claim bead: {}", e)})),
-            )
-        })?;
+        // Claim existing task
+        let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
+        plugin_mgr
+            .resolve_claim(&default_source, &task_id, "claude", ctx)
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Failed to claim task: {}", e)})),
+                )
+            })?;
 
         // Fetch task title for display
-        let title = toren_lib::tasks::beads::fetch_bead(&task_id, &segment_path)
+        let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
+        let title = plugin_mgr
+            .resolve_fetch(&default_source, &task_id, ctx)
             .ok()
             .map(|t| t.title);
 
@@ -815,10 +833,11 @@ async fn assignments_complete(
 
     let opts = toren_lib::CompleteOptions {
         push: request.push,
-        keep_open: request.keep_open,
+        keep_task_open: request.keep_open,
         segment_path: &segment_path,
         kill: request.kill,
         auto_commit_message,
+        plugin_mgr: &state.rhai_plugins,
     };
 
     let result =
@@ -889,9 +908,10 @@ async fn assignments_abort(
     ))?;
 
     let opts = toren_lib::AbortOptions {
-        close_bead: request.close_bead,
+        close_task: request.close_bead,
         segment_path: &segment_path,
         kill: request.kill,
+        plugin_mgr: &state.rhai_plugins,
     };
 
     toren_lib::abort_assignment(&assignment, &mut assignments, ws_mgr, &opts).map_err(|e| {
@@ -962,6 +982,7 @@ async fn assignments_resume(
         instruction: request.instruction.as_deref(),
         segment_path: &segment_path,
         segment_name: &assignment.segment,
+        plugin_mgr: &state.rhai_plugins,
     };
 
     let resume_result =
@@ -1073,10 +1094,7 @@ async fn assignment_action(
         }
     };
 
-    let ctx = toren_lib::PluginContext {
-        segment_path: seg_path,
-        segment_name: seg_name,
-    };
+    let ctx = toren_lib::PluginContext::new(seg_path, seg_name);
 
     // Run plugin in a blocking task (Rhai execution is synchronous)
     let rhai_plugins = state.rhai_plugins.clone();

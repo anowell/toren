@@ -1,6 +1,3 @@
-pub mod beads;
-
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Inferred task fields from various input formats.
@@ -75,33 +72,25 @@ pub fn infer_task_fields(
     }
 }
 
-/// Represents a task from any supported task tracking system
+/// Represents a task from any supported task tracking system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
     pub title: String,
     pub description: Option<String>,
-    pub provider: TaskProvider,
+    /// Source name (e.g., "beads", "linear", "github").
+    pub source: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TaskProvider {
-    Beads,
-}
-
-impl std::fmt::Display for TaskProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TaskProvider::Beads => write!(f, "beads"),
-        }
-    }
-}
-
-/// Fetch a task by ID, auto-detecting the provider based on available systems
-pub fn fetch_task(task_id: &str, working_dir: &std::path::Path) -> Result<Task> {
-    // For now, only beads is supported
-    beads::fetch_bead(task_id, working_dir)
+/// Observable task info for composite status display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskInfo {
+    pub id: String,
+    pub title: String,
+    /// Task status: e.g. "open", "in_progress", "closed"
+    pub status: String,
+    /// Task assignee: e.g. "claude", "anthony"
+    pub assignee: String,
 }
 
 /// Generate a prompt from a task using the provided template.
@@ -124,14 +113,14 @@ pub fn generate_prompt(task: &Task, template: &str) -> String {
             title: task.title.clone(),
             description: task.description.clone(),
             url: None,
-            source: None,
+            source: Some(task.source.clone()),
         }),
     };
     crate::workspace_setup::render_template(template, &ctx).unwrap_or_else(|_| {
         // Fallback to simple replacement for backwards compatibility
         template
             .replace("{{task_id}}", &task.id)
-            .replace("{{task_provider}}", &task.provider.to_string())
+            .replace("{{task_provider}}", &task.source)
     })
 }
 
