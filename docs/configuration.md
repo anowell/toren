@@ -51,10 +51,6 @@ review = """Review the implementation of {{ task.id }}: {{ task.title }}
 
 Verify completeness, check for issues, and assess confidence."""
 
-[plugins]
-# Directory for user Rhai plugin scripts (default: ~/.toren/plugins)
-dir = "~/.toren/plugins"
-
 [aliases]
 # Shell command templates invoked as breq subcommands (lower priority than plugins).
 # Positional args: $1, $2, etc. Clean output vars: $ID, $WORKSPACE, $SEGMENT, $REVISION.
@@ -95,14 +91,6 @@ Only used by the toren daemon. Ignored by breq.
 Named prompt templates used with `breq do -i <intent>`. The default intents (`act`, `plan`, `review`) cover common workflows. You can add custom intents or override defaults.
 
 Template variables: `{{ task.id }}`, `{{ task.title }}`, `{{ task.url }}`, `{{ task.source }}`
-
-### `[plugins]`
-
-Configures the Rhai plugin system. See [plugins.md](plugins.md) for full details on writing plugins.
-
-**`dir`** — Directory for user plugin scripts. Files matching `*.rhai` are loaded as plugins. The filename (without extension) becomes the command name. User plugins override built-ins of the same name. Defaults to `~/.toren/plugins`.
-
-**`disable`** — List of plugin names to disable. Useful for turning off specific built-in plugins.
 
 ### `[aliases]`
 

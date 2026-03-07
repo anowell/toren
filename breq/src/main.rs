@@ -228,23 +228,21 @@ fn main() -> Result<()> {
 
             // Top-level help: inject plugin descriptions
             if subcmd == "--help" || subcmd == "-h" {
-                if let Ok(config) = Config::load() {
-                    if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&config.plugins) {
-                        let plugins = plugin_mgr.list_with_descriptions();
-                        if !plugins.is_empty() {
-                            let mut section = String::from("Plugins:");
-                            for (name, desc) in &plugins {
-                                match desc {
-                                    Some(d) => section.push_str(&format!("\n  {:<16}{}", name, d)),
-                                    None => section.push_str(&format!("\n  {}", name)),
-                                }
+                if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")) {
+                    let plugins = plugin_mgr.list_with_descriptions();
+                    if !plugins.is_empty() {
+                        let mut section = String::from("Plugins:");
+                        for (name, desc) in &plugins {
+                            match desc {
+                                Some(d) => section.push_str(&format!("\n  {:<16}{}", name, d)),
+                                None => section.push_str(&format!("\n  {}", name)),
                             }
-                            Cli::command()
-                                .after_help(section)
-                                .print_help()
-                                .ok();
-                            std::process::exit(0);
                         }
+                        Cli::command()
+                            .after_help(section)
+                            .print_help()
+                            .ok();
+                        std::process::exit(0);
                     }
                 }
                 // Fall through to normal clap --help if no plugins
@@ -277,7 +275,7 @@ fn main() -> Result<()> {
                 };
 
                 // 1. Plugin dispatch (highest priority)
-                if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&config.plugins) {
+                if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")) {
                     if plugin_mgr.has(subcmd) {
                         // Per-plugin help
                         if plugin_args.iter().any(|a| a == "--help" || a == "-h") {
@@ -506,7 +504,7 @@ fn cmd_do(
 
         // Fetch task description if we have a task_id
         let task_description = inferred.task_id.as_ref().and_then(|id| {
-            let plugin_mgr = toren_lib::PluginManager::new(&config.plugins).ok()?;
+            let plugin_mgr = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")).ok()?;
             let ctx = toren_lib::PluginContext::new(Some(segment.path.clone()), Some(segment.name.clone()));
             if let Some(source) = inferred.task_source.as_deref() {
                 // Source is known (e.g., "beads:foo-123") — direct lookup

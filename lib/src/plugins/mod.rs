@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
-use crate::config::PluginsConfig;
 use crate::tasks::ResolvedTask;
 
 /// Lightweight metadata extracted from a plugin file without compilation.
@@ -151,16 +150,15 @@ pub struct PluginManager {
 }
 
 impl PluginManager {
-    /// Create a new PluginManager: scan plugins from the configured directory
+    /// Create a new PluginManager: scan plugins from the given directory
     /// without compiling them.
-    pub fn new(config: &PluginsConfig) -> Result<Self> {
+    pub fn new(dir: &Path) -> Result<Self> {
         let mut mgr = Self {
             command_metas: HashMap::new(),
             resolver_metas: HashMap::new(),
             compiled: Mutex::new(HashMap::new()),
         };
 
-        let dir = crate::config::expand_path_str(&config.dir);
         if dir.exists() {
             let commands_dir = dir.join("commands");
             let tasks_dir = dir.join("tasks");
@@ -175,14 +173,7 @@ impl PluginManager {
                 }
             } else {
                 // Legacy flat directory with @resolver tag detection
-                mgr.scan_dir_legacy(&dir)?;
-            }
-        }
-
-        // Remove disabled command plugins
-        for name in &config.disable {
-            if mgr.command_metas.remove(name).is_some() {
-                info!("Plugin '{}' disabled by config", name);
+                mgr.scan_dir_legacy(dir)?;
             }
         }
 
@@ -569,30 +560,9 @@ mod tests {
 
     #[test]
     fn test_empty_dir_no_plugins() {
-        let config = PluginsConfig {
-            dir: "/nonexistent".to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(Path::new("/nonexistent")).unwrap();
         assert!(mgr.command_metas.is_empty());
         assert!(mgr.resolver_metas.is_empty());
-    }
-
-    #[test]
-    fn test_disabled_plugins_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd_dir = dir.path().join("commands");
-        std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::write(cmd_dir.join("foo.rhai"), r#"let x = 1;"#).unwrap();
-        std::fs::write(cmd_dir.join("bar.rhai"), r#"let x = 2;"#).unwrap();
-
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: vec!["foo".to_string()],
-        };
-        let mgr = PluginManager::new(&config).unwrap();
-        assert!(!mgr.has("foo"));
-        assert!(mgr.has("bar"));
     }
 
     #[test]
@@ -602,11 +572,7 @@ mod tests {
         std::fs::create_dir_all(&cmd_dir).unwrap();
         std::fs::write(cmd_dir.join("custom.rhai"), r#"let x = "hello";"#).unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
         assert!(mgr.has("custom"));
     }
 
@@ -617,11 +583,7 @@ mod tests {
         std::fs::create_dir_all(&cmd_dir).unwrap();
         std::fs::write(cmd_dir.join("bad.rhai"), r#"this is not valid rhai {{{"#).unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
         // Meta is scanned (plugin is "known") but compilation will fail
         assert!(mgr.has("bad"));
         // Compilation should fail
@@ -637,11 +599,7 @@ mod tests {
         std::fs::write(cmd_dir.join("readme.md"), "# Plugins").unwrap();
         std::fs::write(cmd_dir.join("notes.txt"), "notes").unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
         assert!(mgr.command_metas.is_empty());
         assert!(mgr.resolver_metas.is_empty());
     }
@@ -729,11 +687,7 @@ mod tests {
         .unwrap();
         std::fs::write(cmd_dir.join("gamma.rhai"), "let x = 1;").unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
         let list = mgr.list_with_descriptions();
         // Should be sorted by name
         assert_eq!(list[0].0, "alpha");
@@ -801,11 +755,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         assert!(mgr.has("mycmd"));
         assert!(!mgr.has_resolver("mycmd"));
@@ -829,11 +779,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         assert!(mgr.has("mycmd"));
         assert!(!mgr.has_resolver("mycmd"));
@@ -853,11 +799,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         assert!(mgr.resolver_has_fn("test_src", "fetch"));
         assert!(mgr.resolver_has_fn("test_src", "info"));
@@ -884,11 +826,7 @@ mod tests {
         .unwrap();
         std::fs::write(cmd_dir.join("cmd.rhai"), "let x = 1;").unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         let mut resolvers = mgr.list_resolvers();
         resolvers.sort();
@@ -909,11 +847,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
         let ctx = PluginContext::default();
         let info = mgr.resolve_info("mock", "abc-123", ctx).unwrap();
 
@@ -938,11 +872,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
         let ctx = PluginContext::default();
         let id = mgr
             .resolve_create("mock", "My Task", Some("desc"), ctx)
@@ -964,11 +894,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
         let ctx = PluginContext::default();
         mgr.resolve_claim("mock", "abc-123", "claude", ctx).unwrap();
     }
@@ -985,11 +911,7 @@ fn abort(id) { }"#,
         )
         .unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         let ctx = PluginContext::default();
         mgr.resolve_complete("mock", "abc-123", ctx).unwrap();
@@ -1000,11 +922,7 @@ fn abort(id) { }"#,
 
     #[test]
     fn test_resolve_missing_resolver_errors() {
-        let config = PluginsConfig {
-            dir: "/nonexistent".to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(Path::new("/nonexistent")).unwrap();
         let ctx = PluginContext::default();
 
         assert!(mgr.resolve_info("nonexistent", "id", ctx).is_err());
@@ -1026,11 +944,7 @@ fn abort(id) { }"#,
         // A command plugin that just returns ok
         std::fs::write(cmd_dir.join("cmd.rhai"), "let x = 1;").unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         // Verify resolver ASTs are generated correctly
         let asts = mgr.resolver_asts();
@@ -1045,11 +959,7 @@ fn abort(id) { }"#,
         std::fs::write(cmd_dir.join("foo.rhai"), "let x = 1;").unwrap();
         std::fs::write(cmd_dir.join("bar.rhai"), "let x = 2;").unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         // Plugins are known but no ASTs compiled yet
         assert!(mgr.has("foo"));
@@ -1066,11 +976,7 @@ fn abort(id) { }"#,
         std::fs::write(cmd_dir.join("hello.rhai"), r#"let x = "hi";"#).unwrap();
         std::fs::write(cmd_dir.join("world.rhai"), r#"let y = "wo";"#).unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         // Nothing compiled yet
         assert!(mgr.compiled.lock().unwrap().is_empty());
@@ -1105,11 +1011,7 @@ fn abort(id) { }"#,
         )
         .unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         let sources = vec!["failing".to_string(), "working".to_string()];
         let ctx = PluginContext::default();
@@ -1128,11 +1030,7 @@ fn abort(id) { }"#,
         std::fs::write(tasks_dir.join("alpha.rhai"), "fn fetch(id) { #{} }").unwrap();
         std::fs::write(tasks_dir.join("beta.rhai"), "fn fetch(id) { #{} }").unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         // With explicit config sources, uses those in order
         let configured = vec!["beta".to_string()];
@@ -1147,11 +1045,7 @@ fn abort(id) { }"#,
         std::fs::write(tasks_dir.join("alpha.rhai"), "fn fetch(id) { #{} }").unwrap();
         std::fs::write(tasks_dir.join("beta.rhai"), "fn fetch(id) { #{} }").unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         // With empty config sources, discovers all installed resolvers
         let empty: Vec<String> = vec![];
@@ -1178,11 +1072,7 @@ fn abort(id) { }"#,
             r#"fn info(id) { #{ id: id, title: "T", status: "open", assignee: "bob" } }"#,
         ).unwrap();
 
-        let config = PluginsConfig {
-            dir: dir.path().display().to_string(),
-            disable: Vec::new(),
-        };
-        let mgr = PluginManager::new(&config).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
 
         let sources = vec!["no_info".to_string(), "has_info".to_string()];
         let ctx = PluginContext::default();

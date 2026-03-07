@@ -17,17 +17,6 @@ When you run `breq <name> [args...]`, breq checks for a matching command plugin 
 
 **Lazy loading**: Plugin metadata (descriptions, usage) is parsed from doc comments without compiling the Rhai AST. Compilation happens on demand — only when a plugin is actually executed.
 
-## Configuration
-
-```toml
-[plugins]
-# Directory for user plugin scripts (default: ~/.toren/plugins)
-dir = "~/.toren/plugins"
-
-# Disable specific plugins by name
-disable = ["abort"]
-```
-
 ## Writing command plugins
 
 Create a `.rhai` file in `~/.toren/plugins/commands/`. The filename (without extension) becomes the command name.

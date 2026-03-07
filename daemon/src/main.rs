@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
     plugin_manager.load_all()?;
 
     // Initialize Rhai plugin manager (shared with breq CLI)
-    let rhai_plugins = toren_lib::PluginManager::new(&config.plugins)?;
+    let rhai_plugins = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))?;
     info!(
         "Rhai plugins loaded: {:?}",
         rhai_plugins.list()
