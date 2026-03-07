@@ -295,7 +295,8 @@ fn main() -> Result<()> {
                         // Resolve segment from CWD for plugin context
                         let (seg_path, seg_name) = resolve_segment_for_plugin(&config);
 
-                        let ctx = toren_lib::PluginContext::new(seg_path, seg_name);
+                        let mut ctx = toren_lib::PluginContext::new(seg_path, seg_name);
+                        ctx.task_sources = config.tasks.sources.clone();
 
                         match plugin_mgr.run(subcmd, &plugin_args, ctx) {
                             Ok(toren_lib::PluginResult::Ok) => std::process::exit(0),
@@ -494,7 +495,6 @@ fn cmd_do(
         task_title_arg.as_deref(),
         task_url_arg.as_deref(),
         None, // prompt not known yet
-        &config.tasks.default_source,
     );
 
     // 1. System prompt from intent (optional, rendered as --append-system-prompt)
@@ -506,12 +506,16 @@ fn cmd_do(
 
         // Fetch task description if we have a task_id
         let task_description = inferred.task_id.as_ref().and_then(|id| {
-            let source = inferred.task_source.as_deref().unwrap_or(&config.tasks.default_source);
             let plugin_mgr = toren_lib::PluginManager::new(&config.plugins).ok()?;
             let ctx = toren_lib::PluginContext::new(Some(segment.path.clone()), Some(segment.name.clone()));
-            plugin_mgr.resolve_fetch(source, id, ctx)
-                .ok()
-                .and_then(|t| t.description)
+            if let Some(source) = inferred.task_source.as_deref() {
+                // Source is known (e.g., "beads:foo-123") — direct lookup
+                plugin_mgr.resolve_info(source, id, ctx).ok()
+            } else {
+                // Source unknown — search across all task plugins
+                let sources = plugin_mgr.effective_sources(&config.tasks.sources);
+                plugin_mgr.resolve_info_multi(&sources, id, ctx).ok()
+            }.and_then(|t| t.description)
         });
 
         // Build task context for template rendering
@@ -770,7 +774,6 @@ fn cmd_shell(
             task_title_arg.as_deref(),
             task_url_arg.as_deref(),
             None,
-            &config.tasks.default_source,
         );
 
         let source = if inferred.task_id.is_some() {

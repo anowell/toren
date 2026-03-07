@@ -443,10 +443,20 @@ async fn compute_composite_status(
     };
 
     let (task_status, task_assignee) = if let (Some(ref seg_path), Some(ref task_id)) = (&segment_path, &assignment.task_id) {
-        let source = assignment.task_source.as_deref().unwrap_or("beads");
         let ctx = toren_lib::PluginContext::new(Some(seg_path.clone()), None);
-        match state.rhai_plugins.resolve_info(source, task_id, ctx) {
-            Ok(info) => (info.status, info.assignee),
+        let result = if let Some(source) = assignment.task_source.as_deref() {
+            // Source is known — direct lookup
+            state.rhai_plugins.resolve_info(source, task_id, ctx)
+        } else {
+            // Source unknown — search across all task plugins
+            let sources = state.rhai_plugins.effective_sources(&state.config.tasks.sources);
+            state.rhai_plugins.resolve_info_multi(&sources, task_id, ctx)
+        };
+        match result {
+            Ok(info) => (
+                info.status.unwrap_or_else(|| "unknown".to_string()),
+                info.assignee.unwrap_or_default(),
+            ),
             Err(_) => ("unknown".to_string(), String::new()),
         }
     } else {
@@ -553,7 +563,7 @@ async fn assignments_create(
     let mut assignments = state.assignments.write().await;
 
     // Determine task ID - either from existing or create from prompt
-    let default_source = state.config.tasks.default_source.clone();
+    let default_source = state.config.tasks.default_source().to_string();
     let plugin_mgr = &state.rhai_plugins;
 
     let (task_id, original_prompt, task_title) = if let Some(ref prompt) = request.prompt {
@@ -591,10 +601,11 @@ async fn assignments_create(
 
         (new_task_id, Some(prompt.clone()), Some(title))
     } else if let Some(task_id) = request.task_id.clone() {
-        // Claim existing task
+        // Look up which source has this task, then claim it
+        let task_source = request.task_source.as_deref().unwrap_or(&default_source);
         let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
         plugin_mgr
-            .resolve_claim(&default_source, &task_id, "claude", ctx)
+            .resolve_claim(task_source, &task_id, "claude", ctx)
             .map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -602,12 +613,14 @@ async fn assignments_create(
                 )
             })?;
 
-        // Fetch task title for display
+        // Fetch task title for display — search across sources if needed
         let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
-        let title = plugin_mgr
-            .resolve_fetch(&default_source, &task_id, ctx)
-            .ok()
-            .map(|t| t.title);
+        let title = if let Some(source) = request.task_source.as_deref() {
+            plugin_mgr.resolve_info(source, &task_id, ctx).ok()
+        } else {
+            let sources = plugin_mgr.effective_sources(&state.config.tasks.sources);
+            plugin_mgr.resolve_info_multi(&sources, &task_id, ctx).ok()
+        }.map(|t| t.title);
 
         (task_id, None, title)
     } else {
@@ -1094,7 +1107,8 @@ async fn assignment_action(
         }
     };
 
-    let ctx = toren_lib::PluginContext::new(seg_path, seg_name);
+    let mut ctx = toren_lib::PluginContext::new(seg_path, seg_name);
+    ctx.task_sources = state.config.tasks.sources.clone();
 
     // Run plugin in a blocking task (Rhai execution is synchronous)
     let rhai_plugins = state.rhai_plugins.clone();

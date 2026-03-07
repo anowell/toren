@@ -25,9 +25,9 @@ pub use assignment_ops::{
 pub use agent::{Agent, AgentKind};
 pub use composite_status::CompositeStatus;
 pub use config::{Config, AncillariesConfig, IntentsConfig, PluginsConfig, TasksConfig, expand_path, expand_path_str, tilde_shorten};
-pub use plugins::{DeferredAction, PluginContext, PluginManager, PluginResult};
+pub use plugins::{DeferredAction, PluginContext, PluginManager, PluginMeta, PluginResult};
 pub use segments::{Segment, SegmentManager};
-pub use tasks::{generate_prompt, infer_task_fields, InferredTaskFields, Task};
+pub use tasks::{generate_prompt, infer_task_fields, InferredTaskFields, ResolvedTask};
 pub use workspace::{
     CleanupMode, CommitInfo, GitWorktreeBackend, JjBackend, RepoType, VcsBackend, WorkspaceManager,
     detect_repo_type,

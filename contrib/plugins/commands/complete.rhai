@@ -4,9 +4,7 @@
 ///
 /// 1. Resolves workspace to its active assignment
 /// 2. Cleans the workspace (auto-commit, push, kill processes)
-/// 3. Closes the task via source-specific CLI
-///
-/// Supported sources: beads, github, linear
+/// 3. Closes the task via its resolver plugin
 
 let ws = ARGS[0];
 
@@ -20,18 +18,5 @@ shell("breq", ["clean", ws, "--kill", "--push"]);
 
 // Close the task if we have a task ID
 if task_id != "" {
-    switch source {
-        "beads" => {
-            shell("bd", ["update", task_id, "--status", "closed"]);
-        },
-        "github" => {
-            shell("gh", ["issue", "close", task_id]);
-        },
-        "linear" => {
-            shell("linear", ["issue", "update", task_id, "--status", "Done"]);
-        },
-        _ => {
-            print(`Warning: unknown task source '${source}', skipping status update`);
-        },
-    }
+    task::complete(source, task_id);
 }

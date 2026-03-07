@@ -167,19 +167,41 @@ impl Default for PluginsConfig {
 /// Configuration for task tracking defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TasksConfig {
-    /// Default task source when an ID is provided but source isn't specified
-    #[serde(default = "default_task_source")]
-    pub default_source: String,
+    /// Ordered list of task sources to try when resolving.
+    /// Accepts old `default_source = "beads"` format for backwards compat.
+    #[serde(default = "default_task_sources", deserialize_with = "deserialize_sources", alias = "default_source")]
+    pub sources: Vec<String>,
 }
 
-fn default_task_source() -> String {
-    "beads".to_string()
+fn default_task_sources() -> Vec<String> {
+    vec![] // empty = auto-detect from installed task plugins
+}
+
+/// Accept both `sources = ["beads"]` (new) and `default_source = "beads"` (old).
+fn deserialize_sources<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SourcesCompat {
+        Multiple(Vec<String>),
+        Single(String),
+    }
+    match SourcesCompat::deserialize(d)? {
+        SourcesCompat::Multiple(v) => Ok(v),
+        SourcesCompat::Single(s) => Ok(vec![s]),
+    }
+}
+
+impl TasksConfig {
+    /// Primary source (first in list). Used where a single source is needed.
+    pub fn default_source(&self) -> &str {
+        self.sources.first().map(|s| s.as_str()).unwrap_or("beads")
+    }
 }
 
 impl Default for TasksConfig {
     fn default() -> Self {
         Self {
-            default_source: default_task_source(),
+            sources: default_task_sources(),
         }
     }
 }

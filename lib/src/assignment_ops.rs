@@ -325,7 +325,7 @@ pub fn prepare_resume(
             Some(opts.segment_path.to_path_buf()),
             Some(opts.segment_name.to_string()),
         );
-        match opts.plugin_mgr.resolve_fetch(source, task_id, ctx) {
+        match opts.plugin_mgr.resolve_info(source, task_id, ctx) {
             Ok(task) => task.title,
             Err(_) => {
                 // Task might be closed or not found, try to reclaim

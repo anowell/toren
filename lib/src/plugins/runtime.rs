@@ -6,11 +6,13 @@
 //! - `path::join`, `path::parent`, `path::filename`, `path::ext`
 //! - `toml::parse`
 //! - `http::get`, `http::post`, `http::put`, `http::patch`, `http::delete`
-//! - `toren::config`, `toren::task`, `toren::assignment`
+//! - `toren::config`, `toren::assignment`
+//! - `task::info`, `task::claim`, `task::complete`, `task::abort`, `task::create`
 //! - `ws::changes`
 //!
-//! Flat aliases (`json_parse`, `config`, `task`, `ancillary`, `ws_changes`,
-//! `shell_status`) are kept for backwards compatibility.
+//! Flat aliases (`task`, `claim_task`, `complete_task`, `abort_task`, `ancillary`,
+//! `config`, `ws_changes`, `json_parse`, `shell_status`) are kept for backwards
+//! compatibility.
 
 use anyhow::Result;
 use rhai::{Dynamic, Engine, Map, Module, Scope, AST};
@@ -47,7 +49,8 @@ pub fn create_engine(ctx: Arc<PluginContext>) -> Engine {
     engine.register_static_module("path", build_path_module().into());
     engine.register_static_module("toml", build_toml_module().into());
     engine.register_static_module("http", build_http_module().into());
-    engine.register_static_module("toren", build_toren_module());
+    engine.register_static_module("task", build_task_module(ctx.clone()));
+    engine.register_static_module("toren", build_toren_module(ctx.clone()));
     engine.register_static_module("ws", build_ws_module());
 
     // ── Flat aliases for backwards compat (DEPRECATED) ───────────────
@@ -714,32 +717,86 @@ fn http_with_body(method: &str, url: &str, opts: &Map) -> Result<Map, Box<rhai::
 /// Since Rhai's `set_native_fn` on Module doesn't support closures that capture state,
 /// we register these as flat functions and also build a static module for the
 /// non-capturing `toren::config`.
-fn build_toren_module() -> rhai::Shared<Module> {
-    // Only config can be a true static module fn (no captures needed)
+fn build_toren_module(ctx: Arc<PluginContext>) -> rhai::Shared<Module> {
     let mut module = Module::new();
+
     module.set_native_fn("config", |key: &str| -> Result<String, Box<rhai::EvalAltResult>> {
         config_impl(key)
     });
+
+    let assign_ctx = ctx.clone();
+    module.set_native_fn("assignment", move |workspace: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
+        assignment_impl(workspace, &assign_ctx)
+    });
+
     module.into()
 }
 
-/// Register context-dependent toren and ws functions directly on the engine.
+fn build_task_module(ctx: Arc<PluginContext>) -> rhai::Shared<Module> {
+    let mut module = Module::new();
+
+    let info_ctx = ctx.clone();
+    module.set_native_fn("info", move |id: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
+        task_impl(id, &info_ctx)
+    });
+
+    let claim_ctx = ctx.clone();
+    module.set_native_fn("claim", move |source: &str, id: &str, assignee: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+        claim_task_impl(source, id, assignee, &claim_ctx)
+    });
+
+    let complete_ctx = ctx.clone();
+    module.set_native_fn("complete", move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+        complete_task_impl(source, id, &complete_ctx)
+    });
+
+    let abort_ctx = ctx.clone();
+    module.set_native_fn("abort", move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+        abort_task_impl(source, id, &abort_ctx)
+    });
+
+    let create_ctx = ctx.clone();
+    module.set_native_fn("create", move |source: &str, title: &str, desc: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+        create_task_impl(source, title, Some(desc), &create_ctx)
+    });
+
+    let create_no_desc_ctx = ctx;
+    module.set_native_fn("create", move |source: &str, title: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+        create_task_impl(source, title, None, &create_no_desc_ctx)
+    });
+
+    module.into()
+}
+
+/// Register context-dependent flat aliases (DEPRECATED — use task:: and toren:: modules).
 fn register_ctx_flat_aliases(engine: &mut Engine, ctx: Arc<PluginContext>) {
-    // task(id) -> Map — flat alias for backwards compat
     let task_ctx = ctx.clone();
     engine.register_fn("task", move |id: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
         task_impl(id, &task_ctx)
     });
 
-    // ancillary(workspace) -> Map — flat alias for backwards compat
     let assign_ctx = ctx.clone();
     engine.register_fn("ancillary", move |workspace: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
         assignment_impl(workspace, &assign_ctx)
     });
 
-    // ws_changes(workspace) -> Array — flat alias for backwards compat
+    let ws_ctx = ctx.clone();
     engine.register_fn("ws_changes", move |workspace: &str| -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
-        ws_changes_impl(workspace, &ctx)
+        ws_changes_impl(workspace, &ws_ctx)
+    });
+
+    let claim_ctx = ctx.clone();
+    engine.register_fn("claim_task", move |source: &str, id: &str, assignee: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+        claim_task_impl(source, id, assignee, &claim_ctx)
+    });
+
+    let complete_ctx = ctx.clone();
+    engine.register_fn("complete_task", move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+        complete_task_impl(source, id, &complete_ctx)
+    });
+
+    engine.register_fn("abort_task", move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+        abort_task_impl(source, id, &ctx)
     });
 }
 
@@ -755,6 +812,11 @@ fn build_ws_module() -> rhai::Shared<Module> {
 fn config_impl(key: &str) -> Result<String, Box<rhai::EvalAltResult>> {
     let config = crate::Config::load()
         .map_err(|e| format!("Failed to load config: {}", e))?;
+
+    // Virtual key for backwards compat: tasks.default_source -> first element of sources
+    if key == "tasks.default_source" {
+        return Ok(config.tasks.default_source().to_string());
+    }
 
     let json_value = serde_json::to_value(&config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
@@ -791,45 +853,58 @@ fn task_impl(id: &str, ctx: &PluginContext) -> Result<Map, Box<rhai::EvalAltResu
         None,
         None,
         None,
-        &config.tasks.default_source,
     );
 
-    // Try resolver if available
-    let fetched = if let (Some(ref source), Some(ref task_id)) =
-        (&inferred.task_source, &inferred.task_id)
-    {
-        if let Some(resolver_ast) = ctx.resolvers.get(source.as_str()) {
-            // Call resolver's fetch(id) function
-            let resolver_ctx = Arc::new(PluginContext::default());
-            let engine = super::runtime::create_resolver_engine(resolver_ctx);
-            let mut scope = Scope::new();
-            engine
-                .call_fn::<Dynamic>(&mut scope, resolver_ast, "fetch", (task_id.clone(),))
-                .ok()
-                .and_then(|d| d.try_cast::<Map>())
-                .map(|m| crate::tasks::Task {
-                    id: m
-                        .get("id")
-                        .and_then(|v| v.clone().into_string().ok())
-                        .unwrap_or_else(|| task_id.clone()),
-                    title: m
-                        .get("title")
-                        .and_then(|v| v.clone().into_string().ok())
-                        .unwrap_or_default(),
-                    description: m
-                        .get("description")
-                        .and_then(|v| {
-                            if v.is::<()>() {
-                                None
-                            } else {
-                                v.clone().into_string().ok()
-                            }
-                        }),
-                    source: source.clone(),
-                })
+    // Try to fetch task via resolver
+    let fetched = if let Some(ref task_id) = inferred.task_id {
+        // Determine which sources to try
+        let sources_to_try: Vec<String> = if let Some(ref explicit_source) = inferred.task_source {
+            vec![explicit_source.clone()]
+        } else if !ctx.task_sources.is_empty() {
+            ctx.task_sources.clone()
+        } else if !config.tasks.sources.is_empty() {
+            config.tasks.sources.clone()
         } else {
-            None
+            // Auto-detect: try all available resolvers
+            ctx.resolvers.keys().cloned().collect()
+        };
+
+        // Try each source's resolver until one succeeds
+        let mut result = None;
+        for source in &sources_to_try {
+            if let Some(resolver_ast) = ctx.resolvers.get(source.as_str()) {
+                let resolver_ctx = Arc::new(PluginContext::default());
+                let engine = super::runtime::create_resolver_engine(resolver_ctx);
+                let mut scope = Scope::new();
+                if let Some(task) = engine
+                    .call_fn::<Dynamic>(&mut scope, resolver_ast, "info", (task_id.clone(),))
+                    .ok()
+                    .and_then(|d| d.try_cast::<Map>())
+                    .map(|m| {
+                        let get_opt = |key: &str| -> Option<String> {
+                            m.get(key).and_then(|v| {
+                                if v.is::<()>() { None } else { v.clone().into_string().ok() }
+                            })
+                        };
+                        crate::tasks::ResolvedTask {
+                            id: get_opt("id").unwrap_or_else(|| task_id.clone()),
+                            source: source.clone(),
+                            kind: get_opt("kind"),
+                            title: get_opt("title").unwrap_or_default(),
+                            status: get_opt("status"),
+                            assignee: get_opt("assignee"),
+                            description: get_opt("description"),
+                            created_at: get_opt("created_at"),
+                            updated_at: get_opt("updated_at"),
+                        }
+                    })
+                {
+                    result = Some(task);
+                    break;
+                }
+            }
         }
+        result
     } else {
         None
     };
@@ -848,10 +923,91 @@ fn task_impl(id: &str, ctx: &PluginContext) -> Result<Map, Box<rhai::EvalAltResu
     if let Some(url) = inferred.task_url {
         map.insert("url".into(), Dynamic::from(url));
     }
-    if let Some(source) = inferred.task_source {
+    // Use source from fetched task (which was resolved) or inferred
+    let source = fetched.as_ref().map(|t| t.source.clone()).or(inferred.task_source);
+    if let Some(source) = source {
         map.insert("source".into(), Dynamic::from(source));
     }
+    if let Some(status) = fetched.as_ref().and_then(|t| t.status.clone()) {
+        map.insert("status".into(), Dynamic::from(status));
+    }
+    if let Some(assignee) = fetched.as_ref().and_then(|t| t.assignee.clone()) {
+        map.insert("assignee".into(), Dynamic::from(assignee));
+    }
+    if let Some(kind) = fetched.as_ref().and_then(|t| t.kind.clone()) {
+        map.insert("kind".into(), Dynamic::from(kind));
+    }
     Ok(map)
+}
+
+fn call_resolver_void(
+    source: &str,
+    fn_name: &str,
+    args: impl rhai::FuncArgs,
+    ctx: &PluginContext,
+) -> Result<(), Box<rhai::EvalAltResult>> {
+    let resolver_ast = ctx
+        .resolvers
+        .get(source)
+        .ok_or_else(|| format!("No task resolver found for source '{}'", source))?;
+
+    let resolver_ctx = Arc::new(PluginContext::default());
+    let engine = super::runtime::create_resolver_engine(resolver_ctx);
+    let mut scope = Scope::new();
+    let _ = engine
+        .call_fn::<Dynamic>(&mut scope, resolver_ast, fn_name, args)
+        .map_err(|e| format!("Resolver '{}' {}() failed: {}", source, fn_name, e))?;
+    Ok(())
+}
+
+fn claim_task_impl(
+    source: &str,
+    id: &str,
+    assignee: &str,
+    ctx: &PluginContext,
+) -> Result<(), Box<rhai::EvalAltResult>> {
+    call_resolver_void(source, "claim", (id.to_string(), assignee.to_string()), ctx)
+}
+
+fn complete_task_impl(
+    source: &str,
+    id: &str,
+    ctx: &PluginContext,
+) -> Result<(), Box<rhai::EvalAltResult>> {
+    call_resolver_void(source, "complete", (id.to_string(),), ctx)
+}
+
+fn abort_task_impl(
+    source: &str,
+    id: &str,
+    ctx: &PluginContext,
+) -> Result<(), Box<rhai::EvalAltResult>> {
+    call_resolver_void(source, "abort", (id.to_string(),), ctx)
+}
+
+fn create_task_impl(
+    source: &str,
+    title: &str,
+    desc: Option<&str>,
+    ctx: &PluginContext,
+) -> Result<String, Box<rhai::EvalAltResult>> {
+    let resolver_ast = ctx
+        .resolvers
+        .get(source)
+        .ok_or_else(|| format!("No task resolver found for source '{}'", source))?;
+
+    let resolver_ctx = Arc::new(PluginContext::default());
+    let engine = super::runtime::create_resolver_engine(resolver_ctx);
+    let mut scope = Scope::new();
+
+    let desc_arg = match desc {
+        Some(d) => Dynamic::from(d.to_string()),
+        None => Dynamic::UNIT,
+    };
+    let result = engine
+        .call_fn::<Dynamic>(&mut scope, resolver_ast, "create", (title.to_string(), desc_arg))
+        .map_err(|e| format!("Resolver '{}' create() failed: {}", source, e))?;
+    Ok(result.into_string().unwrap_or_default())
 }
 
 fn assignment_impl(workspace: &str, ctx: &PluginContext) -> Result<Map, Box<rhai::EvalAltResult>> {

@@ -1,12 +1,4 @@
-/// @resolver
 /// Beads task tracking. Resolves tasks via the `bd` CLI.
-
-fn fetch(id) {
-    let result = shell("bd", ["show", id, "--json"]);
-    let beads = json::parse(result);
-    let bead = beads[0];
-    #{ id: bead.id, title: bead.title, description: bead.description }
-}
 
 fn info(id) {
     let result = shell("bd", ["show", id, "--json"]);
@@ -14,7 +6,7 @@ fn info(id) {
     let bead = beads[0];
     let status = if bead.status != () { bead.status } else { "open" };
     let assignee = if bead.assignee != () { bead.assignee } else { "" };
-    #{ id: bead.id, title: bead.title, status: status, assignee: assignee }
+    #{ id: bead.id, title: bead.title, status: status, assignee: assignee, description: bead.description }
 }
 
 fn claim(id, assignee) {
