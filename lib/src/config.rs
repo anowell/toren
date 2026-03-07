@@ -136,8 +136,9 @@ impl IntentsConfig {
 impl Default for IntentsConfig {
     fn default() -> Self {
         let mut entries = HashMap::new();
-        entries.insert("act".to_string(), default_intent_act());
-        entries.insert("plan".to_string(), default_intent_plan());
+        entries.insert("debug".to_string(), default_intent_debug());
+        entries.insert("design".to_string(), default_intent_design());
+        entries.insert("implement".to_string(), default_intent_implement());
         entries.insert("review".to_string(), default_intent_review());
         Self { entries }
     }
@@ -148,7 +149,11 @@ impl Default for IntentsConfig {
 pub struct TasksConfig {
     /// Ordered list of task sources to try when resolving.
     /// Accepts old `default_source = "beads"` format for backwards compat.
-    #[serde(default = "default_task_sources", deserialize_with = "deserialize_sources", alias = "default_source")]
+    #[serde(
+        default = "default_task_sources",
+        deserialize_with = "deserialize_sources",
+        alias = "default_source"
+    )]
     pub sources: Vec<String>,
 }
 
@@ -185,21 +190,30 @@ impl Default for TasksConfig {
     }
 }
 
-fn default_intent_act() -> String {
-    "Implement {{ task.source }} {{ task.id }}: {{ task.title }}\n\n\
-     Complete the task as specified. When done, summarize changes."
+fn default_intent_debug() -> String {
+    "Focus on root cause analysis, not fixing. Reproduce the issue — a failing test is ideal. \
+     Trace from symptom to cause, identify contributing factors, then suggest fix options with \
+     a clear recommendation. Document findings as a task comment."
         .to_string()
 }
 
-fn default_intent_plan() -> String {
-    "Design an approach for {{ task.source }} {{ task.id }}: {{ task.title }}\n\n\
-     Investigate the codebase, explore options, and propose a design."
+fn default_intent_design() -> String {
+    "Act as architect. Investigate the codebase, then propose a design — not code. \
+     Identify impact surface, risks, and open questions that need human input. \
+     Write the proposal to the task's design field."
+        .to_string()
+}
+
+fn default_intent_implement() -> String {
+    "Implement the task. Prove it works with high value tests. Ensure clean build and lints. \
+     Keep changes minimal and focused. When done, summarize changes as a task comment."
         .to_string()
 }
 
 fn default_intent_review() -> String {
-    "Review the implementation of {{ task.source }} {{ task.id }}: {{ task.title }}\n\n\
-     Verify completeness, check for issues, and assess confidence."
+    "You are NOT the implementer — review with fresh eyes. Check correctness against \
+     requirements, look for bugs and edge cases, assess test coverage. Categorize issues \
+     as critical/important/suggestion. Comment on task with findings and an overall confidence for shipping."
         .to_string()
 }
 

@@ -19,8 +19,13 @@ let t = task::info(task_id);
 
 // Claim the task via its resolver
 if t.source != () {
-    let assignee = toren::config("agent.name");
-    task::claim(t.source, t.id, assignee);
+    task::claim(t.source, t.id, "claude");
+}
+
+// Build prompt with task context
+let prompt = `${t.source} ${t.id}: ${t.title}`;
+if t.description != () {
+    prompt += "\n\n" + t.description;
 }
 
 // Return deferred action to start a coding agent session
@@ -28,10 +33,8 @@ let result = #{
     action: "do",
     task_id: t.id,
     task_title: t.title,
+    prompt: prompt,
 };
-if t.description != () {
-    result.prompt = t.description;
-}
 if t.url != () {
     result.task_url = t.url;
 }

@@ -41,20 +41,15 @@ default_model = "claude-sonnet-4-5-20250929"
 # Pool size for ancillaries per segment
 pool_size = 10
 
-# Intent-specific prompt templates (rendered with minijinja)
-# Available template variables: task.id, task.title, ws.name, ws.num, ws.path, repo.root, repo.name
-[intents]
-act = """Implement bead {{ task.id }}: {{ task.title }}
-
-Complete the task as specified. When done, summarize changes in a bead comment."""
-
-plan = """Design an approach for bead {{ task.id }}: {{ task.title }}
-
-Investigate the codebase, explore options, and propose a design. Update the bead's design field with your proposal."""
-
-review = """Review the implementation of bead {{ task.id }}: {{ task.title }}
-
-Verify completeness, check for issues, and assess confidence. Add review comments to the bead."""
+# Intent templates: workflow guidance appended as system prompt via --append-system-prompt.
+# Omitting -i/--intent passes only the user prompt with no additional system prompt.
+# Built-in intents (debug, design, implement, review) are used if not overridden here.
+# Available template variables: task.id, task.title, task.description, task.source, ws.name, ws.num, ws.path, repo.root, repo.name
+# [intents]
+# debug = "Focus on root cause analysis, not fixing. ..."
+# design = "Act as architect. Investigate the codebase, then propose a design — not code. ..."
+# implement = "Implement the task. Prove it works — tests should pass, lints should be clean. ..."
+# review = "You are NOT the implementer — review with fresh eyes. ..."
 
 [security]
 # Whether to require authentication
