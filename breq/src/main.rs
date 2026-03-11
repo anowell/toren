@@ -367,6 +367,7 @@ fn main() -> Result<()> {
             task_id,
             task_title,
             task_url,
+            None, // task_source inferred from task_id prefix or plugin resolution
             segment.as_deref(),
             agent,
             passthrough,
@@ -444,6 +445,7 @@ fn execute_deferred_action(config: &Config, action: toren_lib::DeferredAction) -
             task_id,
             task_title,
             task_url,
+            task_source,
             prompt,
             intent,
         } => {
@@ -455,6 +457,7 @@ fn execute_deferred_action(config: &Config, action: toren_lib::DeferredAction) -
                 task_id,
                 task_title,
                 task_url,
+                task_source,
                 None,       // segment (resolve from CWD)
                 None,       // agent (use config/auto-detect)
                 Vec::new(), // passthrough
@@ -474,6 +477,7 @@ fn cmd_do(
     task_id_arg: Option<String>,
     task_title_arg: Option<String>,
     task_url_arg: Option<String>,
+    task_source_arg: Option<String>,
     segment_name: Option<&str>,
     agent_str: Option<String>,
     passthrough: Vec<String>,
@@ -488,12 +492,35 @@ fn cmd_do(
     let segment = resolve_segment(&segment_mgr, segment_name)?;
 
     // Infer task fields from CLI args
-    let inferred = toren_lib::infer_task_fields(
+    let mut inferred = toren_lib::infer_task_fields(
         task_id_arg.as_deref(),
         task_title_arg.as_deref(),
         task_url_arg.as_deref(),
         None, // prompt not known yet
     );
+
+    // Explicit task_source_arg (from deferred action) takes priority over inferred
+    if task_source_arg.is_some() && inferred.task_source.is_none() {
+        inferred.task_source = task_source_arg;
+    }
+
+    // Resolve task_source from plugins when we have a task_id but no source.
+    // This discovers the source once so downstream operations (complete/abort/resume)
+    // never need to search across plugins.
+    if inferred.task_id.is_some() && inferred.task_source.is_none() {
+        if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")) {
+            let sources = plugin_mgr.effective_sources(&config.tasks.sources);
+            if let Some(ref task_id) = inferred.task_id {
+                let ctx = toren_lib::PluginContext::new(Some(segment.path.clone()), Some(segment.name.clone()));
+                if let Ok(task) = plugin_mgr.resolve_info_multi(&sources, task_id, ctx) {
+                    inferred.task_source = Some(task.source);
+                    if inferred.task_title.is_none() {
+                        inferred.task_title = Some(task.title);
+                    }
+                }
+            }
+        }
+    }
 
     // 1. System prompt from intent (optional, rendered as --append-system-prompt)
     let system_prompt = if let Some(ref intent_name) = intent {
@@ -507,7 +534,7 @@ fn cmd_do(
             let plugin_mgr = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")).ok()?;
             let ctx = toren_lib::PluginContext::new(Some(segment.path.clone()), Some(segment.name.clone()));
             if let Some(source) = inferred.task_source.as_deref() {
-                // Source is known (e.g., "beads:foo-123") — direct lookup
+                // Source is known (e.g., "runes:foo-123") — direct lookup
                 plugin_mgr.resolve_info(source, id, ctx).ok()
             } else {
                 // Source unknown — search across all task plugins

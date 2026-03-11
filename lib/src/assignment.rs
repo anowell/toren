@@ -101,7 +101,7 @@ pub struct Assignment {
     /// Task URL (e.g., link to issue tracker)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_url: Option<String>,
-    /// Task source (e.g., "beads", "github")
+    /// Task source (e.g., "runes", "github")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_source: Option<String>,
     /// Claude session ID for cross-interface handoff (breq <-> toren)

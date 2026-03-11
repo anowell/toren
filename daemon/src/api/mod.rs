@@ -487,7 +487,7 @@ struct CreateAssignmentRequest {
     /// Task URL
     #[serde(default)]
     task_url: Option<String>,
-    /// Task source (e.g., "beads")
+    /// Task source (e.g., "runes")
     #[serde(default)]
     task_source: Option<String>,
     /// Segment name
@@ -563,11 +563,17 @@ async fn assignments_create(
     let mut assignments = state.assignments.write().await;
 
     // Determine task ID - either from existing or create from prompt
-    let default_source = state.config.tasks.default_source().to_string();
     let plugin_mgr = &state.rhai_plugins;
 
-    let (task_id, original_prompt, task_title) = if let Some(ref prompt) = request.prompt {
-        // Create task from prompt
+    let (task_id, original_prompt, task_title, resolved_source) = if let Some(ref prompt) = request.prompt {
+        // Create task from prompt — requires a task source
+        let create_source = request.task_source.clone()
+            .or_else(|| state.config.tasks.default_source().map(|s| s.to_string()))
+            .ok_or_else(|| (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "task_source required when creating from prompt (no default configured)"})),
+            ))?;
+
         let title = request.task_title.clone().unwrap_or_else(|| {
             prompt
                 .lines()
@@ -580,7 +586,7 @@ async fn assignments_create(
 
         let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
         let new_task_id = plugin_mgr
-            .resolve_create(&default_source, &title, Some(prompt), ctx)
+            .resolve_create(&create_source, &title, Some(prompt), ctx)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -591,7 +597,7 @@ async fn assignments_create(
         // Claim the newly created task
         let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
         plugin_mgr
-            .resolve_claim(&default_source, &new_task_id, "claude", ctx)
+            .resolve_claim(&create_source, &new_task_id, "claude", ctx)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -599,30 +605,37 @@ async fn assignments_create(
                 )
             })?;
 
-        (new_task_id, Some(prompt.clone()), Some(title))
+        (new_task_id, Some(prompt.clone()), Some(title), Some(create_source))
     } else if let Some(task_id) = request.task_id.clone() {
         // Look up which source has this task, then claim it
-        let task_source = request.task_source.as_deref().unwrap_or(&default_source);
-        let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
-        plugin_mgr
-            .resolve_claim(task_source, &task_id, "claude", ctx)
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("Failed to claim task: {}", e)})),
-                )
-            })?;
+        let task_source = request.task_source.as_deref()
+            .or_else(|| state.config.tasks.default_source());
+        if let Some(source) = task_source {
+            let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
+            plugin_mgr
+                .resolve_claim(source, &task_id, "claude", ctx)
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("Failed to claim task: {}", e)})),
+                    )
+                })?;
+        }
 
         // Fetch task title for display — search across sources if needed
         let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
-        let title = if let Some(source) = request.task_source.as_deref() {
-            plugin_mgr.resolve_info(source, &task_id, ctx).ok()
+        let (title, discovered_source) = if let Some(source) = request.task_source.as_deref() {
+            let title = plugin_mgr.resolve_info(source, &task_id, ctx).ok().map(|t| t.title);
+            (title, Some(source.to_string()))
         } else {
             let sources = plugin_mgr.effective_sources(&state.config.tasks.sources);
-            plugin_mgr.resolve_info_multi(&sources, &task_id, ctx).ok()
-        }.map(|t| t.title);
+            match plugin_mgr.resolve_info_multi(&sources, &task_id, ctx) {
+                Ok(task) => (Some(task.title.clone()), Some(task.source)),
+                Err(_) => (None, state.config.tasks.default_source().map(|s| s.to_string())),
+            }
+        };
 
-        (task_id, None, title)
+        (task_id, None, title, discovered_source)
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -662,9 +675,6 @@ async fn assignments_create(
             )
         })?;
 
-    // Infer task source (default to "beads" if not specified)
-    let task_source = request.task_source.as_deref().unwrap_or("beads");
-
     // Create assignment
     let source = if let Some(prompt) = original_prompt {
         toren_lib::AssignmentSource::Prompt {
@@ -684,7 +694,7 @@ async fn assignments_create(
             task_title,
             base_branch,
             request.task_url.as_deref(),
-            Some(task_source),
+            resolved_source.as_deref(),
         )
         .map_err(|e| {
             (
@@ -1135,6 +1145,7 @@ async fn assignment_action(
                     task_id,
                     task_title,
                     task_url,
+                    task_source,
                     prompt,
                     intent,
                 } => serde_json::json!({
@@ -1142,6 +1153,7 @@ async fn assignment_action(
                     "task_id": task_id,
                     "task_title": task_title,
                     "task_url": task_url,
+                    "task_source": task_source,
                     "prompt": prompt,
                     "intent": intent,
                 }),

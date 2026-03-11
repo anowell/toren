@@ -11,7 +11,7 @@ pub struct InferredTaskFields {
 /// Infer task fields from an ID, URL, or prompt.
 ///
 /// Supports:
-/// - `source:id` prefix splitting on first `:` (e.g., "beads:breq-abc")
+/// - `source:id` prefix splitting on first `:` (e.g., "runes:task-abc")
 /// - URL → task_id extraction (last path segment)
 /// - prompt → task_title (first 120 chars of first line)
 ///
@@ -76,7 +76,7 @@ pub fn infer_task_fields(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedTask {
     pub id: String,
-    /// Source name (e.g., "beads", "runes", "linear").
+    /// Source name (e.g., "runes", "linear").
     pub source: String,
     /// Task kind (e.g., "bug", "task", "feature").
     #[serde(skip_serializing_if = "Option::is_none")]

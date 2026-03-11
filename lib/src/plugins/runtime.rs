@@ -131,6 +131,7 @@ pub fn interpret_result(value: Dynamic) -> Result<PluginResult> {
                     task_id: get_str("task_id"),
                     task_title: get_str("task_title"),
                     task_url: get_str("task_url"),
+                    task_source: get_str("task_source"),
                     prompt: get_str("prompt"),
                     intent: get_str("intent"),
                 }));
@@ -815,7 +816,7 @@ fn config_impl(key: &str) -> Result<String, Box<rhai::EvalAltResult>> {
 
     // Virtual key for backwards compat: tasks.default_source -> first element of sources
     if key == "tasks.default_source" {
-        return Ok(config.tasks.default_source().to_string());
+        return Ok(config.tasks.default_source().unwrap_or_default().to_string());
     }
 
     let json_value = serde_json::to_value(&config)
@@ -1225,10 +1226,9 @@ mod tests {
     fn test_config_via_engine() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        // tasks.default_source should always exist
+        // tasks.default_source returns empty string when no sources configured
         let ast = engine.compile(r#"config("tasks.default_source")"#).unwrap();
-        let result: String = engine.eval_ast(&ast).unwrap();
-        assert!(!result.is_empty());
+        let _result: String = engine.eval_ast(&ast).unwrap();
     }
 
     #[test]
@@ -1485,9 +1485,9 @@ mod tests {
     fn test_toren_config_module() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
+        // tasks.default_source returns empty string when no sources configured
         let ast = engine.compile(r#"toren::config("tasks.default_source")"#).unwrap();
-        let result: String = engine.eval_ast(&ast).unwrap();
-        assert!(!result.is_empty());
+        let _result: String = engine.eval_ast(&ast).unwrap();
     }
 
     #[test]

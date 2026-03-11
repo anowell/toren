@@ -33,8 +33,9 @@ host = "127.0.0.1"
 port = 8787
 
 [tasks]
-# Default task source when an ID is provided without a source prefix (e.g., "beads:breq-abc")
-default_source = "beads"
+# Default task source for creating tasks or when an ID has no source prefix.
+# If omitted, auto-detects from installed task plugins.
+# default_source = "beads"
 
 [intents]
 # Named prompt templates for breq do -i <name>.
@@ -84,7 +85,7 @@ Only used by the toren daemon. Ignored by breq.
 
 ### `[tasks]`
 
-**`default_source`** — The default task source used when an ID is provided without a `source:id` prefix. Defaults to `"beads"`. When you run `breq do --task-id my-task`, the source is set to this value. To override, use the prefix syntax: `breq do --task-id linear:ENG-123`.
+**`default_source`** — The default task source used when creating tasks or when an ID is provided without a `source:id` prefix. If not set, toren auto-detects from installed task plugins. To override, use the prefix syntax: `breq do --task-id linear:ENG-123`.
 
 ### `[intents]`
 

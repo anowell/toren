@@ -220,10 +220,9 @@ pub fn complete_assignment(
     )?;
     assignment_mgr.remove(&assignment.id)?;
 
-    // Close task unless keep_task_open (only if task_id is present)
+    // Close task unless keep_task_open (only if task_id and task_source are present)
     if !opts.keep_task_open {
-        if let Some(ref task_id) = assignment.task_id {
-            let source = assignment.task_source.as_deref().unwrap_or("beads");
+        if let (Some(ref task_id), Some(ref source)) = (&assignment.task_id, &assignment.task_source) {
             let ctx = crate::PluginContext::new(
                 Some(opts.segment_path.to_path_buf()),
                 None,
@@ -258,9 +257,8 @@ pub fn abort_assignment(
     assignment_mgr.record_completion(assignment, CompletionReason::Aborted, None)?;
     assignment_mgr.remove(&assignment.id)?;
 
-    // Handle task status (only if task_id is present)
-    if let Some(ref task_id) = assignment.task_id {
-        let source = assignment.task_source.as_deref().unwrap_or("beads");
+    // Handle task status (only if task_id and task_source are present)
+    if let (Some(ref task_id), Some(ref source)) = (&assignment.task_id, &assignment.task_source) {
         let ctx = crate::PluginContext::new(
             Some(opts.segment_path.to_path_buf()),
             None,
@@ -318,9 +316,8 @@ pub fn prepare_resume(
     // Touch updated_at timestamp (assignment is always Active)
     assignment_mgr.touch(&assignment.id)?;
 
-    // Ensure task is in_progress and assigned to claude (if task_id present)
-    let task_title = if let Some(ref task_id) = assignment.task_id {
-        let source = assignment.task_source.as_deref().unwrap_or("beads");
+    // Ensure task is in_progress and assigned to claude (if task_id and task_source present)
+    let task_title = if let (Some(ref task_id), Some(ref source)) = (&assignment.task_id, &assignment.task_source) {
         let ctx = crate::PluginContext::new(
             Some(opts.segment_path.to_path_buf()),
             Some(opts.segment_name.to_string()),

@@ -106,6 +106,7 @@ pub enum DeferredAction {
         task_id: Option<String>,
         task_title: Option<String>,
         task_url: Option<String>,
+        task_source: Option<String>,
         prompt: Option<String>,
         intent: Option<String>,
     },

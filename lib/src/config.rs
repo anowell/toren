@@ -148,7 +148,7 @@ impl Default for IntentsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TasksConfig {
     /// Ordered list of task sources to try when resolving.
-    /// Accepts old `default_source = "beads"` format for backwards compat.
+    /// Accepts old `default_source = "myresolver"` format for backwards compat.
     #[serde(
         default = "default_task_sources",
         deserialize_with = "deserialize_sources",
@@ -161,7 +161,7 @@ fn default_task_sources() -> Vec<String> {
     vec![] // empty = auto-detect from installed task plugins
 }
 
-/// Accept both `sources = ["beads"]` (new) and `default_source = "beads"` (old).
+/// Accept both `sources = ["mysource"]` (new) and `default_source = "mysource"` (old).
 fn deserialize_sources<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -176,9 +176,10 @@ fn deserialize_sources<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Str
 }
 
 impl TasksConfig {
-    /// Primary source (first in list). Used where a single source is needed.
-    pub fn default_source(&self) -> &str {
-        self.sources.first().map(|s| s.as_str()).unwrap_or("beads")
+    /// Primary source (first in list), if configured.
+    /// Returns `None` when sources is empty (auto-detect from installed plugins).
+    pub fn default_source(&self) -> Option<&str> {
+        self.sources.first().map(|s| s.as_str())
     }
 }
 

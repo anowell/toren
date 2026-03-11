@@ -67,7 +67,7 @@ pub struct TaskInfo {
     /// Task URL (e.g., link to issue tracker)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Task source (e.g., "beads", "github")
+    /// Task source (e.g., "runes", "github")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
