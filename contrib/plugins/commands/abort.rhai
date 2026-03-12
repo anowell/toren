@@ -13,10 +13,16 @@ let info = toren::assignment(ws);
 let task_id = info.task_id;
 let source = if info.task_source != "" { info.task_source } else { toren::config("tasks.default_source") };
 
+// Discover source from task resolvers if still unknown
+if source == "" && task_id != "" {
+    let resolved = task::info(task_id);
+    if resolved.contains("source") { source = resolved.source; }
+}
+
 // Clean workspace with kill (no push)
 shell("breq", ["clean", ws, "--kill"]);
 
-// Reopen the task if we have a task ID
-if task_id != "" {
+// Reopen the task if we have a task ID and source
+if task_id != "" && source != "" {
     task::abort(source, task_id);
 }

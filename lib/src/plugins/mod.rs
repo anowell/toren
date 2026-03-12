@@ -625,7 +625,7 @@ mod tests {
         }
 
         // Resolvers are in tasks/ subdir
-        for name in &["beads"] {
+        for name in &["beads", "github", "linear"] {
             let path = contrib_dir.join(format!("tasks/{}.rhai", name));
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|_| panic!("Failed to read {}", path.display()));
