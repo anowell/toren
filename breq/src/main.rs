@@ -60,7 +60,7 @@ enum Commands {
         #[arg(short, long)]
         prompt: Option<String>,
 
-        /// Intent template to use (e.g., "act", "plan", "review")
+        /// Intent-specific system prompt (see available intents below)
         #[arg(short, long)]
         intent: Option<String>,
 
@@ -225,6 +225,25 @@ fn main() -> Result<()> {
         if subcmd_idx < raw_args.len() {
             let subcmd = &raw_args[subcmd_idx];
             let plugin_args: Vec<String> = raw_args[subcmd_idx + 1..].to_vec();
+
+            // `breq do --help`: inject available intents into help text
+            if subcmd == "do" && plugin_args.iter().any(|a| a == "--help" || a == "-h") {
+                if let Ok(config) = Config::load() {
+                    let mut intent_names: Vec<&str> = config.intents.entries.keys().map(|s| s.as_str()).collect();
+                    intent_names.sort();
+                    let intent_list = intent_names.join(", ");
+                    let section = format!("Available intents:\n  {}", intent_list);
+                    Cli::command()
+                        .find_subcommand_mut("do")
+                        .expect("do subcommand exists")
+                        .clone()
+                        .after_help(section)
+                        .print_help()
+                        .ok();
+                    std::process::exit(0);
+                }
+                // Fall through to normal clap help if config fails
+            }
 
             // Top-level help: inject plugin descriptions
             if subcmd == "--help" || subcmd == "-h" {
