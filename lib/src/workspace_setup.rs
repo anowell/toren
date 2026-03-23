@@ -15,7 +15,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 use tracing::{debug, info, trace, warn};
 
 const TOREN_CONFIG_FILE: &str = "toren.kdl";
@@ -726,7 +727,7 @@ impl WorkspaceSetup {
         fs::write(&dest_path, rendered)
             .with_context(|| format!("Failed to write: {}", dest_path.display()))?;
 
-        info!("  template: {} -> {}", src, dest);
+        eprintln!("[setup:template] creating {}", dest);
         Ok(())
     }
 
@@ -763,7 +764,7 @@ impl WorkspaceSetup {
             )
         })?;
 
-        info!("  copy: {} -> {}", src_path.display(), dest);
+        eprintln!("[setup:copy] creating {}", dest);
         Ok(())
     }
 
@@ -796,7 +797,7 @@ impl WorkspaceSetup {
                 }
             }
             // Stale or wrong symlink (or regular file/dir) - remove it
-            info!(
+            debug!(
                 "  share: removing stale entry at {}",
                 dest_path.display()
             );
@@ -833,7 +834,7 @@ impl WorkspaceSetup {
             })?;
         }
 
-        info!("  share: {} -> {}", dest_path.display(), src_path.display());
+        eprintln!("[setup:share] creating {}", src);
         Ok(())
     }
 
@@ -855,40 +856,70 @@ impl WorkspaceSetup {
         };
 
         if let Some(dir) = &cwd_rendered {
-            info!("  run: {} (in {})", command, dir);
+            eprintln!("[setup:run] {} (in {})", command, dir);
         } else {
-            info!("  run: {}", command);
+            eprintln!("[setup:run] {}", command);
         }
 
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(&command).current_dir(&work_dir);
+        cmd.arg("-c")
+            .arg(&command)
+            .current_dir(&work_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         // Inject STATION_DOMAIN env var if available
         if let Some(domain) = self.station_domain() {
             cmd.env("STATION_DOMAIN", &domain);
         }
 
-        let output = cmd
-            .output()
+        let mut child = cmd
+            .spawn()
             .with_context(|| format!("Failed to execute: {}", command))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            anyhow::bail!(
-                "Command failed: {}\nstdout: {}\nstderr: {}",
-                command,
-                stdout,
-                stderr
-            );
+        // Stream stdout (in-place last line) and stderr (collected) concurrently
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            std::thread::spawn(move || {
+                let mut output = String::new();
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+                output
+            })
+        });
+
+        let mut last_line = String::new();
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                // Clear current line, write new last line
+                eprint!("\r\x1b[2K  {}", line);
+                last_line = line;
+            }
         }
 
-        // Print stdout if any
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.is_empty() {
-            for line in stdout.lines() {
-                debug!("    {}", line);
+        let stderr_output = stderr_handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+
+        // Clear the in-place line
+        if !last_line.is_empty() {
+            eprint!("\r\x1b[2K");
+        }
+
+        let status = child.wait().with_context(|| format!("Failed to wait for: {}", command))?;
+        let code = status.code().unwrap_or(-1);
+        eprintln!("[exit {}]", code);
+
+        if !status.success() {
+            let mut msg = format!("Command failed (exit {}): {}", code, command);
+            if !stderr_output.is_empty() {
+                msg.push_str("\nstderr: ");
+                msg.push_str(stderr_output.trim());
             }
+            anyhow::bail!(msg);
         }
 
         Ok(())
@@ -932,9 +963,6 @@ impl WorkspaceSetup {
         // Explicit tls= overrides implicit protocol tls
         let use_tls = tls.unwrap_or(implicit_tls);
 
-        info!("  proxy: {} -> {} (port {}{})", station_name, upstream_val, resolved_port,
-            if use_tls { ", tls" } else { "" });
-
         let mut cmd = Command::new("station");
         cmd.arg("proxy")
             .arg(&station_name)
@@ -957,8 +985,31 @@ impl WorkspaceSetup {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("station proxy failed for '{}': {}", station_name, stderr.trim());
+            // Build manual command hint
+            let mut hint_args = format!("station proxy {} -u {} -p {}",
+                station_name, upstream_val, resolved_port);
+            if use_tls {
+                hint_args.push_str(" --tls");
+            }
+            anyhow::bail!(
+                "[setup:proxy] {} (run `breq sh <ws> -- {}` to manually setup proxy)",
+                stderr.trim(), hint_args
+            );
         }
+
+        // Show the domain mapping on success
+        let scheme = if use_tls { "https" } else { "http" };
+        let listen_display = if let Some(domain) = self.station_domain() {
+            let port_suffix = match (use_tls, resolved_port) {
+                (false, 80) | (true, 443) => String::new(),
+                _ => format!(":{}", resolved_port),
+            };
+            format!("{}.{}{}",
+                station_name, domain, port_suffix)
+        } else {
+            format!("{}:{}", station_name, resolved_port)
+        };
+        eprintln!("[setup:proxy] {}://{} => {}", scheme, listen_display, upstream_val);
 
         Ok(())
     }
