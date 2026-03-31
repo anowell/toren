@@ -104,13 +104,12 @@ pub struct RepoInfo {
 
 // ==================== Variable Definitions ====================
 
-/// A variable definition from a `vars {}` block
+/// A variable definition from a `vars {}` block.
+/// All values are rendered through minijinja, so `{{ }}` template syntax works.
 #[derive(Debug, Clone)]
-pub enum VarDef {
-    /// Literal string value: `port "8080"`
-    Literal { name: String, value: String },
-    /// Expression evaluated via minijinja: `port expr="8000 + ws.num"`
-    Expr { name: String, expr: String },
+pub struct VarDef {
+    pub name: String,
+    pub value: String,
 }
 
 /// Evaluate a list of variable definitions sequentially.
@@ -122,38 +121,24 @@ pub fn evaluate_vars(
     let mut result = HashMap::new();
 
     for var in vars {
-        match var {
-            VarDef::Literal { name, value } => {
-                // Try to parse as integer, otherwise store as string
-                let json_val = if let Ok(n) = value.parse::<i64>() {
-                    serde_json::Value::Number(n.into())
-                } else {
-                    serde_json::Value::String(value.clone())
-                };
-                result.insert(name.clone(), json_val);
-            }
-            VarDef::Expr { name, expr } => {
-                // Build a temporary context that includes previously evaluated vars
-                let template_str = format!("{{{{ {} }}}}", expr);
-                let mut env = Environment::new();
-                env.add_template("expr", &template_str)?;
-                let tmpl = env.get_template("expr")?;
-                let rendered = tmpl.render(context! {
-                    ws => ctx.ws,
-                    repo => ctx.repo,
-                    task => ctx.task,
-                    vars => &result,
-                })?;
+        // Render value through minijinja with context including previously-defined vars
+        let mut env = Environment::new();
+        env.add_template("var", &var.value)?;
+        let tmpl = env.get_template("var")?;
+        let rendered = tmpl.render(context! {
+            ws => ctx.ws,
+            repo => ctx.repo,
+            task => ctx.task,
+            vars => &result,
+        })?;
 
-                // Try to parse as integer, otherwise store as string
-                let json_val = if let Ok(n) = rendered.trim().parse::<i64>() {
-                    serde_json::Value::Number(n.into())
-                } else {
-                    serde_json::Value::String(rendered)
-                };
-                result.insert(name.clone(), json_val);
-            }
-        }
+        // Try to parse as integer, otherwise store as string
+        let json_val = if let Ok(n) = rendered.trim().parse::<i64>() {
+            serde_json::Value::Number(n.into())
+        } else {
+            serde_json::Value::String(rendered)
+        };
+        result.insert(var.name.clone(), json_val);
     }
 
     Ok(result)
@@ -305,29 +290,20 @@ impl BreqConfig {
             for child in children.nodes() {
                 let name = child.name().value().to_string();
 
-                // Check for expr= attribute first
-                if let Some(expr) = child.get("expr").and_then(|v| v.as_string()) {
-                    vars.push(VarDef::Expr {
-                        name,
-                        expr: expr.to_string(),
-                    });
-                } else {
-                    // Literal: first positional argument
-                    let value = child
-                        .entries()
-                        .iter()
-                        .find(|e| e.name().is_none())
-                        .and_then(|e| {
-                            // Support both string and integer literals
-                            if let Some(s) = e.value().as_string() {
-                                Some(s.to_string())
-                            } else {
-                                kdl_value_as_i64(e.value()).map(|n| n.to_string())
-                            }
-                        })
-                        .with_context(|| format!("var '{}' requires a value or expr= attribute", name))?;
-                    vars.push(VarDef::Literal { name, value });
-                }
+                let value = child
+                    .entries()
+                    .iter()
+                    .find(|e| e.name().is_none())
+                    .and_then(|e| {
+                        // Support both string and integer literals
+                        if let Some(s) = e.value().as_string() {
+                            Some(s.to_string())
+                        } else {
+                            kdl_value_as_i64(e.value()).map(|n| n.to_string())
+                        }
+                    })
+                    .with_context(|| format!("var '{}' requires a value", name))?;
+                vars.push(VarDef { name, value });
             }
         }
 
@@ -1235,28 +1211,18 @@ setup { }
         let config = BreqConfig::parse_kdl(content).unwrap();
         assert_eq!(config.vars.len(), 2);
 
-        match &config.vars[0] {
-            VarDef::Literal { name, value } => {
-                assert_eq!(name, "port");
-                assert_eq!(value, "5173");
-            }
-            _ => panic!("Expected Literal"),
-        }
-        match &config.vars[1] {
-            VarDef::Literal { name, value } => {
-                assert_eq!(name, "name");
-                assert_eq!(value, "my-app");
-            }
-            _ => panic!("Expected Literal"),
-        }
+        assert_eq!(config.vars[0].name, "port");
+        assert_eq!(config.vars[0].value, "5173");
+        assert_eq!(config.vars[1].name, "name");
+        assert_eq!(config.vars[1].value, "my-app");
     }
 
     #[test]
-    fn test_parse_vars_expr() {
+    fn test_parse_vars_template() {
         let content = r#"
 vars {
     base_port 5170
-    port expr="vars.base_port + ws.num"
+    port "{{ vars.base_port + ws.num }}"
 }
 setup { }
 "#;
@@ -1264,25 +1230,20 @@ setup { }
         let config = BreqConfig::parse_kdl(content).unwrap();
         assert_eq!(config.vars.len(), 2);
 
-        match &config.vars[1] {
-            VarDef::Expr { name, expr } => {
-                assert_eq!(name, "port");
-                assert_eq!(expr, "vars.base_port + ws.num");
-            }
-            _ => panic!("Expected Expr"),
-        }
+        assert_eq!(config.vars[1].name, "port");
+        assert_eq!(config.vars[1].value, "{{ vars.base_port + ws.num }}");
     }
 
     #[test]
     fn test_evaluate_vars_sequential() {
         let vars = vec![
-            VarDef::Literal {
+            VarDef {
                 name: "base_port".to_string(),
                 value: "5170".to_string(),
             },
-            VarDef::Expr {
+            VarDef {
                 name: "port".to_string(),
-                expr: "vars.base_port + ws.num".to_string(),
+                value: "{{ vars.base_port + ws.num }}".to_string(),
             },
         ];
 

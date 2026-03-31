@@ -91,7 +91,7 @@ The `toren.kdl` file in your repo root configures workspace setup and teardown:
 
 ```kdl
 vars {
-    web_port expr="30000 + {{ ws.num }}"
+    web_port "{{ 30000 + ws.num }}"
 }
 
 setup {
