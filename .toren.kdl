@@ -1,6 +1,5 @@
 setup {
-    // template src=".env.breq" dest=".env"
-    share src=".beads"
+    share src="runes.kdl"
     copy src="target"
     copy src="web/node_modules"
     // run "pnpm install" cwd="web"
