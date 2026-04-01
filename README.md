@@ -12,7 +12,7 @@ Built-in support for:
 - Configurable workspace setup and destruction (isolate and/or share components between workspaces)
 - Per-workspace local domains (i.e. reverse proxying via Caddy)
 
-Bring your own work-tracking system (e.g. Linear, GH Issues, beads, etc). 
+Bring your own work-tracking system (e.g. Linear, GH Issues, [runes](https://github.com/anowell/runes), beads, etc). 
 
 ## Introduction
 
@@ -47,7 +47,7 @@ breq init --stealth
 ```
 
 This does two things:
-1. Creates `toren.kdl` in your repo with auto-discovered workspace hooks (e.g. copying `node_modules`, sharing `.beads`, etc.)
+1. Creates `toren.kdl` in your repo with auto-discovered workspace hooks (e.g. copying `node_modules`)
 2. Ensures the repo is registered as an ancillary in `~/.toren/config.toml`
 
 Then start an agent session:
@@ -65,11 +65,11 @@ Breq creates a workspace (git worktree or jj workspace), runs your setup hooks, 
 breq do -p <prompt>                # Launch agent in a new workspace
 breq do <workspace> -p <prompt>    # Launch agent in an existing workspace
 breq do -i <intent>                # Use a configured prompt template
-bd show proj-123 | breq do         # Prompt from stdin
+runes show proj-123 | breq do         # Prompt from stdin
 
 # Manage active sessions
 breq list                          # Show active assignments
-breq clean <workspace>             # Teardown workspace and cleanup
+breq destroy <workspace>           # Teardown workspace
 
 # Work in a workspace directly
 breq shell <workspace>             # Open shell in workspace
@@ -98,7 +98,7 @@ setup {
     // Copy-on-write into workspace
     copy src="node_modules"
     // Symlink into workspace
-    share src=".beads"
+    share src=".claude"
     // Execute arbitrary workspace setup commands:w
     run "pnpm install"
 
