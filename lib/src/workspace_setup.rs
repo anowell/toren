@@ -681,6 +681,8 @@ impl WorkspaceSetup {
         // Dest is relative to workspace
         let dest_path = self.workspace_path.join(&dest);
 
+        eprintln!("[setup:template] creating {}", dest);
+
         let template_content = fs::read_to_string(&src_path)
             .with_context(|| format!("Failed to read template: {}", src_path.display()))?;
 
@@ -702,8 +704,6 @@ impl WorkspaceSetup {
 
         fs::write(&dest_path, rendered)
             .with_context(|| format!("Failed to write: {}", dest_path.display()))?;
-
-        eprintln!("[setup:template] creating {}", dest);
         Ok(())
     }
 
@@ -731,6 +731,8 @@ impl WorkspaceSetup {
             fs::create_dir_all(parent)?;
         }
 
+        eprintln!("[setup:copy] creating {}", dest);
+
         // Use clonetree for CoW with automatic fallback
         clonetree::clone_tree(&src_path, &dest_path, &CloneOptions::new()).with_context(|| {
             format!(
@@ -739,8 +741,6 @@ impl WorkspaceSetup {
                 dest_path.display()
             )
         })?;
-
-        eprintln!("[setup:copy] creating {}", dest);
         Ok(())
     }
 
@@ -784,6 +784,8 @@ impl WorkspaceSetup {
             }
         }
 
+        eprintln!("[setup:share] creating {}", src);
+
         // Create symlink
         #[cfg(unix)]
         std::os::unix::fs::symlink(&src_path, &dest_path).with_context(|| {
@@ -809,8 +811,6 @@ impl WorkspaceSetup {
                 )
             })?;
         }
-
-        eprintln!("[setup:share] creating {}", src);
         Ok(())
     }
 
