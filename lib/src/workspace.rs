@@ -343,7 +343,9 @@ impl VcsBackend for JjBackend {
             return false;
         }
 
-        // Check 1: non-empty commits exclusive to this workspace
+        // Non-empty commits ahead of default@ (includes dirty working copy
+        // since jj auto-snapshots when this command runs, making @ reflect
+        // the actual disk state).
         let log_output = Command::new("jj")
             .args([
                 "log",
@@ -360,25 +362,7 @@ impl VcsBackend for JjBackend {
         if let Some(output) = log_output {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.trim().is_empty() {
-                    return true;
-                }
-            }
-        }
-
-        // Check 2: uncommitted working-copy changes
-        let diff_output = Command::new("jj")
-            .args(["diff", "--stat"])
-            .current_dir(workspace_path)
-            .output()
-            .ok();
-
-        if let Some(output) = diff_output {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.trim().is_empty() {
-                    return true;
-                }
+                return !stdout.trim().is_empty();
             }
         }
 
@@ -748,7 +732,7 @@ impl VcsBackend for GitWorktreeBackend {
 
         let base = base_ref.unwrap_or("main");
 
-        // Check 1: commits beyond base
+        // Check 1: commits ahead of base
         let log_range = format!("{}..HEAD", base);
         let log_output = Command::new("git")
             .args(["log", &log_range, "--oneline"])
@@ -764,7 +748,7 @@ impl VcsBackend for GitWorktreeBackend {
             }
         }
 
-        // Check 2: uncommitted working-copy changes
+        // Check 2: dirty working tree (uncommitted/unstaged changes)
         let diff_output = Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(workspace_path)
