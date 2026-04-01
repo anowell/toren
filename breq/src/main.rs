@@ -138,8 +138,31 @@ enum Commands {
         detail: bool,
     },
 
+    /// Set up a workspace without starting an agent
+    Setup {
+        /// Workspace name (e.g. "one"); omit to create next available
+        workspace: Option<String>,
+
+        /// Tag assignment with a task identifier (e.g., bead ID)
+        #[arg(long = "task-id", alias = "id")]
+        task_id: Option<String>,
+
+        /// Task title
+        #[arg(long = "task-title")]
+        task_title: Option<String>,
+
+        /// Task URL
+        #[arg(long = "task-url")]
+        task_url: Option<String>,
+
+        /// Segment to use (defaults to current directory's segment)
+        #[arg(short, long)]
+        segment: Option<String>,
+    },
+
     /// Teardown a workspace (bead-free), output JSON to stdout
-    Clean {
+    #[command(visible_alias = "clean")]
+    Destroy {
         /// Workspace name (e.g. "one", "three")
         workspace: String,
 
@@ -406,12 +429,19 @@ fn main() -> Result<()> {
             segment,
             detail,
         } => cmd_list(&config, reference, all, segment, detail),
-        Commands::Clean {
+        Commands::Setup {
+            workspace,
+            task_id,
+            task_title,
+            task_url,
+            segment,
+        } => cmd_setup(&config, workspace, task_id, task_title, task_url, segment.as_deref()),
+        Commands::Destroy {
             workspace,
             kill,
             push,
             segment,
-        } => cmd_clean(&config, &workspace, kill, push, segment.as_deref()),
+        } => cmd_destroy(&config, &workspace, kill, push, segment.as_deref()),
         Commands::Cleanup { segment, all } => cmd_cleanup(&config, all, segment),
         Commands::Init { stealth } => cmd_init(stealth),
         Commands::Show {
@@ -631,7 +661,27 @@ fn cmd_do(
             anyhow::bail!("Workspace '{}' not found at {}", ws_name_lower, ws_path.display());
         }
 
-        // Reuse workspace — start agent session
+        // Reuse workspace — update assignment fields if provided
+        if inferred.task_id.is_some() || inferred.task_title.is_some() || inferred.task_url.is_some() {
+            let ancillary_num = toren_lib::word_to_number(&ws_name_lower).unwrap_or(0);
+            let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
+
+            if let Some(assignment) = assignment_mgr.get_active_for_ancillary(&ancillary_id_str).cloned() {
+                if assignment_mgr.update_task_fields(
+                    &assignment.id,
+                    inferred.task_id.as_deref(),
+                    inferred.task_title.as_deref(),
+                    inferred.task_url.as_deref(),
+                    inferred.task_source.as_deref(),
+                )? {
+                    eprintln!("Updated assignment for workspace '{}'", ws_name_lower);
+                }
+            } else {
+                info!("No assignment found for ancillary '{}', skipping update", ancillary_id_str);
+            }
+        }
+
+        // Start agent session
         eprintln!("Starting {} session in {}\n", agent, ws_path.display());
         let mut cmd = agent.build_command(&user_message, &ws_path, system_prompt.as_deref());
         cmd.args(&passthrough);
@@ -1088,9 +1138,136 @@ fn cmd_list_detail(
     Ok(())
 }
 
-// ─── clean ──────────────────────────────────────────────────────────────────
+// ─── setup ─────────────────────────────────────────────────────────────────
 
-fn cmd_clean(
+fn cmd_setup(
+    config: &Config,
+    workspace: Option<String>,
+    task_id_arg: Option<String>,
+    task_title_arg: Option<String>,
+    task_url_arg: Option<String>,
+    segment_name: Option<&str>,
+) -> Result<()> {
+    let workspace_root = config.ancillaries.workspace_root.clone();
+
+    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
+    let segment_mgr = SegmentManager::new(config)?;
+    let mut assignment_mgr = AssignmentManager::new()?;
+
+    let segment = resolve_segment(&segment_mgr, segment_name)?;
+
+    // Infer task fields from CLI args
+    let mut inferred = toren_lib::infer_task_fields(
+        task_id_arg.as_deref(),
+        task_title_arg.as_deref(),
+        task_url_arg.as_deref(),
+        None,
+    );
+
+    // Resolve task_source from plugins when we have a task_id but no source
+    if inferred.task_id.is_some() && inferred.task_source.is_none() {
+        if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")) {
+            let sources = plugin_mgr.effective_sources(&config.tasks.sources);
+            if let Some(ref task_id) = inferred.task_id {
+                let ctx = toren_lib::PluginContext::new(Some(segment.path.clone()), Some(segment.name.clone()));
+                if let Ok(task) = plugin_mgr.resolve_info_multi(&sources, task_id, ctx) {
+                    inferred.task_source = Some(task.source);
+                    if inferred.task_title.is_none() {
+                        inferred.task_title = Some(task.title);
+                    }
+                }
+            }
+        }
+    }
+
+    // If workspace exists, just update assignment fields and return
+    if let Some(ref ws_name) = workspace {
+        let ws_name_lower = ws_name.to_lowercase();
+        let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name_lower);
+
+        if ws_path.exists() {
+            let ancillary_num = toren_lib::word_to_number(&ws_name_lower).unwrap_or(0);
+            let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
+
+            if inferred.task_id.is_some() || inferred.task_title.is_some() || inferred.task_url.is_some() {
+                if let Some(assignment) = assignment_mgr.get_active_for_ancillary(&ancillary_id_str).cloned() {
+                    if assignment_mgr.update_task_fields(
+                        &assignment.id,
+                        inferred.task_id.as_deref(),
+                        inferred.task_title.as_deref(),
+                        inferred.task_url.as_deref(),
+                        inferred.task_source.as_deref(),
+                    )? {
+                        eprintln!("Updated assignment for workspace '{}'", ws_name_lower);
+                    }
+                } else {
+                    info!("No assignment found for ancillary '{}', skipping update", ancillary_id_str);
+                }
+            }
+
+            println!("{}", ws_path.display());
+            return Ok(());
+        }
+    }
+
+    // Resolve workspace name and ancillary ID
+    let (ws_name, ancillary_id_str, ancillary_num) = if let Some(ref name) = workspace {
+        let ws_name = name.to_lowercase();
+        let num = toren_lib::word_to_number(&ws_name)
+            .with_context(|| format!("Invalid workspace name: {}", ws_name))?;
+        let id = toren_lib::ancillary_id(&segment.name, num);
+        (ws_name, id, num)
+    } else {
+        let existing_workspaces = workspace_mgr
+            .list_workspaces(&segment.path)
+            .unwrap_or_default();
+        let id = assignment_mgr.next_available_ancillary(
+            &segment.name,
+            config.ancillaries.max_per_segment,
+            &existing_workspaces,
+        );
+        let num = toren_lib::ancillary_number(&id).unwrap_or(1);
+        let ws_name = workspace_name_for_number(num);
+        (ws_name, id, num)
+    };
+
+    // Create workspace
+    let base_branch = workspace_mgr.active_branch(&segment.path);
+    let (ws_path, _) = workspace_mgr.create_workspace_with_setup(
+        &segment.path,
+        &segment.name,
+        &ws_name,
+        ancillary_num,
+    )?;
+
+    let source = if inferred.task_id.is_some() {
+        AssignmentSource::Reference
+    } else {
+        AssignmentSource::Prompt {
+            original_prompt: "(setup)".to_string(),
+        }
+    };
+
+    assignment_mgr.create(
+        &ancillary_id_str,
+        inferred.task_id.as_deref(),
+        source,
+        &segment.name,
+        ws_path.clone(),
+        inferred.task_title,
+        base_branch,
+        inferred.task_url.as_deref(),
+        inferred.task_source.as_deref(),
+    )?;
+
+    eprintln!("Created workspace: {}", ws_path.display());
+    println!("{}", ws_path.display());
+    Ok(())
+}
+
+// ─── destroy ───────────────────────────────────────────────────────────────
+
+fn cmd_destroy(
     config: &Config,
     workspace: &str,
     kill: bool,
@@ -1124,7 +1301,7 @@ fn cmd_clean(
     );
 
     eprintln!(
-        "Cleaning workspace: {} ({})",
+        "Destroying workspace: {} ({})",
         ws_name,
         assignment.workspace_path.display()
     );

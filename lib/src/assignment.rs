@@ -443,6 +443,43 @@ impl AssignmentManager {
         }
     }
 
+    /// Update task fields on an existing assignment.
+    /// Only overwrites fields that are Some.
+    pub fn update_task_fields(
+        &mut self,
+        assignment_id: &str,
+        task_id: Option<&str>,
+        task_title: Option<&str>,
+        task_url: Option<&str>,
+        task_source: Option<&str>,
+    ) -> Result<bool> {
+        if let Some(assignment) = self.assignments.get_mut(assignment_id) {
+            if let Some(id) = task_id {
+                assignment.task_id = Some(id.to_string());
+            }
+            if let Some(title) = task_title {
+                assignment.task_title = Some(title.to_string());
+            }
+            if let Some(url) = task_url {
+                assignment.task_url = Some(url.to_string());
+            }
+            if let Some(source) = task_source {
+                assignment.task_source = Some(source.to_string());
+            }
+            // Update source to Reference if task_id was set and source was Prompt
+            if task_id.is_some() {
+                if matches!(assignment.source, AssignmentSource::Prompt { .. }) {
+                    assignment.source = AssignmentSource::Reference;
+                }
+            }
+            assignment.updated_at = chrono::Utc::now().to_rfc3339();
+            self.save()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Touch the updated_at timestamp for an assignment
     pub fn touch(&mut self, assignment_id: &str) -> Result<bool> {
         if let Some(assignment) = self.assignments.get_mut(assignment_id) {
