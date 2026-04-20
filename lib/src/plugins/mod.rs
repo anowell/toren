@@ -2,14 +2,11 @@
 //!
 //! Plugins are Rhai scripts that call native Rust operations via a host API.
 //! User plugins are discovered from `~/.toren/plugins/`.
-//! Community/example plugins live in `contrib/plugins/` and can be copied
-//! into the user plugin directory.
+//! Community/example plugins live in `contrib/plugins/` and can be installed
+//! via `breq plugin install`.
 //!
 //! Plugins are either **commands** (in `commands/` subdir, invoked as `breq <name>`)
 //! or **task resolvers** (in `tasks/` subdir, provide task data for a source).
-//!
-//! For backwards compatibility, if neither `commands/` nor `tasks/` subdirectory
-//! exists, flat directory scanning with `/// @resolver` tag detection is used.
 //!
 //! Compilation is lazy: plugins are scanned for metadata on init but only
 //! compiled to AST when actually executed.
@@ -38,22 +35,15 @@ pub struct PluginMeta {
 
 /// Parse leading `///` doc comments from a Rhai source string.
 ///
-/// Returns `(description, usage, is_resolver)` where:
+/// Returns `(description, usage)` where:
 /// - `description` is the first paragraph (lines before a blank `///` line)
 /// - `usage` is the full collected text
-/// - `is_resolver` is true if `/// @resolver` tag was found
-fn parse_doc_comments(source: &str) -> (Option<String>, Option<String>, bool) {
+fn parse_doc_comments(source: &str) -> (Option<String>, Option<String>) {
     let mut lines: Vec<String> = Vec::new();
-    let mut is_resolver = false;
     for raw in source.lines() {
         let trimmed = raw.trim_start();
         if let Some(rest) = trimmed.strip_prefix("///") {
-            // Strip one optional leading space after ///
             let content = rest.strip_prefix(' ').unwrap_or(rest);
-            if content.trim() == "@resolver" {
-                is_resolver = true;
-                continue; // Don't include @resolver tag in description/usage
-            }
             lines.push(content.to_string());
         } else {
             break;
@@ -61,12 +51,11 @@ fn parse_doc_comments(source: &str) -> (Option<String>, Option<String>, bool) {
     }
 
     if lines.is_empty() {
-        return (None, None, is_resolver);
+        return (None, None);
     }
 
     let usage = lines.join("\n").trim().to_string();
 
-    // First paragraph: lines before the first blank line
     let description = lines
         .iter()
         .take_while(|l| !l.trim().is_empty())
@@ -83,7 +72,7 @@ fn parse_doc_comments(source: &str) -> (Option<String>, Option<String>, bool) {
     };
     let usg = if usage.is_empty() { None } else { Some(usage) };
 
-    (desc, usg, is_resolver)
+    (desc, usg)
 }
 
 /// The result of running a plugin script.
@@ -162,19 +151,12 @@ impl PluginManager {
 
         if dir.exists() {
             let commands_dir = dir.join("commands");
+            if commands_dir.exists() {
+                mgr.scan_dir(&commands_dir, false)?;
+            }
             let tasks_dir = dir.join("tasks");
-
-            if commands_dir.exists() || tasks_dir.exists() {
-                // Semantic directory structure
-                if commands_dir.exists() {
-                    mgr.scan_dir(&commands_dir, &mut Vec::new(), false)?;
-                }
-                if tasks_dir.exists() {
-                    mgr.scan_dir(&tasks_dir, &mut Vec::new(), true)?;
-                }
-            } else {
-                // Legacy flat directory with @resolver tag detection
-                mgr.scan_dir_legacy(dir)?;
+            if tasks_dir.exists() {
+                mgr.scan_dir(&tasks_dir, true)?;
             }
         }
 
@@ -430,12 +412,7 @@ impl PluginManager {
     ///
     /// If `is_resolver` is true, metas are added to `resolver_metas`;
     /// otherwise to `command_metas`.
-    fn scan_dir(
-        &mut self,
-        dir: &Path,
-        _errors: &mut Vec<String>,
-        is_resolver: bool,
-    ) -> Result<()> {
+    fn scan_dir(&mut self, dir: &Path, is_resolver: bool) -> Result<()> {
         let entries = std::fs::read_dir(dir)
             .with_context(|| format!("Failed to read plugin directory: {}", dir.display()))?;
 
@@ -459,64 +436,9 @@ impl PluginManager {
 
             match std::fs::read_to_string(&path) {
                 Ok(source) => {
-                    let (description, usage, _) = parse_doc_comments(&source);
+                    let (description, usage) = parse_doc_comments(&source);
                     let kind_label = if is_resolver { "resolver" } else { "command" };
                     info!("Scanned {} plugin '{}' from {}", kind_label, name, path.display());
-                    let meta = PluginMeta {
-                        name: name.clone(),
-                        path,
-                        description,
-                        usage,
-                    };
-                    if is_resolver {
-                        self.resolver_metas.insert(name, meta);
-                    } else {
-                        self.command_metas.insert(name, meta);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to read plugin '{}' ({}): {}",
-                        name,
-                        path.display(),
-                        e
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Legacy flat directory scan: route to commands or resolvers based on
-    /// `/// @resolver` doc comment tag.
-    fn scan_dir_legacy(&mut self, dir: &Path) -> Result<()> {
-        let entries = std::fs::read_dir(dir)
-            .with_context(|| format!("Failed to read plugin directory: {}", dir.display()))?;
-
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.extension().and_then(|s| s.to_str()) != Some("rhai") {
-                continue;
-            }
-
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-
-            if name.is_empty() {
-                continue;
-            }
-
-            match std::fs::read_to_string(&path) {
-                Ok(source) => {
-                    let (description, usage, is_resolver) = parse_doc_comments(&source);
-                    let kind_label = if is_resolver { "resolver" } else { "command" };
-                    info!("Scanned {} plugin '{}' from {} (legacy)", kind_label, name, path.display());
                     let meta = PluginMeta {
                         name: name.clone(),
                         path,
@@ -639,19 +561,18 @@ mod tests {
     fn test_doc_comments_basic() {
         let source =
             "/// Short description.\n///\n/// Detailed usage text\n/// spanning lines.\nlet x = 1;";
-        let (desc, usage, is_resolver) = parse_doc_comments(source);
+        let (desc, usage) = parse_doc_comments(source);
         assert_eq!(desc.as_deref(), Some("Short description."));
         assert_eq!(
             usage.as_deref(),
             Some("Short description.\n\nDetailed usage text\nspanning lines.")
         );
-        assert!(!is_resolver);
     }
 
     #[test]
     fn test_doc_comments_missing() {
         let source = "// regular comment\nlet x = 1;";
-        let (desc, usage, _) = parse_doc_comments(source);
+        let (desc, usage) = parse_doc_comments(source);
         assert!(desc.is_none());
         assert!(usage.is_none());
     }
@@ -659,7 +580,7 @@ mod tests {
     #[test]
     fn test_doc_comments_single_paragraph() {
         let source = "/// Just a one-liner.\nlet x = 1;";
-        let (desc, usage, _) = parse_doc_comments(source);
+        let (desc, usage) = parse_doc_comments(source);
         assert_eq!(desc.as_deref(), Some("Just a one-liner."));
         assert_eq!(usage.as_deref(), Some("Just a one-liner."));
     }
@@ -667,7 +588,7 @@ mod tests {
     #[test]
     fn test_doc_comments_no_space_after_slashes() {
         let source = "///No space here.\nlet x = 1;";
-        let (desc, _, _) = parse_doc_comments(source);
+        let (desc, _) = parse_doc_comments(source);
         assert_eq!(desc.as_deref(), Some("No space here."));
     }
 
@@ -723,21 +644,6 @@ mod tests {
     // ── Resolver tests ──────────────────────────────────────────────
 
     #[test]
-    fn test_resolver_detection_in_doc_comments() {
-        let source = "/// @resolver\n/// My resolver plugin.\nfn fetch(id) { #{} }";
-        let (desc, _, is_resolver) = parse_doc_comments(source);
-        assert!(is_resolver);
-        assert_eq!(desc.as_deref(), Some("My resolver plugin."));
-    }
-
-    #[test]
-    fn test_resolver_detection_not_present() {
-        let source = "/// Regular command plugin.\nlet x = 1;";
-        let (_, _, is_resolver) = parse_doc_comments(source);
-        assert!(!is_resolver);
-    }
-
-    #[test]
     fn test_semantic_dir_routing() {
         let dir = tempfile::tempdir().unwrap();
         let cmd_dir = dir.path().join("commands");
@@ -766,27 +672,18 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_flat_dir_fallback() {
+    fn test_flat_dir_no_scan() {
+        // Without commands/ or tasks/ subdirs, nothing is scanned.
         let dir = tempfile::tempdir().unwrap();
-        // No commands/ or tasks/ subdirs — should use legacy mode
         std::fs::write(
-            dir.path().join("myresolver.rhai"),
-            "/// @resolver\n/// Test resolver.\nfn fetch(id) { #{} }",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("mycmd.rhai"),
-            "/// Test command.\nlet x = 1;",
+            dir.path().join("loose.rhai"),
+            "/// Loose plugin.\nlet x = 1;",
         )
         .unwrap();
 
         let mgr = PluginManager::new(dir.path()).unwrap();
-
-        assert!(mgr.has("mycmd"));
-        assert!(!mgr.has_resolver("mycmd"));
-
-        assert!(!mgr.has("myresolver"));
-        assert!(mgr.has_resolver("myresolver"));
+        assert!(!mgr.has("loose"));
+        assert!(!mgr.has_resolver("loose"));
     }
 
     #[test]

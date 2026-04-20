@@ -305,11 +305,24 @@ for c in changes {
 
 ## Community plugins
 
-Example plugins for common workflows live in `contrib/plugins/`. To install them, copy into your plugin directory:
+Example plugins for common workflows live in `contrib/plugins/` in the
+[toren repo](https://github.com/anowell/toren). Install them with:
 
 ```sh
-cp -r contrib/plugins/* ~/.toren/plugins/
+breq plugin list                    # see what's available
+breq plugin install commands/abort  # fetch from the repo
+breq plugin install tasks/linear    # ...or any other plugin
 ```
+
+You can also install from a local file (e.g. during plugin development):
+
+```sh
+breq plugin install ./my-plugin/tasks/custom.rhai
+```
+
+`breq plugin install` resolves a local path first, falling back to the remote
+contrib directory. The parent directory name (`commands/` or `tasks/`)
+determines the installed category.
 
 ### `assign`
 

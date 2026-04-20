@@ -3,7 +3,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use colored::Colorize;
 use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use toren_lib::{
     AssignmentManager, AssignmentRef, AssignmentSource, Config, Segment, SegmentManager,
@@ -216,6 +216,28 @@ enum Commands {
     Dismiss {
         /// Workspace or task ID reference
         reference: String,
+    },
+
+    /// Manage Rhai plugins under ~/.toren/plugins
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// List plugins available from the contrib repo (and which are installed)
+    List,
+
+    /// Install a plugin from a local path or the contrib repo
+    ///
+    /// TARGET is one of:
+    ///   - `commands/<name>` or `tasks/<name>` (fetched from github.com/anowell/toren)
+    ///   - a local .rhai path whose parent dir is `commands` or `tasks`
+    Install {
+        /// `commands/<name>`, `tasks/<name>`, or a local path to a .rhai file
+        target: String,
     },
 }
 
@@ -450,6 +472,7 @@ fn main() -> Result<()> {
             segment,
         } => cmd_show(&config, &workspace, &field, segment.as_deref()),
         Commands::Dismiss { reference } => cmd_dismiss(&config, &reference),
+        Commands::Plugin { cmd } => cmd_plugin(cmd),
     }
 }
 
@@ -1572,7 +1595,7 @@ fn cmd_init(stealth: bool) -> Result<()> {
         }
     }
 
-    let mut kdl = String::from("setup {\n");
+    let mut kdl = String::from("vars {\n    // subdomain \"{{ ws.name }}.{{ repo.name }}\"\n}\n\nsetup {\n");
     for entry in &share_entries {
         kdl.push_str(&format!("    share src=\"{}\"\n", entry));
     }
@@ -1583,7 +1606,11 @@ fn cmd_init(stealth: bool) -> Result<()> {
 
     let total = share_entries.len() + copy_entries.len();
     std::fs::write(&config_path, &kdl).context("Failed to write toren.kdl")?;
-    println!("Created toren.kdl with {} setup entries", total);
+    println!(
+        "Created {} with {} setup entries",
+        toren_lib::tilde_shorten(&config_path),
+        total
+    );
 
     for entry in &share_entries {
         println!("  share src=\"{}\"", entry);
@@ -1591,6 +1618,7 @@ fn cmd_init(stealth: bool) -> Result<()> {
     for entry in &copy_entries {
         println!("  copy src=\"{}\"", entry);
     }
+    println!("Edit toren.kdl to customize workspace setup and teardown.");
 
     if stealth {
         let git_info_dir = cwd.join(".git").join("info");
@@ -1612,46 +1640,287 @@ fn cmd_init(stealth: bool) -> Result<()> {
         }
     }
 
-    // Segment onboarding: check if this repo is discoverable as a segment
-    if let Ok(config) = Config::load() {
-        let segment_mgr = SegmentManager::new(&config)?;
-        if segment_mgr.resolve_from_path(&cwd).is_none() {
-            // Repo not discoverable — offer to add it
-            if let Some(parent) = cwd.parent() {
+    // Segment onboarding (TTY only): if this repo isn't already covered by a
+    // configured segment, offer to add its parent as a glob (default yes).
+    // If declined, register just this repo as a literal segment.
+    if std::io::stdin().is_terminal() {
+        if let Ok(config) = Config::load() {
+            let segment_mgr = SegmentManager::new(&config)?;
+            if segment_mgr.resolve_from_path(&cwd).is_none() {
                 let repo_path = toren_lib::tilde_shorten(&cwd);
-                let parent_glob = format!("{}/*", toren_lib::tilde_shorten(parent));
+                let parent_glob = cwd
+                    .parent()
+                    .map(|p| format!("{}/*", toren_lib::tilde_shorten(p)));
 
-                if std::io::stdin().is_terminal() {
-                    eprintln!("\nThis repo is not discoverable as a segment.");
-                    eprintln!("Add it to ~/.toren/config.toml?");
-                    eprintln!("  1) Add parent glob: {}", parent_glob);
-                    eprintln!("  2) Add repo path:   {}", repo_path);
-                    eprintln!("  3) Skip");
-                    eprint!("Choice [1/2/3]: ");
-
+                let entry = if let Some(glob) = parent_glob {
+                    eprintln!(
+                        "\nThis repo isn't covered by a segment in ~/.toren/config.toml."
+                    );
+                    eprint!("Add parent glob '{}'? [Y/n] ", glob);
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input)?;
-                    let choice = input.trim();
-
-                    let new_entry = match choice {
-                        "1" => Some(parent_glob),
-                        "2" => Some(repo_path),
-                        _ => None,
-                    };
-
-                    if let Some(entry) = new_entry {
-                        let config_path = dirs::home_dir()
-                            .context("Could not determine home directory")?
-                            .join(".toren/config.toml");
-
-                        add_segment_to_config(&config_path, &entry)?;
+                    let ans = input.trim().to_ascii_lowercase();
+                    if ans.is_empty() || ans == "y" || ans == "yes" {
+                        glob
+                    } else {
+                        repo_path
                     }
-                }
+                } else {
+                    repo_path
+                };
+
+                let config_path = dirs::home_dir()
+                    .context("Could not determine home directory")?
+                    .join(".toren/config.toml");
+                add_segment_to_config(&config_path, &entry)?;
             }
         }
     }
 
     Ok(())
+}
+
+// ─── plugin ─────────────────────────────────────────────────────────────────
+
+const PLUGIN_REPO_RAW: &str =
+    "https://raw.githubusercontent.com/anowell/toren/main/contrib/plugins";
+const PLUGIN_REPO_API: &str =
+    "https://api.github.com/repos/anowell/toren/contents/contrib/plugins";
+const PLUGIN_CATEGORIES: &[&str] = &["commands", "tasks"];
+
+fn cmd_plugin(cmd: PluginCmd) -> Result<()> {
+    match cmd {
+        PluginCmd::List => cmd_plugin_list(),
+        PluginCmd::Install { target } => cmd_plugin_install(&target),
+    }
+}
+
+fn cmd_plugin_list() -> Result<()> {
+    let installed_root = toren_lib::toren_root().join("plugins");
+
+    for category in PLUGIN_CATEGORIES {
+        let remote_names = fetch_remote_plugin_names(category).unwrap_or_else(|e| {
+            eprintln!("warning: failed to list remote {}: {:#}", category, e);
+            Vec::new()
+        });
+        let local_names = list_installed_plugins(&installed_root, category);
+
+        let mut all: Vec<&str> = remote_names
+            .iter()
+            .map(|s| s.as_str())
+            .chain(local_names.iter().map(|s| s.as_str()))
+            .collect();
+        all.sort();
+        all.dedup();
+
+        println!("{}/", category);
+        if all.is_empty() {
+            println!("  (none)");
+            continue;
+        }
+        let width = all.iter().map(|n| n.len()).max().unwrap_or(0);
+        for name in all {
+            let installed = local_names.iter().any(|n| n == name);
+            let remote = remote_names.iter().any(|n| n == name);
+            let marker = match (installed, remote) {
+                (true, true) => "installed",
+                (true, false) => "installed (local only)",
+                (false, true) => "available",
+                (false, false) => unreachable!(),
+            };
+            println!("  {:<width$}  {}", name, marker, width = width);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_plugin_install(target: &str) -> Result<()> {
+    let installed_root = toren_lib::toren_root().join("plugins");
+
+    let local_path = PathBuf::from(target);
+    if local_path.is_file() {
+        install_from_local(&local_path, &installed_root)
+    } else {
+        install_from_remote(target, &installed_root)
+    }
+}
+
+/// Install from a local .rhai file. The parent directory name must be
+/// `commands` or `tasks` to determine the category.
+fn install_from_local(src: &Path, installed_root: &Path) -> Result<()> {
+    if src.extension().and_then(|s| s.to_str()) != Some("rhai") {
+        anyhow::bail!("Local plugin must be a .rhai file: {}", src.display());
+    }
+
+    let category = src
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .filter(|c| PLUGIN_CATEGORIES.contains(c))
+        .with_context(|| {
+            format!(
+                "Cannot infer plugin category from path: {} (parent dir must be 'commands' or 'tasks')",
+                src.display()
+            )
+        })?;
+
+    let file_name = src
+        .file_name()
+        .with_context(|| format!("Invalid plugin path: {}", src.display()))?;
+
+    let dest_dir = installed_root.join(category);
+    std::fs::create_dir_all(&dest_dir)
+        .with_context(|| format!("Failed to create {}", dest_dir.display()))?;
+    let dest = dest_dir.join(file_name);
+
+    let contents = std::fs::read(src)
+        .with_context(|| format!("Failed to read {}", src.display()))?;
+    std::fs::write(&dest, contents)
+        .with_context(|| format!("Failed to write {}", dest.display()))?;
+
+    println!(
+        "Installed {} -> {}",
+        src.display(),
+        toren_lib::tilde_shorten(&dest)
+    );
+    Ok(())
+}
+
+/// Install from the remote contrib repo. `target` must be `<category>/<name>`.
+fn install_from_remote(target: &str, installed_root: &Path) -> Result<()> {
+    let (category, name) = parse_remote_target(target)?;
+
+    let url = format!("{}/{}/{}.rhai", PLUGIN_REPO_RAW, category, name);
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build(),
+    );
+
+    let response = agent
+        .get(&url)
+        .call()
+        .with_context(|| format!("Failed to fetch {}", url))?;
+
+    let status: u16 = response.status().into();
+    if status == 404 {
+        anyhow::bail!(
+            "Plugin '{}/{}' not found in contrib repo.\n\
+             Run `breq plugin list` to see available plugins.",
+            category,
+            name
+        );
+    }
+    if !(200..300).contains(&status) {
+        anyhow::bail!("Failed to fetch {} (HTTP {})", url, status);
+    }
+
+    let body = response
+        .into_body()
+        .read_to_string()
+        .with_context(|| format!("Failed to read body from {}", url))?;
+
+    let dest_dir = installed_root.join(category);
+    std::fs::create_dir_all(&dest_dir)
+        .with_context(|| format!("Failed to create {}", dest_dir.display()))?;
+    let dest = dest_dir.join(format!("{}.rhai", name));
+    std::fs::write(&dest, body)
+        .with_context(|| format!("Failed to write {}", dest.display()))?;
+
+    println!(
+        "Installed {}/{} -> {}",
+        category,
+        name,
+        toren_lib::tilde_shorten(&dest)
+    );
+    Ok(())
+}
+
+/// Parse `<category>/<name>` into (category, name). Errors on unknown category
+/// or missing `/`.
+fn parse_remote_target(target: &str) -> Result<(&'static str, String)> {
+    let (category, name) = target.split_once('/').with_context(|| {
+        format!(
+            "Plugin target '{}' must be 'commands/<name>' or 'tasks/<name>' (or a local .rhai path)",
+            target
+        )
+    })?;
+
+    let category = PLUGIN_CATEGORIES
+        .iter()
+        .copied()
+        .find(|c| *c == category)
+        .with_context(|| {
+            format!(
+                "Unknown plugin category '{}' — must be 'commands' or 'tasks'",
+                category
+            )
+        })?;
+
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        anyhow::bail!("Invalid plugin name: '{}'", name);
+    }
+
+    let name = name.strip_suffix(".rhai").unwrap_or(name).to_string();
+    Ok((category, name))
+}
+
+/// Fetch the list of .rhai filenames (without extension) from a contrib category.
+fn fetch_remote_plugin_names(category: &str) -> Result<Vec<String>> {
+    let url = format!("{}/{}", PLUGIN_REPO_API, category);
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build(),
+    );
+
+    let response = agent
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "breq-plugin-list")
+        .call()
+        .with_context(|| format!("Failed to fetch {}", url))?;
+
+    let status: u16 = response.status().into();
+    if !(200..300).contains(&status) {
+        anyhow::bail!("GET {} returned HTTP {}", url, status);
+    }
+
+    let body = response.into_body().read_to_string()?;
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(&body).context("Failed to parse GitHub API response")?;
+
+    let mut names: Vec<String> = entries
+        .iter()
+        .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("file"))
+        .filter_map(|e| e.get("name").and_then(|v| v.as_str()))
+        .filter_map(|n| n.strip_suffix(".rhai"))
+        .map(String::from)
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// List installed .rhai plugin names (without extension) for a given category.
+fn list_installed_plugins(installed_root: &Path, category: &str) -> Vec<String> {
+    let dir = installed_root.join(category);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("rhai"))
+        .filter_map(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────

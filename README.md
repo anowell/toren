@@ -76,12 +76,15 @@ breq shell <workspace>             # Open shell in workspace
 breq shell <workspace> -- <cmd>    # Run command in workspace
 ```
 
-The plugin system makes it trivial to integrate these primitives with any work-tracking workflow. `contrib/` contains example plugins
-that can be copied to `~/.toren/plugins/` and trivially modified to your workflow: 
+The plugin system makes it trivial to integrate these primitives with any work-tracking workflow. Install example plugins with
+`breq plugin install commands/<name>` or `breq plugin install tasks/<name>` (or `breq plugin list` to browse), then modify them to fit your workflow: 
 
 ```bash
-breq assign <task_id>              # Runs `breq do` with --prompt, --task-id, and --task-title
-breq complete <ws>                 # Runs `breq clean` and closes the bead associated with the workspace
+# breq plugin install commands/assign
+breq assign <task_id>              # Runs `breq do` with --prompt, --task-id, and --task-title derived from task
+
+# breq plugin install commands/complete
+breq complete <ws>                 # Runs `breq clean` and closes the task associated with the workspace
 ```
 
 

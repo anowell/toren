@@ -1199,6 +1199,18 @@ setup {
     }
 
     #[test]
+    fn test_parse_init_template() {
+        // Matches the exact template `breq init` emits. Regression guard:
+        // if KDL parsing rules change around commented-out entries or empty
+        // setup blocks, init-generated files must still round-trip.
+        let content = "vars {\n    // subdomain \"{{ ws.name }}.{{ repo.name }}\"\n}\n\nsetup {\n}\n\ndestroy { }\n";
+        let config = BreqConfig::parse_kdl(content).expect("init template must parse");
+        assert_eq!(config.vars.len(), 0, "comment-only vars block yields no vars");
+        assert_eq!(config.setup.len(), 0);
+        assert_eq!(config.destroy.len(), 0);
+    }
+
+    #[test]
     fn test_parse_vars_literal() {
         let content = r#"
 vars {
