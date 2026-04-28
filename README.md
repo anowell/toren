@@ -93,16 +93,17 @@ breq complete <ws>                 # Runs `breq clean` and closes the task assoc
 The `toren.kdl` file in your repo root configures workspace setup and teardown:
 
 ```kdl
-vars {
-    web_port "{{ 30000 + ws.num }}"
-}
+var web_port="{{ 30000 + ws.num }}"
+env LOG_LEVEL="info"
+env ".env.shared"
 
 setup {
     // Copy-on-write into workspace
     copy src="node_modules"
     // Symlink into workspace
     share src=".claude"
-    // Execute arbitrary workspace setup commands:w
+    // Execute arbitrary workspace setup commands
+    env NODE_ENV="development"
     run "pnpm install"
 
     // Configure reverse proxy from `{{ws.name}}.{{repo.name}}.lvh.me` to your web_port
@@ -115,11 +116,13 @@ destroy {
 }
 ```
 
-**Actions:**
+**Directives:**
+- `var NAME=VALUE ...` - Define template variables (top-level)
+- `env NAME=VALUE ...` or `env "FILE" ...` - Set environment variables for `run` commands. Procedural and last-wins. See [docs/env.md](docs/env.md).
 - `copy src="..."` - Copy file/directory using CoW when available
 - `share src="..."` - Symlink to shared content
 - `template src="..." dest="..."` - Copy and render with workspace template variables
-- `run "command"` - Execute shell command
+- `run "command"` - Execute shell command. Supports `{ env ... }` children for command-scoped env.
 - `proxy` - Register a reverse proxy route via [Station](station/README.md) - basically a shorthand for `run "station proxy {{ws.name}} --port <port> --upstream <upstream>"`
 
 All string arguments support `{{ ... }}` template variables.

@@ -104,12 +104,50 @@ pub struct RepoInfo {
 
 // ==================== Variable Definitions ====================
 
-/// A variable definition from a `vars {}` block.
+/// A variable definition from a top-level `var NAME=VALUE` line.
 /// All values are rendered through minijinja, so `{{ }}` template syntax works.
 #[derive(Debug, Clone)]
 pub struct VarDef {
     pub name: String,
     pub value: String,
+}
+
+/// Validate that an identifier matches the POSIX env/var name shape:
+/// `[A-Za-z_][A-Za-z0-9_]*`. Used for both `var` and `env` keys.
+fn validate_identifier(name: &str, kind: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let first = chars.next().ok_or_else(|| anyhow::anyhow!("{} name is empty", kind))?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        anyhow::bail!(
+            "{} name '{}' must start with a letter or underscore",
+            kind, name
+        );
+    }
+    for c in chars {
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            anyhow::bail!(
+                "{} name '{}' contains invalid character '{}' (allowed: letters, digits, underscore)",
+                kind, name, c
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Convert a KDL property value to a string. Handles strings, integers, floats, bools.
+/// Returns None for null or unsupported types.
+fn kdl_value_as_str(val: &kdl::KdlValue) -> Option<String> {
+    if let Some(s) = val.as_string() {
+        Some(s.to_string())
+    } else if let Some(n) = kdl_value_as_i64(val) {
+        Some(n.to_string())
+    } else if let Some(f) = val.as_float() {
+        Some(f.to_string())
+    } else if let Some(b) = val.as_bool() {
+        Some(b.to_string())
+    } else {
+        None
+    }
 }
 
 /// Evaluate a list of variable definitions sequentially.
@@ -155,6 +193,47 @@ pub enum PortSpec {
     Named(String),
 }
 
+/// Parse a `.env`-style file: `KEY=VALUE` per line, `#` line-comments, blank lines skipped.
+/// Splits on the first `=`. No `export ` prefix, no shell expansion, no quote stripping —
+/// values are taken literally so behavior is predictable. Missing files are a hard error.
+fn parse_env_file(path: &Path) -> Result<Vec<(String, String)>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read env file: {}", path.display()))?;
+    let mut pairs = Vec::new();
+    for (lineno, line) in content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (key, value) = trimmed.split_once('=').with_context(|| {
+            format!(
+                "{}:{}: expected KEY=VALUE, got: {}",
+                path.display(),
+                lineno + 1,
+                line
+            )
+        })?;
+        let key = key.trim_end();
+        validate_identifier(key, "env").with_context(|| {
+            format!("{}:{}: invalid env key", path.display(), lineno + 1)
+        })?;
+        pairs.push((key.to_string(), value.to_string()));
+    }
+    Ok(pairs)
+}
+
+// ==================== Env Directives ====================
+
+/// A single `env` node. Either loads files or sets inline pairs — never both.
+/// Multiple directives accumulate procedurally; on key collision, last-wins.
+#[derive(Debug, Clone)]
+pub enum EnvDirective {
+    /// `env "FILE" "FILE2"` — load env files in source order. Paths are repo-root-relative.
+    Files(Vec<String>),
+    /// `env KEY=VALUE KEY2=VALUE2` — inline pairs. Values are templated via minijinja.
+    Pairs(Vec<(String, String)>),
+}
+
 // ==================== Actions ====================
 
 /// An action to execute during setup or destroy
@@ -174,6 +253,9 @@ pub enum Action {
     Run {
         command: String,
         cwd: Option<String>,
+        /// Run-child env directives. Applied on top of the surrounding env state for
+        /// this command only — never leak to subsequent actions.
+        child_env: Vec<EnvDirective>,
     },
     /// Manage a station reverse-proxy route
     Proxy {
@@ -182,6 +264,8 @@ pub enum Action {
         tls: Option<bool>,
         name: Option<String>,
     },
+    /// Set environment variables for everything following in this scope.
+    Env(EnvDirective),
 }
 
 /// Failure handling mode for setup/destroy actions
@@ -215,6 +299,8 @@ pub struct BreqConfig {
     pub setup: Vec<ParsedAction>,
     pub destroy: Vec<ParsedAction>,
     pub vars: Vec<VarDef>,
+    /// Top-level `env` directives, applied in source order before setup or destroy actions.
+    pub global_env: Vec<EnvDirective>,
 }
 
 impl BreqConfig {
@@ -271,11 +357,14 @@ impl BreqConfig {
                 "destroy" => {
                     config.destroy = Self::parse_block(node)?;
                 }
-                "vars" => {
-                    config.vars = Self::parse_vars(node)?;
+                "var" => {
+                    Self::parse_var_node(node, &mut config.vars)?;
+                }
+                "env" => {
+                    config.global_env.push(Self::parse_env_node(node)?);
                 }
                 other => {
-                    warn!("Unknown top-level block in toren.kdl: {}", other);
+                    warn!("Unknown top-level node in toren.kdl: {}", other);
                 }
             }
         }
@@ -283,31 +372,83 @@ impl BreqConfig {
         Ok(config)
     }
 
-    fn parse_vars(node: &KdlNode) -> Result<Vec<VarDef>> {
-        let mut vars = Vec::new();
+    /// Parse a flat `var NAME=VALUE NAME2=VALUE2` node and append to `vars`.
+    /// Positional args are rejected (reserved for future file-form symmetry with `env`).
+    fn parse_var_node(node: &KdlNode, vars: &mut Vec<VarDef>) -> Result<()> {
+        let entries = node.entries();
+        let has_args = entries.iter().any(|e| e.name().is_none());
+        let has_props = entries.iter().any(|e| e.name().is_some());
+        if has_args {
+            anyhow::bail!(
+                "var: positional arguments are not supported; use `var NAME=VALUE`"
+            );
+        }
+        if !has_props {
+            anyhow::bail!("var: requires at least one NAME=VALUE pair");
+        }
+        if node.children().is_some() {
+            anyhow::bail!("var: child blocks are not supported");
+        }
+        for entry in entries {
+            let name = entry
+                .name()
+                .map(|n| n.value().to_string())
+                .expect("filtered to property entries");
+            validate_identifier(&name, "var")?;
+            let value = kdl_value_as_str(entry.value())
+                .with_context(|| format!("var '{}' has unsupported value type", name))?;
+            vars.push(VarDef { name, value });
+        }
+        Ok(())
+    }
 
-        if let Some(children) = node.children() {
-            for child in children.nodes() {
-                let name = child.name().value().to_string();
-
-                let value = child
-                    .entries()
-                    .iter()
-                    .find(|e| e.name().is_none())
-                    .and_then(|e| {
-                        // Support both string and integer literals
-                        if let Some(s) = e.value().as_string() {
-                            Some(s.to_string())
-                        } else {
-                            kdl_value_as_i64(e.value()).map(|n| n.to_string())
-                        }
-                    })
-                    .with_context(|| format!("var '{}' requires a value", name))?;
-                vars.push(VarDef { name, value });
-            }
+    /// Parse an `env` node into an EnvDirective. Either file form (positional string args)
+    /// or pair form (KEY=VALUE properties), never both.
+    fn parse_env_node(node: &KdlNode) -> Result<EnvDirective> {
+        // Reject child blocks first so `env { KEY VALUE; ... }` (the abandoned block form)
+        // gets a precise error instead of "requires either file paths or pairs".
+        if node.children().is_some() {
+            anyhow::bail!("env: child blocks are not supported");
         }
 
-        Ok(vars)
+        let entries = node.entries();
+        let has_args = entries.iter().any(|e| e.name().is_none());
+        let has_props = entries.iter().any(|e| e.name().is_some());
+
+        if has_args && has_props {
+            anyhow::bail!(
+                "env: cannot mix positional path args with KEY=VALUE properties on the same node; use two separate `env` lines"
+            );
+        }
+        if !has_args && !has_props {
+            anyhow::bail!(
+                "env: requires either file paths (e.g. `env \".env\"`) or pairs (e.g. `env KEY=VALUE`)"
+            );
+        }
+
+        if has_args {
+            let mut paths = Vec::new();
+            for entry in entries {
+                let path = entry.value().as_string().with_context(|| {
+                    "env: file path arguments must be quoted strings".to_string()
+                })?;
+                paths.push(path.to_string());
+            }
+            Ok(EnvDirective::Files(paths))
+        } else {
+            let mut pairs = Vec::new();
+            for entry in entries {
+                let name = entry
+                    .name()
+                    .map(|n| n.value().to_string())
+                    .expect("filtered to property entries");
+                validate_identifier(&name, "env")?;
+                let value = kdl_value_as_str(entry.value())
+                    .with_context(|| format!("env '{}' has unsupported value type", name))?;
+                pairs.push((name, value));
+            }
+            Ok(EnvDirective::Pairs(pairs))
+        }
     }
 
     fn parse_block(node: &KdlNode) -> Result<Vec<ParsedAction>> {
@@ -399,8 +540,22 @@ impl BreqConfig {
                     .get("cwd")
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
-                Ok(Action::Run { command, cwd })
+                // run-child env directives (scoped to this command only)
+                let mut child_env = Vec::new();
+                if let Some(children) = node.children() {
+                    for child in children.nodes() {
+                        match child.name().value() {
+                            "env" => child_env.push(Self::parse_env_node(child)?),
+                            other => anyhow::bail!(
+                                "run: unsupported child node '{}' (only `env` is allowed)",
+                                other
+                            ),
+                        }
+                    }
+                }
+                Ok(Action::Run { command, cwd, child_env })
             }
+            "env" => Ok(Action::Env(Self::parse_env_node(node)?)),
             "proxy" => {
                 // First positional arg: port number or string (protocol/"{{template}}")
                 let first = node
@@ -562,7 +717,7 @@ impl WorkspaceSetup {
     pub fn run_setup(&self) -> Result<SetupResult> {
         let config = BreqConfig::parse(&self.repo_root)?;
 
-        if config.setup.is_empty() && config.vars.is_empty() {
+        if config.setup.is_empty() && config.vars.is_empty() && config.global_env.is_empty() {
             debug!("No setup actions defined");
             return Ok(SetupResult);
         }
@@ -581,7 +736,13 @@ impl WorkspaceSetup {
             ctx.vars = vars;
         }
 
-        self.execute_actions(&config.setup, &ctx)?;
+        // Apply global env directives in source order (last-wins on key collision)
+        let mut env_state = HashMap::new();
+        for directive in &config.global_env {
+            self.apply_env_directive(directive, &mut env_state, &ctx)?;
+        }
+
+        self.execute_actions(&config.setup, &ctx, &mut env_state)?;
 
         info!("Workspace setup complete");
         Ok(SetupResult)
@@ -616,8 +777,14 @@ impl WorkspaceSetup {
             ctx.vars = vars;
         }
 
+        // Destroy is isolated from setup but inherits global env, just like setup.
+        let mut env_state = HashMap::new();
+        for directive in &config.global_env {
+            self.apply_env_directive(directive, &mut env_state, &ctx)?;
+        }
+
         if has_destroy {
-            self.execute_actions(&config.destroy, &ctx)?;
+            self.execute_actions(&config.destroy, &ctx, &mut env_state)?;
         }
 
         // Auto-forget proxy routes from setup block (best-effort)
@@ -633,17 +800,18 @@ impl WorkspaceSetup {
         Ok(SetupResult)
     }
 
-    /// Execute a list of actions in order.
-    /// Respects on_fail metadata on each action.
+    /// Execute a list of actions in order, threading the env state through `Env` directives
+    /// and run-child env scopes. Respects on_fail metadata on each action.
     fn execute_actions(
         &self,
         actions: &[ParsedAction],
         ctx: &WorkspaceContext,
+        env_state: &mut HashMap<String, String>,
     ) -> Result<()> {
         for (i, parsed) in actions.iter().enumerate() {
             trace!("Executing action {}: {:?}", i + 1, parsed.action);
             let res = self
-                .execute_action(&parsed.action, ctx)
+                .execute_action(&parsed.action, ctx, env_state)
                 .with_context(|| format!("Action {} failed", i + 1));
 
             if let Err(e) = res {
@@ -658,19 +826,66 @@ impl WorkspaceSetup {
         Ok(())
     }
 
-    fn execute_action(&self, action: &Action, ctx: &WorkspaceContext) -> Result<()> {
+    fn execute_action(
+        &self,
+        action: &Action,
+        ctx: &WorkspaceContext,
+        env_state: &mut HashMap<String, String>,
+    ) -> Result<()> {
         match action {
             Action::Template { src, dest } => self.execute_template(src, dest, ctx),
             Action::Copy { src, dest, from } => self.execute_copy(src, dest, from.as_deref(), ctx),
             Action::Share { src, from } => self.execute_share(src, from.as_deref(), ctx),
-            Action::Run { command, cwd } => self.execute_run(command, cwd.as_deref(), ctx),
+            Action::Run { command, cwd, child_env } => {
+                // Build a per-command env scope: clone surrounding state and overlay child_env.
+                // Mutations here do not leak back to env_state.
+                let mut run_env = env_state.clone();
+                for directive in child_env {
+                    self.apply_env_directive(directive, &mut run_env, ctx)?;
+                }
+                self.execute_run(command, cwd.as_deref(), ctx, &run_env)
+            }
             Action::Proxy {
                 port,
                 upstream,
                 tls,
                 name,
             } => self.execute_proxy(port, upstream, *tls, name.as_deref(), ctx),
+            Action::Env(directive) => {
+                self.apply_env_directive(directive, env_state, ctx)
+            }
         }
+    }
+
+    /// Apply a single env directive to `state`, last-wins on key collision.
+    /// Files are read from repo root (paths are minijinja-rendered, matching
+    /// `template src=` and `copy src=`). File contents themselves are taken
+    /// literally — no templating, no shell expansion.
+    fn apply_env_directive(
+        &self,
+        directive: &EnvDirective,
+        state: &mut HashMap<String, String>,
+        ctx: &WorkspaceContext,
+    ) -> Result<()> {
+        match directive {
+            EnvDirective::Files(paths) => {
+                for path in paths {
+                    let rendered_path = self.render_string(path, ctx)?;
+                    let full_path = self.repo_root.join(&rendered_path);
+                    let pairs = parse_env_file(&full_path)?;
+                    for (k, v) in pairs {
+                        state.insert(k, v);
+                    }
+                }
+            }
+            EnvDirective::Pairs(pairs) => {
+                for (k, v) in pairs {
+                    let rendered = self.render_string(v, ctx)?;
+                    state.insert(k.clone(), rendered);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn execute_template(&self, src: &str, dest: &str, ctx: &WorkspaceContext) -> Result<()> {
@@ -819,7 +1034,13 @@ impl WorkspaceSetup {
         render_template(template, ctx)
     }
 
-    fn execute_run(&self, command: &str, cwd: Option<&str>, ctx: &WorkspaceContext) -> Result<()> {
+    fn execute_run(
+        &self,
+        command: &str,
+        cwd: Option<&str>,
+        ctx: &WorkspaceContext,
+        env_overrides: &HashMap<String, String>,
+    ) -> Result<()> {
         let command = self.render_string(command, ctx)?;
         let cwd_rendered = cwd
             .map(|c| self.render_string(c, ctx))
@@ -847,6 +1068,11 @@ impl WorkspaceSetup {
         // Inject STATION_DOMAIN env var if available
         if let Some(domain) = self.station_domain() {
             cmd.env("STATION_DOMAIN", &domain);
+        }
+
+        // Apply env overrides on top of inherited shell env. Config wins over inherited.
+        for (k, v) in env_overrides {
+            cmd.env(k, v);
         }
 
         let mut child = cmd
@@ -1044,9 +1270,10 @@ destroy {
         }
 
         match &config.setup[1].action {
-            Action::Run { command, cwd } => {
+            Action::Run { command, cwd, child_env } => {
                 assert_eq!(command, "pnpm install");
                 assert!(cwd.is_none());
+                assert!(child_env.is_empty());
             }
             _ => panic!("Expected Run action"),
         }
@@ -1183,16 +1410,18 @@ setup {
 
         assert_eq!(config.setup.len(), 2);
         match &config.setup[0].action {
-            Action::Run { command, cwd } => {
+            Action::Run { command, cwd, child_env } => {
                 assert_eq!(command, "pnpm install");
                 assert_eq!(cwd.as_deref(), Some("web"));
+                assert!(child_env.is_empty());
             }
             _ => panic!("Expected Run action"),
         }
         match &config.setup[1].action {
-            Action::Run { command, cwd } => {
+            Action::Run { command, cwd, child_env } => {
                 assert_eq!(command, "cargo build");
                 assert!(cwd.is_none());
+                assert!(child_env.is_empty());
             }
             _ => panic!("Expected Run action"),
         }
@@ -1201,11 +1430,11 @@ setup {
     #[test]
     fn test_parse_init_template() {
         // Matches the exact template `breq init` emits. Regression guard:
-        // if KDL parsing rules change around commented-out entries or empty
-        // setup blocks, init-generated files must still round-trip.
-        let content = "vars {\n    // subdomain \"{{ ws.name }}.{{ repo.name }}\"\n}\n\nsetup {\n}\n\ndestroy { }\n";
+        // if the parser changes around commented-out entries or empty setup
+        // blocks, init-generated files must still round-trip.
+        let content = "// var subdomain=\"{{ ws.name }}.{{ repo.name }}\"\n\nsetup {\n}\n\ndestroy { }\n";
         let config = BreqConfig::parse_kdl(content).expect("init template must parse");
-        assert_eq!(config.vars.len(), 0, "comment-only vars block yields no vars");
+        assert_eq!(config.vars.len(), 0, "comment-only init template yields no vars");
         assert_eq!(config.setup.len(), 0);
         assert_eq!(config.destroy.len(), 0);
     }
@@ -1213,10 +1442,8 @@ setup {
     #[test]
     fn test_parse_vars_literal() {
         let content = r#"
-vars {
-    port 5173
-    name "my-app"
-}
+var port=5173
+var name="my-app"
 setup { }
 "#;
 
@@ -1232,10 +1459,8 @@ setup { }
     #[test]
     fn test_parse_vars_template() {
         let content = r#"
-vars {
-    base_port 5170
-    port "{{ vars.base_port + ws.num }}"
-}
+var base_port=5170
+var port="{{ vars.base_port + ws.num }}"
 setup { }
 "#;
 
@@ -1244,6 +1469,55 @@ setup { }
 
         assert_eq!(config.vars[1].name, "port");
         assert_eq!(config.vars[1].value, "{{ vars.base_port + ws.num }}");
+    }
+
+    #[test]
+    fn test_parse_var_multi_pair() {
+        // Multiple pairs on one node
+        let content = r#"var greeting="hello" target="world""#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.vars.len(), 2);
+        assert_eq!(config.vars[0].name, "greeting");
+        assert_eq!(config.vars[0].value, "hello");
+        assert_eq!(config.vars[1].name, "target");
+        assert_eq!(config.vars[1].value, "world");
+    }
+
+    #[test]
+    fn test_parse_var_rejects_positional() {
+        let content = r#"var "foo""#;
+        let err = BreqConfig::parse_kdl(content).unwrap_err();
+        assert!(
+            err.to_string().contains("positional arguments"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_var_rejects_empty() {
+        let content = "var";
+        let err = BreqConfig::parse_kdl(content).unwrap_err();
+        assert!(
+            err.to_string().contains("at least one"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_var_rejects_invalid_name() {
+        // Names starting with digit or containing hyphens are invalid POSIX env identifiers.
+        // KDL itself rejects bare property names that start with a digit, so we test via
+        // a name that is a valid KDL ident but invalid POSIX (contains hyphen).
+        let content = r#"var "BAD-NAME"="x""#;
+        let err = BreqConfig::parse_kdl(content).unwrap_err();
+        // KDL parses "BAD-NAME"="x" as a property with quoted name → our validator catches the hyphen.
+        assert!(
+            err.to_string().contains("invalid character") || err.to_string().contains("must start"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -1390,27 +1664,27 @@ destroy {
         WorkspaceSetup::new(dir.clone(), dir, "test".to_string(), 1, None)
     }
 
+    fn run_action(command: &str, on_fail: OnFail) -> ParsedAction {
+        ParsedAction {
+            action: Action::Run {
+                command: command.to_string(),
+                cwd: None,
+                child_env: Vec::new(),
+            },
+            on_fail,
+        }
+    }
+
     #[test]
     fn test_execute_actions_on_fail_warn_continues() {
         let setup = test_setup();
         let ctx = setup.build_context();
+        let mut env = HashMap::new();
         let actions = vec![
-            ParsedAction {
-                action: Action::Run {
-                    command: "exit 1".to_string(),
-                    cwd: None,
-                },
-                on_fail: OnFail::Warn,
-            },
-            ParsedAction {
-                action: Action::Run {
-                    command: "echo ok".to_string(),
-                    cwd: None,
-                },
-                on_fail: OnFail::Exit,
-            },
+            run_action("exit 1", OnFail::Warn),
+            run_action("echo ok", OnFail::Exit),
         ];
-        let result = setup.execute_actions(&actions, &ctx);
+        let result = setup.execute_actions(&actions, &ctx, &mut env);
         assert!(result.is_ok(), "on_fail=warn should continue: {:?}", result);
     }
 
@@ -1418,23 +1692,12 @@ destroy {
     fn test_execute_actions_on_fail_ignore_continues() {
         let setup = test_setup();
         let ctx = setup.build_context();
+        let mut env = HashMap::new();
         let actions = vec![
-            ParsedAction {
-                action: Action::Run {
-                    command: "exit 1".to_string(),
-                    cwd: None,
-                },
-                on_fail: OnFail::Ignore,
-            },
-            ParsedAction {
-                action: Action::Run {
-                    command: "echo ok".to_string(),
-                    cwd: None,
-                },
-                on_fail: OnFail::Exit,
-            },
+            run_action("exit 1", OnFail::Ignore),
+            run_action("echo ok", OnFail::Exit),
         ];
-        let result = setup.execute_actions(&actions, &ctx);
+        let result = setup.execute_actions(&actions, &ctx, &mut env);
         assert!(
             result.is_ok(),
             "on_fail=ignore should continue: {:?}",
@@ -1446,23 +1709,12 @@ destroy {
     fn test_execute_actions_on_fail_exit_aborts() {
         let setup = test_setup();
         let ctx = setup.build_context();
+        let mut env = HashMap::new();
         let actions = vec![
-            ParsedAction {
-                action: Action::Run {
-                    command: "exit 1".to_string(),
-                    cwd: None,
-                },
-                on_fail: OnFail::Exit,
-            },
-            ParsedAction {
-                action: Action::Run {
-                    command: "echo should-not-run".to_string(),
-                    cwd: None,
-                },
-                on_fail: OnFail::Exit,
-            },
+            run_action("exit 1", OnFail::Exit),
+            run_action("echo should-not-run", OnFail::Exit),
         ];
-        let result = setup.execute_actions(&actions, &ctx);
+        let result = setup.execute_actions(&actions, &ctx, &mut env);
         assert!(result.is_err(), "on_fail=exit should abort");
     }
 
@@ -1676,11 +1928,337 @@ setup {
                 action: Action::Run {
                     command: "echo hi".to_string(),
                     cwd: None,
+                    child_env: Vec::new(),
                 },
                 on_fail: OnFail::Exit,
             },
         ];
         let names = WorkspaceSetup::collect_proxy_station_names(&actions, "one", &ctx).unwrap();
         assert_eq!(names, vec!["api.one", "one"]);
+    }
+
+    // ─── env parsing tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_env_pair_form_global() {
+        let content = r#"env PORT=3000 NODE_ENV="dev""#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.global_env.len(), 1);
+        match &config.global_env[0] {
+            EnvDirective::Pairs(pairs) => {
+                assert_eq!(pairs.len(), 2);
+                assert_eq!(pairs[0], ("PORT".to_string(), "3000".to_string()));
+                assert_eq!(pairs[1], ("NODE_ENV".to_string(), "dev".to_string()));
+            }
+            _ => panic!("expected Pairs"),
+        }
+    }
+
+    #[test]
+    fn test_parse_env_file_form_global() {
+        let content = r#"env ".env" ".env.local""#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.global_env.len(), 1);
+        match &config.global_env[0] {
+            EnvDirective::Files(paths) => {
+                assert_eq!(paths, &vec![".env".to_string(), ".env.local".to_string()]);
+            }
+            _ => panic!("expected Files"),
+        }
+    }
+
+    #[test]
+    fn test_parse_env_rejects_mixed_forms() {
+        let content = r#"env ".env" PORT=3000"#;
+        let err = BreqConfig::parse_kdl(content).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot mix"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_env_rejects_empty_node() {
+        let content = "env";
+        let err = BreqConfig::parse_kdl(content).unwrap_err();
+        assert!(
+            err.to_string().contains("file paths") || err.to_string().contains("pairs"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_env_block_form_rejected() {
+        // The abandoned block form should get a precise "child blocks not supported"
+        // error, not the generic "requires either file paths or pairs" message.
+        let content = r#"env { PORT 3000; NODE_ENV "dev" }"#;
+        let err = BreqConfig::parse_kdl(content).unwrap_err();
+        assert!(
+            err.to_string().contains("child blocks"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_env_in_setup_block() {
+        let content = r#"
+setup {
+    env NODE_ENV="dev"
+    run "pnpm install"
+    env DEBUG=1
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.setup.len(), 3);
+        assert!(matches!(&config.setup[0].action, Action::Env(_)));
+        assert!(matches!(&config.setup[1].action, Action::Run { .. }));
+        assert!(matches!(&config.setup[2].action, Action::Env(_)));
+    }
+
+    #[test]
+    fn test_parse_env_in_destroy_block() {
+        let content = r#"
+destroy {
+    env CLEANUP_MODE="full"
+    run "just teardown"
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.destroy.len(), 2);
+        assert!(matches!(&config.destroy[0].action, Action::Env(_)));
+    }
+
+    #[test]
+    fn test_parse_env_as_run_child() {
+        let content = r#"
+setup {
+    run "pnpm build" {
+        env DATABASE_URL="postgres://localhost/db"
+        env ".env.test"
+    }
+}
+"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        assert_eq!(config.setup.len(), 1);
+        match &config.setup[0].action {
+            Action::Run { command, child_env, .. } => {
+                assert_eq!(command, "pnpm build");
+                assert_eq!(child_env.len(), 2);
+                assert!(matches!(&child_env[0], EnvDirective::Pairs(_)));
+                assert!(matches!(&child_env[1], EnvDirective::Files(_)));
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn test_parse_run_rejects_unknown_child() {
+        let content = r#"
+setup {
+    run "x" {
+        run "nested"
+    }
+}
+"#;
+        let err = BreqConfig::parse_kdl(content).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported child"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_env_value_supports_int_and_bool() {
+        let content = r#"env COUNT=42 ENABLED=#true"#;
+        let config = BreqConfig::parse_kdl(content).unwrap();
+        match &config.global_env[0] {
+            EnvDirective::Pairs(pairs) => {
+                assert_eq!(pairs[0], ("COUNT".to_string(), "42".to_string()));
+                assert_eq!(pairs[1], ("ENABLED".to_string(), "true".to_string()));
+            }
+            _ => panic!("expected Pairs"),
+        }
+    }
+
+    #[test]
+    fn test_parse_env_rejects_invalid_key() {
+        // Hyphens are valid KDL idents but invalid POSIX env names.
+        let content = r#"env "BAD-KEY"="x""#;
+        let err = BreqConfig::parse_kdl(content).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid character"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // ─── env file parsing tests ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_env_file_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.env");
+        fs::write(
+            &path,
+            "# comment\nFOO=bar\n\nBAZ=qux\nWITH_EQ=foo=bar=baz\n",
+        )
+        .unwrap();
+        let pairs = parse_env_file(&path).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("BAZ".to_string(), "qux".to_string()),
+                ("WITH_EQ".to_string(), "foo=bar=baz".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_file_missing_is_error() {
+        let path = std::env::temp_dir().join("definitely-not-here.env");
+        let _ = fs::remove_file(&path);
+        let err = parse_env_file(&path).unwrap_err();
+        assert!(err.to_string().contains("Failed to read env file"));
+    }
+
+    #[test]
+    fn test_parse_env_file_rejects_invalid_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.env");
+        fs::write(&path, "BAD-KEY=x\n").unwrap();
+        let err = parse_env_file(&path).unwrap_err();
+        assert!(err.to_string().contains("invalid env key"));
+    }
+
+    // ─── env execution tests ───────────────────────────────────────────
+
+    fn ctx_for_test() -> WorkspaceContext {
+        WorkspaceContext {
+            ws: WorkspaceInfo {
+                name: "test".to_string(),
+                num: 1,
+                path: "/tmp/ws".to_string(),
+            },
+            repo: RepoInfo {
+                root: "/tmp/repo".to_string(),
+                name: "repo".to_string(),
+            },
+            task: None,
+            vars: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_apply_env_directive_pairs_last_wins() {
+        let setup = test_setup();
+        let ctx = ctx_for_test();
+        let mut state = HashMap::new();
+        setup
+            .apply_env_directive(
+                &EnvDirective::Pairs(vec![
+                    ("A".to_string(), "1".to_string()),
+                    ("B".to_string(), "2".to_string()),
+                ]),
+                &mut state,
+                &ctx,
+            )
+            .unwrap();
+        setup
+            .apply_env_directive(
+                &EnvDirective::Pairs(vec![("A".to_string(), "99".to_string())]),
+                &mut state,
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(state.get("A"), Some(&"99".to_string()));
+        assert_eq!(state.get("B"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn test_apply_env_directive_templates_values() {
+        let setup = test_setup();
+        let mut ctx = ctx_for_test();
+        ctx.vars
+            .insert("port".to_string(), serde_json::json!(5173));
+        let mut state = HashMap::new();
+        setup
+            .apply_env_directive(
+                &EnvDirective::Pairs(vec![(
+                    "URL".to_string(),
+                    "http://localhost:{{ vars.port }}".to_string(),
+                )]),
+                &mut state,
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(state.get("URL"), Some(&"http://localhost:5173".to_string()));
+    }
+
+    #[test]
+    fn test_run_child_env_does_not_leak() {
+        // Use shell to verify env var presence: prints the var if set, "(unset)" otherwise.
+        // First run sets RUN_ONLY via child_env; second run checks it's gone.
+        let setup = test_setup();
+        let ctx = ctx_for_test();
+        let mut env_state = HashMap::new();
+        let actions = vec![
+            ParsedAction {
+                action: Action::Run {
+                    command: r#"test "${RUN_ONLY:-}" = "scoped""#.to_string(),
+                    cwd: None,
+                    child_env: vec![EnvDirective::Pairs(vec![(
+                        "RUN_ONLY".to_string(),
+                        "scoped".to_string(),
+                    )])],
+                },
+                on_fail: OnFail::Exit,
+            },
+            ParsedAction {
+                action: Action::Run {
+                    command: r#"test -z "${RUN_ONLY:-}""#.to_string(),
+                    cwd: None,
+                    child_env: Vec::new(),
+                },
+                on_fail: OnFail::Exit,
+            },
+        ];
+        let result = setup.execute_actions(&actions, &ctx, &mut env_state);
+        assert!(result.is_ok(), "child_env should not leak: {:?}", result);
+        assert!(
+            !env_state.contains_key("RUN_ONLY"),
+            "child_env must not be merged into env_state"
+        );
+    }
+
+    #[test]
+    fn test_env_action_persists_to_subsequent_runs() {
+        let setup = test_setup();
+        let ctx = ctx_for_test();
+        let mut env_state = HashMap::new();
+        let actions = vec![
+            ParsedAction {
+                action: Action::Env(EnvDirective::Pairs(vec![(
+                    "PERSIST".to_string(),
+                    "yes".to_string(),
+                )])),
+                on_fail: OnFail::Exit,
+            },
+            ParsedAction {
+                action: Action::Run {
+                    command: r#"test "${PERSIST:-}" = "yes""#.to_string(),
+                    cwd: None,
+                    child_env: Vec::new(),
+                },
+                on_fail: OnFail::Exit,
+            },
+        ];
+        let result = setup.execute_actions(&actions, &ctx, &mut env_state);
+        assert!(result.is_ok(), "env action should persist: {:?}", result);
+        assert_eq!(env_state.get("PERSIST"), Some(&"yes".to_string()));
     }
 }

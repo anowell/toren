@@ -1595,7 +1595,7 @@ fn cmd_init(stealth: bool) -> Result<()> {
         }
     }
 
-    let mut kdl = String::from("vars {\n    // subdomain \"{{ ws.name }}.{{ repo.name }}\"\n}\n\nsetup {\n");
+    let mut kdl = String::from("// var subdomain=\"{{ ws.name }}.{{ repo.name }}\"\n\nsetup {\n");
     for entry in &share_entries {
         kdl.push_str(&format!("    share src=\"{}\"\n", entry));
     }
