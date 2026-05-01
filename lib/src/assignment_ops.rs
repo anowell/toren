@@ -173,7 +173,7 @@ pub fn complete_assignment(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Auto-commit failed: {}", e);
+                    tracing::warn!("Auto-commit failed: {:#}", e);
                     // Continue — don't fail the complete over an auto-commit failure
                 }
             }
@@ -395,7 +395,7 @@ pub fn clean_assignment(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Auto-commit failed: {}", e);
+                    tracing::warn!("Auto-commit failed: {:#}", e);
                 }
             }
         }
@@ -446,8 +446,8 @@ fn cleanup_workspace(
     kill: bool,
     mode: CleanupMode,
 ) -> Result<SetupResult> {
+    // Process check is only meaningful if the workspace dir exists.
     if assignment.workspace_path.exists() {
-        // Check for running processes before cleanup
         let processes = crate::process::find_workspace_processes(&assignment.workspace_path);
         if !processes.is_empty() {
             if kill {
@@ -465,25 +465,24 @@ fn cleanup_workspace(
                 );
             }
         }
-
-        let ws_name = assignment
-            .workspace_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-
-        let segment_name = crate::ancillary_segment(&assignment.ancillary_id)
-            .unwrap_or_else(|| assignment.segment.clone());
-
-        let result =
-            ws_mgr.cleanup_workspace(segment_path, &segment_name, ws_name, mode)?;
-        info!("Workspace cleaned up for assignment {}", assignment.id);
-        Ok(result)
     } else {
         info!(
-            "Workspace already gone for assignment {}",
+            "Workspace dir already gone for assignment {}; running destroy hooks anyway",
             assignment.id
         );
-        Ok(SetupResult)
     }
+
+    let ws_name = assignment
+        .workspace_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    let segment_name = crate::ancillary_segment(&assignment.ancillary_id)
+        .unwrap_or_else(|| assignment.segment.clone());
+
+    let result =
+        ws_mgr.cleanup_workspace(segment_path, &segment_name, ws_name, mode)?;
+    info!("Workspace cleaned up for assignment {}", assignment.id);
+    Ok(result)
 }

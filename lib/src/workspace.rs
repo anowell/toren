@@ -1007,12 +1007,16 @@ impl WorkspaceManager {
     ) -> Result<SetupResult> {
         let ws_path = self.workspace_path(segment_name, workspace_name);
 
-        // Run destroy hooks if workspace exists
-        if ws_path.exists() {
-            if let Err(e) = self.run_destroy(segment_path, &ws_path, workspace_name) {
-                warn!("Workspace destroy hooks failed: {}", e);
-                // Continue with cleanup even if destroy fails
-            }
+        // Run destroy hooks. toren.kdl lives at the segment root, so destroy
+        // can run even when the workspace dir is gone — letting us tear down
+        // external resources (proxy routes, daemons, etc.) for a partially
+        // destroyed workspace. Individual actions opt into warn/ignore via
+        // on_fail if they need the workspace dir.
+        if let Err(e) = self.run_destroy(segment_path, &ws_path, workspace_name) {
+            // {:#} prints the full anyhow chain inline (outer + each `.context()`
+            // + the source error), instead of just the outermost message.
+            warn!("Workspace destroy hooks failed: {:#}", e);
+            // Continue with cleanup even if destroy fails
         }
 
         // Remove VCS tracking (backend-specific behavior based on mode)
@@ -1114,7 +1118,7 @@ impl WorkspaceManager {
                     workspace_name,
                     CleanupMode::Abort,
                 ) {
-                    warn!("Rollback cleanup also failed: {}", rollback_err);
+                    warn!("Rollback cleanup also failed: {:#}", rollback_err);
                 }
                 Err(e).with_context(|| {
                     format!(

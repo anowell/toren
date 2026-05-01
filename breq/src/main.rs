@@ -174,6 +174,12 @@ enum Commands {
         #[arg(long)]
         push: bool,
 
+        /// Run destroy hooks and clean up workspace state even if no
+        /// assignment record exists. Useful when a prior destroy failed
+        /// or setup never completed.
+        #[arg(long)]
+        force: bool,
+
         /// Segment to use
         #[arg(short, long)]
         segment: Option<String>,
@@ -462,8 +468,9 @@ fn main() -> Result<()> {
             workspace,
             kill,
             push,
+            force,
             segment,
-        } => cmd_destroy(&config, &workspace, kill, push, segment.as_deref()),
+        } => cmd_destroy(&config, &workspace, kill, push, force, segment.as_deref()),
         Commands::Cleanup { segment, all } => cmd_cleanup(&config, all, segment),
         Commands::Init { stealth } => cmd_init(stealth),
         Commands::Show {
@@ -1295,6 +1302,7 @@ fn cmd_destroy(
     workspace: &str,
     kill: bool,
     push: bool,
+    force: bool,
     segment_name: Option<&str>,
 ) -> Result<()> {
     let workspace_root = config.ancillaries.workspace_root.clone();
@@ -1305,45 +1313,97 @@ fn cmd_destroy(
 
     let segment = resolve_segment(&segment_mgr, segment_name)?;
 
-    // Resolve workspace name to assignment
     let ws_name = workspace.to_lowercase();
     let ancillary_num = toren_lib::word_to_number(&ws_name).unwrap_or(0);
     let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
 
     let assignment = assignment_mgr
         .get_active_for_ancillary(&ancillary_id_str)
-        .cloned()
-        .with_context(|| format!("No assignment found for workspace '{}'", ws_name))?;
+        .cloned();
 
-    // Render auto-commit message
-    let auto_commit_message = toren_lib::render_auto_commit_message(
-        toren_lib::DEFAULT_AUTO_COMMIT_MESSAGE,
-        &assignment,
-        &segment.name,
-        &segment.path,
-    );
+    match assignment {
+        Some(assignment) => {
+            let auto_commit_message = toren_lib::render_auto_commit_message(
+                toren_lib::DEFAULT_AUTO_COMMIT_MESSAGE,
+                &assignment,
+                &segment.name,
+                &segment.path,
+            );
 
-    eprintln!(
-        "Destroying workspace: {} ({})",
-        ws_name,
-        assignment.workspace_path.display()
-    );
+            eprintln!(
+                "Destroying workspace: {} ({})",
+                ws_name,
+                assignment.workspace_path.display()
+            );
 
-    let opts = toren_lib::CleanOptions {
-        push,
-        segment_path: &segment.path,
-        kill,
-        auto_commit_message,
-    };
+            let opts = toren_lib::CleanOptions {
+                push,
+                segment_path: &segment.path,
+                kill,
+                auto_commit_message,
+            };
 
-    let result =
-        toren_lib::clean_assignment(&assignment, &mut assignment_mgr, &workspace_mgr, &opts)?;
+            let result = toren_lib::clean_assignment(
+                &assignment,
+                &mut assignment_mgr,
+                &workspace_mgr,
+                &opts,
+            )?;
 
-    // Structured JSON to stdout
-    let json = serde_json::to_string(&result)?;
-    println!("{}", json);
+            let json = serde_json::to_string(&result)?;
+            println!("{}", json);
+            Ok(())
+        }
+        None if force => {
+            // No assignment record. Run destroy hooks + remove VCS tracking + delete dir
+            // for whatever state is on disk. Skip auto-commit/push (no assignment context).
+            let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name);
+            eprintln!(
+                "Force-destroying workspace: {} ({}) — no assignment record",
+                ws_name,
+                ws_path.display()
+            );
 
-    Ok(())
+            if push {
+                eprintln!("warning: --push has no effect with --force (no assignment to push)");
+            }
+
+            if ws_path.exists() {
+                let processes = toren_lib::process::find_workspace_processes(&ws_path);
+                if !processes.is_empty() {
+                    if kill {
+                        toren_lib::process::terminate_processes(
+                            &processes,
+                            std::time::Duration::from_secs(5),
+                        )?;
+                    } else {
+                        anyhow::bail!(
+                            toren_lib::process::WorkspaceProcessesRunning { processes }
+                        );
+                    }
+                }
+            }
+
+            workspace_mgr.cleanup_workspace(
+                &segment.path,
+                &segment.name,
+                &ws_name,
+                toren_lib::CleanupMode::Abort,
+            )?;
+
+            let result = serde_json::json!({
+                "workspace": ws_name,
+                "segment": segment.name,
+                "forced": true,
+            });
+            println!("{}", serde_json::to_string(&result)?);
+            Ok(())
+        }
+        None => anyhow::bail!(
+            "No assignment found for workspace '{}'. Use --force to clean up workspace state anyway.",
+            ws_name
+        ),
+    }
 }
 
 // ─── cleanup ────────────────────────────────────────────────────────────────

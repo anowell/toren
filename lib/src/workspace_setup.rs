@@ -792,7 +792,7 @@ impl WorkspaceSetup {
             Self::collect_proxy_station_names(&config.setup, &self.workspace_name, &ctx)?;
         for station_name in &proxy_names {
             if let Err(e) = self.execute_station_forget(station_name) {
-                warn!("Failed to forget station route '{}': {}", station_name, e);
+                warn!("Failed to forget station route '{}': {:#}", station_name, e);
             }
         }
 
