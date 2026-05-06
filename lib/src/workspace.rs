@@ -1076,7 +1076,7 @@ impl WorkspaceManager {
             return Ok(SetupResult);
         }
 
-        let setup = WorkspaceSetup::new(
+        let mut setup = WorkspaceSetup::new(
             segment_path.to_path_buf(),
             workspace_path.to_path_buf(),
             workspace_name.to_string(),

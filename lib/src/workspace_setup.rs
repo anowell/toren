@@ -610,6 +610,31 @@ impl BreqConfig {
 
 // ==================== Workspace Setup ====================
 
+/// Removes a directory on drop, including on panic. Used by `run_destroy` to
+/// clean up the fresh `.cleanup-*` dir it creates when no real workspace or
+/// pre-existing cleanup dir is available.
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl TempDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            warn!(
+                "Failed to remove temp destroy work dir {}: {}",
+                self.path.display(),
+                e
+            );
+        }
+    }
+}
+
 /// Manages workspace setup state and execution
 pub struct WorkspaceSetup {
     /// Path to the repository root (where toren.kdl lives)
@@ -622,6 +647,12 @@ pub struct WorkspaceSetup {
     ancillary_num: u32,
     /// Local domain for station proxy (e.g. "lvh.me")
     local_domain: Option<String>,
+    /// Fallback base dir for `run` actions during destroy when `workspace_path`
+    /// is missing. Set in `run_destroy` *only* when we actually had to fall
+    /// back (sibling `.cleanup-*` dir or a freshly created empty temp dir).
+    /// `None` whenever the live workspace dir is present, so non-degraded
+    /// destroys behave identically to setup.
+    destroy_fallback_workdir: Option<PathBuf>,
 }
 
 impl WorkspaceSetup {
@@ -638,6 +669,7 @@ impl WorkspaceSetup {
             workspace_name,
             ancillary_num,
             local_domain,
+            destroy_fallback_workdir: None,
         }
     }
 
@@ -749,7 +781,7 @@ impl WorkspaceSetup {
     }
 
     /// Run the destroy block, then auto-forget any proxy routes from the setup block.
-    pub fn run_destroy(&self) -> Result<SetupResult> {
+    pub fn run_destroy(&mut self) -> Result<SetupResult> {
         let config = BreqConfig::parse(&self.repo_root)?;
 
         let has_destroy = !config.destroy.is_empty();
@@ -769,6 +801,30 @@ impl WorkspaceSetup {
             self.workspace_path.display()
         );
 
+        // Resolve the base dir for `run` actions: live workspace if present,
+        // else a sibling .cleanup-* dir, else a fresh empty temp dir. The
+        // override is only set when we actually fell back, so non-degraded
+        // destroys keep the original (strict) cwd semantics.
+        let _temp_guard = match self.resolve_destroy_fallback_workdir()? {
+            Some((path, is_temp)) => {
+                self.destroy_fallback_workdir = Some(path.clone());
+                if is_temp {
+                    Some(TempDirGuard::new(path))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        self.run_destroy_with_workdir(&config, has_destroy)
+    }
+
+    fn run_destroy_with_workdir(
+        &self,
+        config: &BreqConfig,
+        has_destroy: bool,
+    ) -> Result<SetupResult> {
         let mut ctx = self.build_context();
 
         // Evaluate vars for destroy too (needed for template rendering in proxy names)
@@ -798,6 +854,96 @@ impl WorkspaceSetup {
 
         info!("Workspace destroy complete");
         Ok(SetupResult)
+    }
+
+    /// Resolve a fallback work dir for destroy `run` actions when the workspace
+    /// dir is gone. Returns:
+    /// - `Ok(None)` if the live workspace dir exists (no fallback needed).
+    /// - `Ok(Some((path, is_temp)))` otherwise, where `is_temp` is true when we
+    ///   created a fresh empty dir that the caller should remove.
+    ///
+    /// Fallback chain:
+    /// 1. Most recently modified `.cleanup-<ws>-<pid>` sibling under the
+    ///    workspace's parent dir (the same naming convention used by
+    ///    `delete_workspace`). The `<pid>` suffix must be all digits, so a
+    ///    workspace named "foo" never picks up the cleanup dir of "foo-bar".
+    /// 2. Otherwise a freshly created empty `.cleanup-<ws>-<pid>` sibling
+    ///    (with a warning, since destroy steps that need workspace contents
+    ///    will not work).
+    fn resolve_destroy_fallback_workdir(&self) -> Result<Option<(PathBuf, bool)>> {
+        if self.workspace_path.exists() {
+            return Ok(None);
+        }
+
+        let parent = self.workspace_path.parent().with_context(|| {
+            format!(
+                "Workspace path has no parent: {}",
+                self.workspace_path.display()
+            )
+        })?;
+
+        let cleanup_prefix = format!(".cleanup-{}-", self.workspace_name);
+
+        let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+        match std::fs::read_dir(parent) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    let Some(suffix) = name_str.strip_prefix(&cleanup_prefix) else {
+                        continue;
+                    };
+                    // Suffix must be the pid (digits only). Anything else is a
+                    // different workspace's cleanup dir whose name happens to
+                    // share our prefix (e.g. "foo" vs "foo-bar").
+                    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+                        continue;
+                    }
+                    let Ok(meta) = entry.metadata() else { continue };
+                    if !meta.is_dir() {
+                        continue;
+                    }
+                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    match &best {
+                        Some((b_mt, _)) if mtime <= *b_mt => {}
+                        _ => best = Some((mtime, entry.path())),
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "read_dir({}) failed while looking for cleanup dirs: {}",
+                    parent.display(),
+                    e
+                );
+            }
+        }
+
+        if let Some((_, path)) = best {
+            warn!(
+                "Workspace dir {} is gone; running destroy in cleanup dir {}",
+                self.workspace_path.display(),
+                path.display()
+            );
+            return Ok(Some((path, false)));
+        }
+
+        // Last resort: empty temp dir. Some destroy steps may not work, but
+        // those that depend only on env (e.g. `dropdb`) will still succeed.
+        let temp_name = format!("{}{}", cleanup_prefix, std::process::id());
+        let temp_path = parent.join(&temp_name);
+        std::fs::create_dir_all(&temp_path).with_context(|| {
+            format!(
+                "Failed to create temp destroy work dir: {}",
+                temp_path.display()
+            )
+        })?;
+        warn!(
+            "Workspace dir {} is gone and no cleanup dir was found; running destroy in empty temp dir {} (some destroy steps may not work)",
+            self.workspace_path.display(),
+            temp_path.display()
+        );
+        Ok(Some((temp_path, true)))
     }
 
     /// Execute a list of actions in order, threading the env state through `Env` directives
@@ -1046,10 +1192,28 @@ impl WorkspaceSetup {
             .map(|c| self.render_string(c, ctx))
             .transpose()?;
 
-        // Resolve cwd: if provided, relative to workspace; otherwise workspace root
-        let work_dir = match &cwd_rendered {
-            Some(dir) => self.workspace_path.join(dir),
-            None => self.workspace_path.clone(),
+        // Resolve cwd: if provided, relative to workspace; otherwise workspace root.
+        // `destroy_fallback_workdir` is set only when the workspace dir is gone
+        // and we fell back to a sibling cleanup or temp dir; in that case a
+        // workspace-relative cwd is meaningless, so we ignore it (with a warn)
+        // and run in the fallback base instead. Otherwise we use workspace_path
+        // unchanged, preserving the strict spawn-ENOENT behavior that surfaces
+        // misconfigured `cwd=` values during normal setup or destroy runs.
+        let work_dir = match self.destroy_fallback_workdir.as_ref() {
+            Some(fallback) => {
+                if let Some(dir) = &cwd_rendered {
+                    warn!(
+                        "Destroy fallback: ignoring cwd '{}' (workspace dir is gone); running in {}",
+                        dir,
+                        fallback.display()
+                    );
+                }
+                fallback.clone()
+            }
+            None => match &cwd_rendered {
+                Some(dir) => self.workspace_path.join(dir),
+                None => self.workspace_path.clone(),
+            },
         };
 
         if let Some(dir) = &cwd_rendered {
@@ -2260,5 +2424,87 @@ setup {
         let result = setup.execute_actions(&actions, &ctx, &mut env_state);
         assert!(result.is_ok(), "env action should persist: {:?}", result);
         assert_eq!(env_state.get("PERSIST"), Some(&"yes".to_string()));
+    }
+
+    // ─── destroy fallback workdir resolution ───────────────────────────
+
+    fn destroy_setup(repo_root: &Path, ws_name: &str) -> WorkspaceSetup {
+        let ws_path = repo_root.join(ws_name);
+        WorkspaceSetup::new(
+            repo_root.to_path_buf(),
+            ws_path,
+            ws_name.to_string(),
+            0,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_resolve_destroy_workdir_returns_none_when_workspace_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("ws-a")).unwrap();
+        let setup = destroy_setup(dir.path(), "ws-a");
+        let resolved = setup.resolve_destroy_fallback_workdir().unwrap();
+        assert!(
+            resolved.is_none(),
+            "live workspace dir should not trigger fallback"
+        );
+    }
+
+    #[test]
+    fn test_resolve_destroy_workdir_picks_existing_cleanup_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        // workspace dir intentionally absent
+        let cleanup = dir.path().join(".cleanup-ws-a-12345");
+        fs::create_dir_all(&cleanup).unwrap();
+        let setup = destroy_setup(dir.path(), "ws-a");
+        let (path, is_temp) = setup
+            .resolve_destroy_fallback_workdir()
+            .unwrap()
+            .expect("expected fallback");
+        assert_eq!(path, cleanup);
+        assert!(!is_temp, "reused sibling should not be marked temp");
+    }
+
+    #[test]
+    fn test_resolve_destroy_workdir_creates_fresh_temp_when_no_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let setup = destroy_setup(dir.path(), "ws-a");
+        let (path, is_temp) = setup
+            .resolve_destroy_fallback_workdir()
+            .unwrap()
+            .expect("expected fallback");
+        assert!(is_temp, "fresh dir should be marked temp");
+        assert!(path.is_dir(), "fresh dir should exist on disk");
+        assert!(path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .starts_with(".cleanup-ws-a-"));
+        // cleanup since no Drop guard is involved here
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn test_resolve_destroy_workdir_ignores_prefix_collision() {
+        // Workspace "foo"'s cleanup prefix is ".cleanup-foo-". Workspace
+        // "foo-bar"'s cleanup dir name (".cleanup-foo-bar-12345") shares that
+        // prefix but its suffix isn't all-digit. Resolving "foo" must skip it
+        // and create a fresh temp dir, not run destroy hooks in the unrelated
+        // sibling.
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = dir.path().join(".cleanup-foo-bar-12345");
+        fs::create_dir_all(&foreign).unwrap();
+        let setup = destroy_setup(dir.path(), "foo");
+        let (path, is_temp) = setup
+            .resolve_destroy_fallback_workdir()
+            .unwrap()
+            .expect("expected fallback");
+        assert_ne!(
+            path, foreign,
+            "must not pick up foo-bar's cleanup dir when destroying foo"
+        );
+        assert!(is_temp, "expected a freshly created temp dir");
+        let _ = fs::remove_dir_all(&path);
     }
 }
