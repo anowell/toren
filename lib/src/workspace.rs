@@ -25,7 +25,11 @@ fn spawn_background_cleanup(parent: PathBuf) {
         let entries = match std::fs::read_dir(&parent) {
             Ok(entries) => entries,
             Err(e) => {
-                warn!("Failed to read directory for cleanup {}: {}", parent.display(), e);
+                warn!(
+                    "Failed to read directory for cleanup {}: {}",
+                    parent.display(),
+                    e
+                );
                 return;
             }
         };
@@ -306,7 +310,9 @@ impl VcsBackend for JjBackend {
     }
 
     fn auto_commit(&self, workspace_path: &Path, message: &str) -> Result<bool> {
-        // Check if jj working commit is empty
+        // `jj commit -m` rewrites the working-copy commit `@`, which *is* the work.
+        // Skip when `@` is already described (would clobber the agent's message) or
+        // already pushed (would diverge from shared/merged history).
         let diff_output = Command::new("jj")
             .args(["diff", "--stat"])
             .current_dir(workspace_path)
@@ -315,13 +321,50 @@ impl VcsBackend for JjBackend {
 
         let is_empty = diff_output
             .as_ref()
-            .map(|o| {
-                o.status.success() && String::from_utf8_lossy(&o.stdout).trim().is_empty()
-            })
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim().is_empty())
             .unwrap_or(true);
 
         if is_empty {
             debug!("jj working commit is empty, skipping auto-commit");
+            return Ok(false);
+        }
+
+        let desc_output = Command::new("jj")
+            .args(["log", "-r", "@", "--no-graph", "-T", "description"])
+            .current_dir(workspace_path)
+            .output()
+            .ok();
+
+        let has_description = desc_output
+            .as_ref()
+            .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false);
+
+        if has_description {
+            debug!("jj working commit already has a description, skipping auto-commit");
+            return Ok(false);
+        }
+
+        let remote_output = Command::new("jj")
+            .args([
+                "log",
+                "-r",
+                "@ & ::remote_bookmarks()",
+                "--no-graph",
+                "-T",
+                "change_id",
+            ])
+            .current_dir(workspace_path)
+            .output()
+            .ok();
+
+        let is_published = remote_output
+            .as_ref()
+            .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false);
+
+        if is_published {
+            debug!("jj working commit is already published to a remote, skipping auto-commit");
             return Ok(false);
         }
 
@@ -592,17 +635,13 @@ impl VcsBackend for GitWorktreeBackend {
                 }
                 if let Some(ref_name) = line.strip_prefix("branch ") {
                     // "refs/heads/one" -> "one"
-                    branch = ref_name
-                        .strip_prefix("refs/heads/")
-                        .map(|s| s.to_string());
+                    branch = ref_name.strip_prefix("refs/heads/").map(|s| s.to_string());
                 }
             }
 
             // Skip the main worktree
             if let Some(ref wt_path) = worktree_path {
-                let wt_canonical = wt_path
-                    .canonicalize()
-                    .unwrap_or_else(|_| wt_path.clone());
+                let wt_canonical = wt_path.canonicalize().unwrap_or_else(|_| wt_path.clone());
                 if wt_canonical == segment_canonical {
                     continue;
                 }
@@ -690,9 +729,7 @@ impl VcsBackend for GitWorktreeBackend {
 
         let is_clean = status_output
             .as_ref()
-            .map(|o| {
-                o.status.success() && String::from_utf8_lossy(&o.stdout).trim().is_empty()
-            })
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim().is_empty())
             .unwrap_or(true);
 
         if is_clean {
@@ -741,8 +778,7 @@ impl VcsBackend for GitWorktreeBackend {
             .ok();
 
         if let Some(output) = log_output {
-            if output.status.success()
-                && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+            if output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
             {
                 return true;
             }
@@ -756,8 +792,7 @@ impl VcsBackend for GitWorktreeBackend {
             .ok();
 
         if let Some(output) = diff_output {
-            if output.status.success()
-                && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+            if output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
             {
                 return true;
             }
@@ -818,7 +853,10 @@ impl WorkspaceManager {
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(&workspace_root)
         };
-        Self { workspace_root, local_domain }
+        Self {
+            workspace_root,
+            local_domain,
+        }
     }
 
     /// Get the VCS backend for a segment based on repo type detection
@@ -890,11 +928,7 @@ impl WorkspaceManager {
     }
 
     /// Capture the current revision/commit hash
-    pub fn capture_revision(
-        &self,
-        segment_path: &Path,
-        workspace_path: &Path,
-    ) -> Option<String> {
+    pub fn capture_revision(&self, segment_path: &Path, workspace_path: &Path) -> Option<String> {
         self.backend_for(segment_path)
             .capture_revision(workspace_path)
     }
@@ -968,15 +1002,11 @@ impl WorkspaceManager {
         let ws_path = self.workspace_path(segment_name, workspace_name);
 
         if ws_path.exists() {
-            let parent = ws_path.parent().with_context(|| {
-                format!("Workspace path has no parent: {}", ws_path.display())
-            })?;
+            let parent = ws_path
+                .parent()
+                .with_context(|| format!("Workspace path has no parent: {}", ws_path.display()))?;
 
-            let cleanup_name = format!(
-                ".cleanup-{}-{}",
-                workspace_name,
-                std::process::id()
-            );
+            let cleanup_name = format!(".cleanup-{}-{}", workspace_name, std::process::id());
             let cleanup_path = parent.join(&cleanup_name);
 
             info!(
@@ -1099,12 +1129,7 @@ impl WorkspaceManager {
         let ws_path = self.create_workspace(segment_path, segment_name, workspace_name)?;
 
         // Run setup hooks if toren.kdl exists - fail if setup fails
-        match self.run_setup(
-            segment_path,
-            &ws_path,
-            workspace_name,
-            ancillary_num,
-        ) {
+        match self.run_setup(segment_path, &ws_path, workspace_name, ancillary_num) {
             Ok(setup_result) => Ok((ws_path, setup_result)),
             Err(e) => {
                 // Rollback: remove VCS tracking + delete the partially-created workspace
@@ -1185,7 +1210,9 @@ mod tests {
     fn test_git_worktree_list_parse() {
         // Test that we can create the backend and it handles nonexistent dirs gracefully
         let backend = GitWorktreeBackend;
-        assert!(backend.list_workspaces(std::path::Path::new("/nonexistent")).is_err());
+        assert!(backend
+            .list_workspaces(std::path::Path::new("/nonexistent"))
+            .is_err());
     }
 
     #[test]
