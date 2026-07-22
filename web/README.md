@@ -134,7 +134,7 @@ Uses Svelte stores for reactive state management:
 
 5. Enter the pairing token and connect
 
-6. Start chatting with your development environment!
+6. Open an ancillary to get a live terminal on its agent — the same session `breq do` attaches to
 
 ## Future Enhancements
 

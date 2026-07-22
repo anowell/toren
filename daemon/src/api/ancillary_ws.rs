@@ -1,185 +1,156 @@
+//! Bridges an ancillary's rmux agent pane to a browser terminal.
+//!
+//! `Binary` frames carry raw pane bytes both ways; `Text` frames carry JSON control messages
+//! ([`WsRequest`] / [`WsResponse`]). A connecting client gets the pane's output so far, then live
+//! output, with no gap or overlap between the two.
+
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
-
-use crate::ancillary::{ClientInput, WorkEvent, WorkStatus};
+use tracing::{info, warn};
 
 use super::AppState;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WsRequest {
-    /// Send a message to Claude
-    Message { content: String },
-    /// Interrupt the current work
+    /// Keystrokes, forwarded to the pane verbatim.
+    Data { data: String },
+    Resize { cols: u16, rows: u16 },
+    /// Ctrl-C, distinct from `Data` so the UI can offer a button for it.
     Interrupt,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WsResponse {
-    /// A work event from the ancillary
-    Event { event: WorkEvent },
-    /// Replay complete, now streaming live
-    ReplayComplete { current_seq: u64 },
-    /// Current status of the ancillary
-    Status {
-        status: String,
-        ancillary_id: String,
-    },
-    /// Error message
+    /// Pane liveness, sent on connect and when it changes.
+    Status { status: String, session: String },
     Error { message: String },
 }
 
-/// Handle WebSocket connection for observing/interacting with ancillary work
-pub async fn handle_ancillary_ws(
-    socket: WebSocket,
-    state: AppState,
-    ancillary_id: String,
-    from_seq: Option<u64>,
-) {
+/// ETX.
+const INTERRUPT: &str = "\u{3}";
+
+pub async fn handle_ancillary_ws(socket: WebSocket, state: AppState, ancillary_id: String) {
     let (mut sender, mut receiver) = socket.split();
-    let client_id = uuid::Uuid::new_v4().to_string();
 
-    info!(
-        "Client {} connected to ancillary {} (from_seq: {:?})",
-        client_id, ancillary_id, from_seq
-    );
-
-    // Get the active work for this ancillary
-    let work = match state.work_manager.get_work(&ancillary_id).await {
-        Some(work) => work,
-        None => {
-            let response = WsResponse::Error {
-                message: format!("No active work for ancillary: {}", ancillary_id),
-            };
-            if let Ok(json) = serde_json::to_string(&response) {
-                let _ = sender.send(Message::Text(json)).await;
-            }
-            return;
-        }
-    };
-
-    // Log client connected
-    let _ = work
-        .send_input(ClientInput::Message {
-            content: format!("[Client {} connected]", client_id),
-            client_id: client_id.clone(),
-        })
+    let Some(mirror) = state.panes.mirror(&ancillary_id).await else {
+        send_json(
+            &mut sender,
+            &WsResponse::Error {
+                message: format!("No agent pane for ancillary: {}", ancillary_id),
+            },
+        )
         .await;
-
-    // Send current status
-    let status = work.status().await;
-    let response = WsResponse::Status {
-        status: status.to_string(),
-        ancillary_id: ancillary_id.clone(),
+        return;
     };
-    if let Ok(json) = serde_json::to_string(&response) {
-        let _ = sender.send(Message::Text(json)).await;
-    }
 
-    // Replay events from the requested sequence
-    let from_seq = from_seq.unwrap_or(0);
-    match work.read_log_from(from_seq).await {
-        Ok(events) => {
-            for event in events {
-                let response = WsResponse::Event { event };
-                if let Ok(json) = serde_json::to_string(&response) {
-                    if sender.send(Message::Text(json)).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Failed to read work log: {}", e);
-        }
-    }
+    let session = state
+        .panes
+        .session_of(&ancillary_id)
+        .await
+        .unwrap_or_default();
 
-    // Signal replay complete
-    let (mut event_rx, current_seq) = work.subscribe();
-    let response = WsResponse::ReplayComplete { current_seq };
-    if let Ok(json) = serde_json::to_string(&response) {
-        let _ = sender.send(Message::Text(json)).await;
-    }
+    info!("Client attached to {} (rmux session {})", ancillary_id, session);
 
-    // Now stream live events and handle client input
-    let input_sender = work.input_sender();
+    // Taken together, so nothing is missed or repeated.
+    let (backfill, mut live) = mirror.attach().await;
+    let mut ended = mirror.ended();
+
+    send_json(
+        &mut sender,
+        &WsResponse::Status {
+            status: if mirror.has_ended() { "ended" } else { "attached" }.to_string(),
+            session: session.clone(),
+        },
+    )
+    .await;
+
+    if !backfill.is_empty() && sender.send(Message::Binary(backfill)).await.is_err() {
+        return;
+    }
 
     loop {
         tokio::select! {
-            // Handle incoming messages from client
-            msg = receiver.next() => {
-                match msg {
+            incoming = receiver.next() => {
+                match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<WsRequest>(&text) {
-                            Ok(WsRequest::Message { content }) => {
-                                let _ = input_sender.send(ClientInput::Message {
-                                    content,
-                                    client_id: client_id.clone(),
-                                }).await;
-                            }
-                            Ok(WsRequest::Interrupt) => {
-                                info!("Client {} requested interrupt", client_id);
-                                let _ = input_sender.send(ClientInput::Interrupt).await;
-                            }
-                            Err(e) => {
-                                warn!("Failed to parse client message: {}", e);
-                                let response = WsResponse::Error {
-                                    message: format!("Invalid request: {}", e),
-                                };
-                                if let Ok(json) = serde_json::to_string(&response) {
-                                    let _ = sender.send(Message::Text(json)).await;
-                                }
-                            }
+                        if let Err(e) = handle_request(&state, &ancillary_id, &text).await {
+                            warn!("{}: {}", ancillary_id, e);
+                            send_json(&mut sender, &WsResponse::Error { message: e.to_string() }).await;
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => {
-                        info!("Client {} disconnected", client_id);
-                        break;
+                    Some(Ok(Message::Binary(bytes))) => {
+                        // For clients that send keystrokes as raw bytes.
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        if let Err(e) = state.panes.send_input(&ancillary_id, &text).await {
+                            warn!("{}: failed to forward input: {}", ancillary_id, e);
+                        }
                     }
+                    Some(Ok(_)) => {}
                     Some(Err(e)) => {
-                        error!("WebSocket error: {}", e);
+                        warn!("WebSocket error for {}: {}", ancillary_id, e);
                         break;
                     }
-                    _ => {}
+                    None => break,
                 }
             }
-            // Forward work events to client
-            event = event_rx.recv() => {
-                match event {
-                    Ok(event) => {
-                        let response = WsResponse::Event { event };
-                        if let Ok(json) = serde_json::to_string(&response) {
-                            if sender.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
+            chunk = live.recv() => {
+                match chunk {
+                    Ok(bytes) => {
+                        if sender.send(Message::Binary(bytes.to_vec())).await.is_err() {
+                            break;
                         }
                     }
-                    Err(e) => {
-                        // Channel closed or lagged
-                        warn!("Event channel error: {}", e);
-                        // Don't break - might just be lag
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Say so rather than render a stream with a hole in it.
+                        warn!("{}: client lagged, {} chunks skipped", ancillary_id, skipped);
+                        send_json(
+                            &mut sender,
+                            &WsResponse::Error {
+                                message: format!("Dropped {} output chunks — reload to resync", skipped),
+                            },
+                        )
+                        .await;
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-        }
-
-        // Check if work is done
-        let status = work.status().await;
-        if matches!(status, WorkStatus::Completed | WorkStatus::Failed { .. }) {
-            // Send final status
-            let response = WsResponse::Status {
-                status: status.to_string(),
-                ancillary_id: ancillary_id.clone(),
-            };
-            if let Ok(json) = serde_json::to_string(&response) {
-                let _ = sender.send(Message::Text(json)).await;
+            // The pane died or was replaced; the client would otherwise wait forever.
+            Ok(()) = ended.changed() => {
+                if !*ended.borrow() {
+                    continue;
+                }
+                send_json(
+                    &mut sender,
+                    &WsResponse::Status {
+                        status: "ended".to_string(),
+                        session: session.clone(),
+                    },
+                )
+                .await;
+                break;
             }
-            break;
         }
     }
 
-    info!("Client {} session ended", client_id);
+    info!("Client detached from {}", ancillary_id);
+}
+
+async fn handle_request(state: &AppState, ancillary_id: &str, text: &str) -> anyhow::Result<()> {
+    match serde_json::from_str::<WsRequest>(text)? {
+        WsRequest::Data { data } => state.panes.send_input(ancillary_id, &data).await,
+        WsRequest::Interrupt => state.panes.send_input(ancillary_id, INTERRUPT).await,
+        WsRequest::Resize { cols, rows } => state.panes.resize(ancillary_id, cols, rows).await,
+    }
+}
+
+async fn send_json<S>(sender: &mut S, response: &WsResponse)
+where
+    S: SinkExt<Message> + Unpin,
+{
+    if let Ok(json) = serde_json::to_string(response) {
+        let _ = sender.send(Message::Text(json)).await;
+    }
 }

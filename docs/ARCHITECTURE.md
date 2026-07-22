@@ -19,11 +19,16 @@
 │  │   Service   │ │  Executor │ │  Manager   │ │  Manager  │ │
 │  └─────────────┘ └───────────┘ └────────────┘ └───────────┘ │
 │         ┌──────────────────────────────────┐                │
-│         │  Claude Agent (TypeScript)       │                │
-│         │  - Anthropic SDK integration     │                │
-│         │  - Tool implementations          │                │
-│         └──────────────────────────────────┘                │
-└─────────────────────────────────────────────────────────────┘
+│         │  Pane Runner (rmux-sdk)          │                │
+│         │  - spawns agents into rmux panes │                │
+│         │  - mirrors pane bytes to clients │                │
+│         └──────────────┬───────────────────┘                │
+└────────────────────────┼────────────────────────────────────┘
+                         │ Unix socket
+              ┌──────────▼───────────┐
+              │     rmux daemon      │  ← `breq` and `rmux attach`
+              │  sessions / panes    │    reach the same sessions
+              └──────────────────────┘
 ```
 
 ## Components
@@ -36,10 +41,12 @@
 - VCS abstraction (Git + Jujutsu)
 - Segment discovery from `toren.toml`
 
-### Agent Runtime (TypeScript)
-- Anthropic SDK integration
-- Tool implementations (read, write, execute, vcs)
-- Session persistence
+### Pane Runner (Rust, `rmux-sdk`)
+- Spawns the agent CLI into an rmux pane, the same process `breq do` would exec
+- Streams raw pane bytes to browsers and forwards keystrokes back
+- Records every mirrored pane to a transcript file
+
+See [terminals.md](terminals.md) for the session layout and how this coexists with zellij.
 
 ### Command Plugin System
 ```yaml
@@ -62,6 +69,20 @@ commands:
 { type: 'AuthSuccess', session_id: string }
 { type: 'CommandOutput', output: CommandOutput }
 { type: 'Error', message: string }
+```
+
+### Ancillary terminal (`ws://localhost:8787/ws/ancillaries/:id`)
+Binary frames carry raw pane bytes; text frames carry JSON control messages. On connect the client
+receives everything the pane has produced so far, then live output, with no gap between the two.
+```typescript
+// Requests
+{ type: 'data', data: string }              // keystrokes
+{ type: 'resize', cols: number, rows: number }
+{ type: 'interrupt' }
+
+// Responses
+{ type: 'status', status: string, session: string }
+{ type: 'error', message: string }
 ```
 
 ### REST Endpoints

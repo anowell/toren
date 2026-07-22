@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::assignment::{AssignmentManager, CompletionReason};
 use crate::workspace::{CleanupMode, CommitInfo, WorkspaceManager};
@@ -438,6 +438,61 @@ pub fn clean_assignment(
     })
 }
 
+/// The rmux session backing an assignment's workspace, if rmux is in play at all.
+fn workspace_session(assignment: &Assignment) -> Option<String> {
+    if !crate::rmux::is_available() {
+        return None;
+    }
+
+    let ws_name = assignment
+        .workspace_path
+        .file_name()
+        .and_then(|n| n.to_str())?;
+
+    let segment_name = crate::ancillary_segment(&assignment.ancillary_id)
+        .unwrap_or_else(|| assignment.segment.clone());
+    Some(crate::rmux::session_name(&segment_name, ws_name))
+}
+
+/// Take the workspace's rmux session down. Call [`guard_rmux_session`] first.
+fn kill_workspace_session(assignment: &Assignment) {
+    let Some(session) = workspace_session(assignment) else {
+        return;
+    };
+
+    if let Err(e) = crate::rmux::kill_session(&session) {
+        warn!("Failed to kill rmux session '{}': {}", session, e);
+    }
+}
+
+/// Refuse to proceed if the workspace's rmux session holds live work.
+///
+/// The session's idle shell would trip `find_workspace_processes` forever, so the session must come
+/// down before that check — but taking it down unconditionally destroys what the check protects.
+fn guard_rmux_session(assignment: &Assignment, kill: bool) -> Result<()> {
+    let Some(session) = workspace_session(assignment) else {
+        return Ok(());
+    };
+    if kill || !crate::rmux::session_exists(&session) {
+        return Ok(());
+    }
+
+    let busy = crate::rmux::busy_panes(&session);
+    if busy.is_empty() {
+        return Ok(());
+    }
+
+    let processes = busy
+        .into_iter()
+        .map(|pane| crate::process::ProcessInfo {
+            pid: pane.pid,
+            name: format!("{} in rmux {}:{}", pane.command, session, pane.window),
+        })
+        .collect();
+
+    Err(crate::process::WorkspaceProcessesRunning { processes }.into())
+}
+
 /// Cleanup workspace for an assignment (process check + destroy hooks + VCS tracking removal + delete)
 fn cleanup_workspace(
     assignment: &Assignment,
@@ -446,6 +501,10 @@ fn cleanup_workspace(
     kill: bool,
     mode: CleanupMode,
 ) -> Result<SetupResult> {
+    // Order matters: check for live work before destroying anything.
+    guard_rmux_session(assignment, kill)?;
+    kill_workspace_session(assignment);
+
     // Process check is only meaningful if the workspace dir exists.
     if assignment.workspace_path.exists() {
         let processes = crate::process::find_workspace_processes(&assignment.workspace_path);
@@ -485,4 +544,78 @@ fn cleanup_workspace(
         ws_mgr.cleanup_workspace(segment_path, &segment_name, ws_name, mode)?;
     info!("Workspace cleaned up for assignment {}", assignment.id);
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assignment::{AssignmentSource, AssignmentStatus};
+
+    fn assignment_for(workspace_path: std::path::PathBuf, segment: &str) -> Assignment {
+        Assignment {
+            id: "a-1".to_string(),
+            ancillary_id: format!("{} One", segment),
+            task_id: None,
+            segment: segment.to_string(),
+            workspace_path,
+            source: AssignmentSource::Reference,
+            status: AssignmentStatus::Active,
+            created_at: String::new(),
+            updated_at: String::new(),
+            task_title: None,
+            task_url: None,
+            task_source: None,
+            session_id: None,
+            ancillary_num: Some(1),
+            base_branch: None,
+        }
+    }
+
+    /// Without this guard, cleanup kills the session first and the downstream process check has
+    /// nothing left to refuse over. Needs rmux installed.
+    #[test]
+    fn cleanup_refuses_to_destroy_a_running_agent_without_kill() {
+        if !crate::rmux::is_available() {
+            eprintln!("skipping: rmux not on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("one");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let segment = format!("guardseg{}", std::process::id());
+        let assignment = assignment_for(workspace.clone(), &segment);
+        let session = crate::rmux::session_name(&segment, "one");
+
+        crate::rmux::ensure_session(&session, &workspace).unwrap();
+
+        // An idle shell must not block cleanup, or no assignment could ever complete.
+        guard_rmux_session(&assignment, false).expect("an idle shell is not live work");
+
+        crate::rmux::spawn_agent(
+            &session,
+            &workspace,
+            &["/bin/sleep".to_string(), "60".to_string()],
+        )
+        .unwrap();
+
+        let refused = guard_rmux_session(&assignment, false)
+            .expect_err("a running agent must block cleanup");
+        assert!(
+            refused
+                .downcast_ref::<crate::process::WorkspaceProcessesRunning>()
+                .is_some(),
+            "callers match on this type to report the conflict: {:#}",
+            refused
+        );
+        assert!(
+            crate::rmux::agent_is_running(&session),
+            "the guard must refuse without destroying what it is protecting"
+        );
+
+        guard_rmux_session(&assignment, true).expect("--kill bypasses the guard");
+
+        crate::rmux::kill_session(&session).unwrap();
+    }
 }

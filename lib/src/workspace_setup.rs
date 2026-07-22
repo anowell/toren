@@ -143,10 +143,8 @@ fn kdl_value_as_str(val: &kdl::KdlValue) -> Option<String> {
         Some(n.to_string())
     } else if let Some(f) = val.as_float() {
         Some(f.to_string())
-    } else if let Some(b) = val.as_bool() {
-        Some(b.to_string())
     } else {
-        None
+        val.as_bool().map(|b| b.to_string())
     }
 }
 

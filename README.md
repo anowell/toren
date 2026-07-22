@@ -37,6 +37,11 @@ Bring your own work-tracking system (e.g. Linear, GH Issues, [runes](https://git
 cargo install --git https://github.com/anowell/toren breq
 ```
 
+Optionally install [rmux](https://rmux.io/) as well. Agents then run inside persistent rmux
+sessions, so detaching leaves them running and the same session is attachable from the toren web
+UI. Without rmux, `breq` execs the agent directly as before. See
+[docs/terminals.md](docs/terminals.md).
+
 ## Getting Started
 
 ```bash
@@ -66,6 +71,8 @@ breq do -p <prompt>                # Launch agent in a new workspace
 breq do <workspace> -p <prompt>    # Launch agent in an existing workspace
 breq do -i <intent>                # Use a configured prompt template
 runes show proj-123 | breq do         # Prompt from stdin
+breq do <workspace> --force        # Replace an agent already running there
+breq do -p <prompt> --no-rmux      # Skip rmux; exec the agent directly
 
 # Manage active sessions
 breq list                          # Show active assignments
@@ -75,6 +82,10 @@ breq destroy <workspace>           # Teardown workspace
 breq shell <workspace>             # Open shell in workspace
 breq shell <workspace> -- <cmd>    # Run command in workspace
 ```
+
+With [rmux](https://rmux.io/) installed, `breq do` runs the agent inside a persistent session and
+attaches you to it — detaching leaves the agent running, and the same session is attachable from
+the toren web UI. See [docs/terminals.md](docs/terminals.md).
 
 The plugin system makes it trivial to integrate these primitives with any work-tracking workflow. Install example plugins with
 `breq plugin install commands/<name>` or `breq plugin install tasks/<name>` (or `breq plugin list` to browse), then modify them to fit your workflow: 
@@ -132,6 +143,7 @@ All string arguments support `{{ ... }}` template variables.
 ## More
 
 - [Configuration](docs/configuration.md) - Global config, proxy, intents, and aliases
+- [Terminals](docs/terminals.md) - rmux sessions, zellij interop, and transcripts
 - [Toren Daemon](daemon/README.md) - REST + WebSocket API for programmatic workspace and agent management
 - [Station](station/README.md) - Reverse proxy management for per-workspace local domains
 - [docs/CONCEPTS.md](docs/CONCEPTS.md) - Naming and metaphor

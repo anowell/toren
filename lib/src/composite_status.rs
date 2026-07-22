@@ -95,29 +95,7 @@ fn claude_project_dir(workspace_path: &Path) -> Option<PathBuf> {
 /// whether the entry type indicates Claude is mid-turn (busy). Also requires
 /// the file to have been modified within 5 minutes to avoid stale sessions.
 fn session_is_mid_turn(project_dir: &Path) -> bool {
-    let entries = match std::fs::read_dir(project_dir) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-
-    // Find the most recently modified .jsonl file
-    let mut most_recent: Option<(PathBuf, std::time::SystemTime)> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            if let Ok(meta) = path.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    most_recent = Some(match most_recent {
-                        Some((_, prev_time)) if modified > prev_time => (path, modified),
-                        Some(prev) => prev,
-                        None => (path, modified),
-                    });
-                }
-            }
-        }
-    }
-
-    let (path, modified) = match most_recent {
+    let (path, modified) = match most_recent_session_log(project_dir) {
         Some(v) => v,
         None => return false,
     };
@@ -135,6 +113,54 @@ fn session_is_mid_turn(project_dir: &Path) -> bool {
     };
 
     is_mid_turn_entry(&last_line)
+}
+
+/// The most recently modified `.jsonl` session log in a Claude project directory.
+fn most_recent_session_log(project_dir: &Path) -> Option<(PathBuf, std::time::SystemTime)> {
+    let entries = std::fs::read_dir(project_dir).ok()?;
+
+    let mut most_recent: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(modified) = path.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        most_recent = Some(match most_recent {
+            Some((_, prev_time)) if modified > prev_time => (path, modified),
+            Some(prev) => prev,
+            None => (path, modified),
+        });
+    }
+
+    most_recent
+}
+
+/// The Claude Code session id most recently active in a workspace.
+///
+/// Claude names its session logs `<session-id>.jsonl`, so the newest log's file stem is the id.
+pub fn latest_claude_session_id(workspace_path: &Path) -> Option<String> {
+    latest_claude_session_id_since(workspace_path, std::time::UNIX_EPOCH)
+}
+
+/// As [`latest_claude_session_id`], ignoring logs older than `since`.
+///
+/// Callers wanting a specific agent's session must bound the search by its launch time, or a
+/// workspace with prior runs hands back a stale id.
+pub fn latest_claude_session_id_since(
+    workspace_path: &Path,
+    since: std::time::SystemTime,
+) -> Option<String> {
+    let project_dir = claude_project_dir(workspace_path)?;
+    let (path, modified) = most_recent_session_log(&project_dir)?;
+    if modified < since {
+        return None;
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
 }
 
 /// Read the last non-empty line of a file by seeking from the end.

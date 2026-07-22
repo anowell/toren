@@ -19,21 +19,14 @@ function makeAssignment(overrides: Partial<Assignment> = {}): Assignment {
 
 describe('getAncillaryDisplayStatus', () => {
 	it('maps busy statuses correctly', () => {
-		const busyStatuses: AncillaryStatus[] = ['starting', 'working', 'executing'];
+		const busyStatuses: AncillaryStatus[] = ['executing'];
 		for (const status of busyStatuses) {
 			expect(getAncillaryDisplayStatus(status)).toBe('busy');
 		}
 	});
 
 	it('maps ready statuses correctly', () => {
-		const readyStatuses: AncillaryStatus[] = [
-			'idle',
-			'awaiting_input',
-			'completed',
-			'failed',
-			'connected',
-			'disconnected',
-		];
+		const readyStatuses: AncillaryStatus[] = ['idle', 'connected'];
 		for (const status of readyStatuses) {
 			expect(getAncillaryDisplayStatus(status)).toBe('ready');
 		}

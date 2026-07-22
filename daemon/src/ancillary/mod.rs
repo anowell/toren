@@ -1,39 +1,18 @@
-pub mod runtime;
-pub mod work_log;
-
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use tokio::sync::RwLock as TokioRwLock;
-use tracing::info;
 
-pub use runtime::{AncillaryWork, ClientInput, WorkStatus};
-use toren_lib::{Agent, Assignment, AssignmentManager};
-pub use work_log::WorkEvent;
-
+/// Connection state of an ancillary client on `/ws`.
+///
+/// Clients, not agents: agent liveness comes from rmux via `PaneRunner::status`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum AncillaryStatus {
-    /// Idle, no active assignment
     Idle,
-    /// Starting work on an assignment
-    Starting,
-    /// Actively working on an assignment
-    Working,
-    /// Awaiting user input
-    AwaitingInput,
-    /// Completed work (will transition to Idle)
-    Completed,
-    /// Failed (will transition to Idle)
-    Failed,
-    /// Legacy: connected via external process
     Connected,
-    /// Legacy: executing via external process
+    /// Running a command on behalf of the client.
     Executing,
-    /// Legacy: disconnected external process
-    Disconnected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,15 +78,6 @@ impl AncillaryManager {
             .map(|a| a.id.clone())
     }
 
-    /// Release an ancillary from its workspace (but don't delete the workspace)
-    #[allow(dead_code)]
-    pub fn release_workspace(&self, id: &str) -> Option<(String, PathBuf)> {
-        let ancillaries = self.ancillaries.read().unwrap();
-        ancillaries
-            .get(id)
-            .and_then(|a| a.workspace.clone().map(|ws| (ws, a.working_dir.clone())))
-    }
-
     pub fn unregister(&self, id: &str) {
         let mut ancillaries = self.ancillaries.write().unwrap();
         if ancillaries.remove(id).is_some() {
@@ -140,167 +110,9 @@ impl AncillaryManager {
         let ancillaries = self.ancillaries.read().unwrap();
         ancillaries.values().cloned().collect()
     }
-
-    #[allow(dead_code)]
-    pub fn find_by_session(&self, session_token: &str) -> Option<Ancillary> {
-        let ancillaries = self.ancillaries.read().unwrap();
-        ancillaries
-            .values()
-            .find(|a| a.session_token == session_token)
-            .cloned()
-    }
 }
 
 impl Default for AncillaryManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Manages active work for ancillaries (embedded runtime).
-/// This is separate from AncillaryManager which tracks connection state.
-pub struct WorkManager {
-    /// Active work keyed by ancillary ID
-    active_work: TokioRwLock<HashMap<String, Arc<AncillaryWork>>>,
-    /// Reference to assignment manager for persisting status changes
-    assignments: Option<Arc<TokioRwLock<AssignmentManager>>>,
-}
-
-impl WorkManager {
-    pub fn new() -> Self {
-        Self {
-            active_work: TokioRwLock::new(HashMap::new()),
-            assignments: None,
-        }
-    }
-
-    /// Set the assignment manager reference for status persistence
-    pub fn set_assignments(&mut self, assignments: Arc<TokioRwLock<AssignmentManager>>) {
-        self.assignments = Some(assignments);
-    }
-
-    /// Start work for an ancillary on an assignment
-    pub async fn start_work(
-        &self,
-        ancillary_id: String,
-        assignment: Assignment,
-        agent: &Agent,
-    ) -> Result<Arc<AncillaryWork>> {
-        info!(
-            "Starting work for {} on {} (agent: {})",
-            ancillary_id,
-            assignment.task_id.as_deref().unwrap_or("-"),
-            agent,
-        );
-
-        let assignment_id = assignment.id.clone();
-        let work = AncillaryWork::start(ancillary_id.clone(), assignment, agent.clone()).await?;
-        let work = Arc::new(work);
-
-        let mut active = self.active_work.write().await;
-        active.insert(ancillary_id, work.clone());
-
-        // Spawn a monitor task to persist assignment status and session_id
-        if let Some(ref assignments) = self.assignments {
-            let assignments = assignments.clone();
-            let (mut event_rx, _) = work.subscribe();
-            tokio::spawn(async move {
-                let mut session_id_captured = false;
-
-                // Listen for work events to capture session_id
-                loop {
-                    tokio::select! {
-                        event = event_rx.recv() => {
-                            match event {
-                                Ok(ev) => {
-                                    // Check for session_id in status change events
-                                    if !session_id_captured {
-                                        if let work_log::WorkOp::StatusChange { ref status } = ev.op {
-                                            if let Some(sid) = status.strip_prefix("session_id:") {
-                                                let mut mgr = assignments.write().await;
-                                                let _ = mgr.update_session_id(&assignment_id, Some(sid.to_string()));
-                                                info!("Captured session_id {} for assignment {}", sid, assignment_id);
-                                                session_id_captured = true;
-                                            }
-                                        }
-                                    }
-
-                                    // Check for terminal events.
-                                    // NOTE: session completion does NOT change assignment status.
-                                    // "complete" and "abort" are explicit user actions via the
-                                    // lifecycle endpoints, not automatic on session end.
-                                    match ev.op {
-                                        work_log::WorkOp::AssignmentCompleted
-                                        | work_log::WorkOp::AssignmentFailed { .. } => {
-                                            info!("Work session ended for assignment {}", assignment_id);
-                                            break;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                    // Missed some events, continue listening
-                                    continue;
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    // Channel closed — session ended, but assignment
-                                    // status is NOT changed (complete/abort are explicit).
-                                    info!("Work monitor channel closed for assignment {}", assignment_id);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        Ok(work)
-    }
-
-    /// Get active work for an ancillary
-    pub async fn get_work(&self, ancillary_id: &str) -> Option<Arc<AncillaryWork>> {
-        let active = self.active_work.read().await;
-        active.get(ancillary_id).cloned()
-    }
-
-    /// Stop work for an ancillary
-    pub async fn stop_work(&self, ancillary_id: &str) -> Option<Arc<AncillaryWork>> {
-        let mut active = self.active_work.write().await;
-        if let Some(work) = active.remove(ancillary_id) {
-            // Interrupt the work
-            let _ = work.interrupt().await;
-            Some(work)
-        } else {
-            None
-        }
-    }
-
-    /// List all active work
-    #[allow(dead_code)]
-    pub async fn list_active(&self) -> Vec<(String, WorkStatus)> {
-        let active = self.active_work.read().await;
-        let mut result = Vec::new();
-        for (id, work) in active.iter() {
-            let status = work.status().await;
-            result.push((id.clone(), status));
-        }
-        result
-    }
-
-    /// Check if ancillary has active work
-    pub async fn has_active_work(&self, ancillary_id: &str) -> bool {
-        let active = self.active_work.read().await;
-        if let Some(work) = active.get(ancillary_id) {
-            let status = work.status().await;
-            !matches!(status, WorkStatus::Completed | WorkStatus::Failed { .. })
-        } else {
-            false
-        }
-    }
-}
-
-impl Default for WorkManager {
     fn default() -> Self {
         Self::new()
     }

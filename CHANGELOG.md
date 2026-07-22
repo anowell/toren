@@ -1,6 +1,24 @@
 # Changelog
 
-## [Unreleased] - 2026-01-07
+## [Unreleased] - 2026-07-21
+
+### Agents run in rmux sessions
+- Coding agents now run inside [rmux](https://rmux.io/) sessions named `toren-<segment>-<workspace>`,
+  so `breq do` and the web UI attach to the *same* agent process rather than each spawning their own
+- `breq do` execs `rmux attach`; detaching leaves the agent running. `--no-rmux` restores the old
+  direct-exec behaviour, which is also the automatic fallback when rmux isn't installed
+- `breq shell <ws>` selects the session's shell window instead of spawning a standalone subprocess
+- The web `[unit]` route renders an xterm.js terminal over `/ws/ancillaries/:id`, which now carries
+  raw pane bytes both ways instead of typed chat events
+- Every mirrored pane is recorded to `~/.toren/transcripts/<ancillary>/<assignment>.raw`, which the
+  browser replays on attach so finished runs and post-restart sessions still show their history
+- `breq do` refuses to replace an agent already running in the workspace unless given `--force`;
+  `breq complete`/`abort` refuse to tear down a session with live work unless given `--kill`
+- Removed the embedded Claude Agent SDK runtime, the per-turn `WorkLog`, and the `ancillary/`
+  TypeScript package
+- See [docs/terminals.md](docs/terminals.md) for the session layout and zellij interop
+
+## [2026-01-07] - Multi-Ancillary
 
 ### Multi-Ancillary Support
 - Multiple concurrent Claude sessions with independent tokens

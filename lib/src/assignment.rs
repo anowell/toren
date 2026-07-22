@@ -467,10 +467,8 @@ impl AssignmentManager {
                 assignment.task_source = Some(source.to_string());
             }
             // Update source to Reference if task_id was set and source was Prompt
-            if task_id.is_some() {
-                if matches!(assignment.source, AssignmentSource::Prompt { .. }) {
-                    assignment.source = AssignmentSource::Reference;
-                }
+            if task_id.is_some() && matches!(assignment.source, AssignmentSource::Prompt { .. }) {
+                assignment.source = AssignmentSource::Reference;
             }
             assignment.updated_at = chrono::Utc::now().to_rfc3339();
             self.save()?;

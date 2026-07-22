@@ -84,6 +84,14 @@ enum Commands {
         #[arg(long)]
         agent: Option<String>,
 
+        /// Exec the agent directly instead of running it inside an rmux session
+        #[arg(long = "no-rmux")]
+        no_rmux: bool,
+
+        /// Replace an agent already running in this workspace instead of refusing
+        #[arg(long)]
+        force: bool,
+
         /// Additional arguments passed directly to the agent CLI
         #[arg(last = true)]
         passthrough: Vec<String>,
@@ -114,6 +122,10 @@ enum Commands {
         /// Segment to use
         #[arg(short, long)]
         segment: Option<String>,
+
+        /// Exec the shell directly instead of attaching to the workspace's rmux session
+        #[arg(long = "no-rmux")]
+        no_rmux: bool,
 
         /// Command to run in the workspace directory (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -428,6 +440,8 @@ fn main() -> Result<()> {
             task_url,
             segment,
             agent,
+            no_rmux,
+            force,
             passthrough,
         } => cmd_do(
             &config,
@@ -440,6 +454,8 @@ fn main() -> Result<()> {
             None, // task_source inferred from task_id prefix or plugin resolution
             segment.as_deref(),
             agent,
+            no_rmux,
+            force,
             passthrough,
         ),
         Commands::Shell {
@@ -449,8 +465,9 @@ fn main() -> Result<()> {
             task_title,
             task_url,
             segment,
+            no_rmux,
             cmd,
-        } => cmd_shell(&config, workspace, hook, task_id, task_title, task_url, segment.as_deref(), cmd),
+        } => cmd_shell(&config, workspace, hook, task_id, task_title, task_url, segment.as_deref(), no_rmux, cmd),
         Commands::List {
             reference,
             all,
@@ -539,6 +556,8 @@ fn execute_deferred_action(config: &Config, action: toren_lib::DeferredAction) -
                 task_source,
                 None,       // segment (resolve from CWD)
                 None,       // agent (use config/auto-detect)
+                false,      // no_rmux
+                false,      // force
                 Vec::new(), // passthrough
             )
         }
@@ -559,6 +578,8 @@ fn cmd_do(
     task_source_arg: Option<String>,
     segment_name: Option<&str>,
     agent_str: Option<String>,
+    no_rmux: bool,
+    force: bool,
     passthrough: Vec<String>,
 ) -> Result<()> {
     let agent = config.resolve_agent(agent_str.as_deref())?;
@@ -713,11 +734,17 @@ fn cmd_do(
 
         // Start agent session
         eprintln!("Starting {} session in {}\n", agent, ws_path.display());
-        let mut cmd = agent.build_command(&user_message, &ws_path, system_prompt.as_deref());
-        cmd.args(&passthrough);
-
-        let err = cmd.exec();
-        Err(err).context(format!("Failed to exec {}", agent.kind.binary_name()))
+        launch_agent(
+            &agent,
+            &user_message,
+            system_prompt.as_deref(),
+            &ws_path,
+            &segment.name,
+            &ws_name_lower,
+            no_rmux,
+            force,
+            &passthrough,
+        )
     } else {
         // Create new workspace
         let existing_workspaces = workspace_mgr
@@ -776,12 +803,66 @@ fn cmd_do(
 
         // Exec into agent
         eprintln!("Starting {} session in {}\n", agent, ws_path.display());
-        let mut cmd = agent.build_command(&user_message, &ws_path, system_prompt.as_deref());
-        cmd.args(&passthrough);
-
-        let err = cmd.exec();
-        Err(err).context(format!("Failed to exec {}", agent.kind.binary_name()))
+        launch_agent(
+            &agent,
+            &user_message,
+            system_prompt.as_deref(),
+            &ws_path,
+            &segment.name,
+            &ws_name,
+            no_rmux,
+            force,
+            &passthrough,
+        )
     }
+}
+
+/// Hand the terminal to the agent.
+///
+/// Spawning into the workspace's rmux session and exec'ing `rmux attach` leaves the TUI
+/// experience unchanged, but the session survives detach and is attachable from the web UI.
+#[allow(clippy::too_many_arguments)]
+fn launch_agent(
+    agent: &toren_lib::Agent,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    ws_path: &Path,
+    segment_name: &str,
+    ws_name: &str,
+    no_rmux: bool,
+    force: bool,
+    passthrough: &[String],
+) -> Result<()> {
+    if !no_rmux && toren_lib::rmux::is_available() {
+        let session = toren_lib::rmux::session_name(segment_name, ws_name);
+
+        // Spawning replaces the agent window, SIGKILLing whatever was working there.
+        if !force && toren_lib::rmux::agent_is_running(&session) {
+            anyhow::bail!(
+                "An agent is already running in workspace '{}'.\n  \
+                 Attach to it:  rmux attach -t {}\n  \
+                 Replace it:    breq do {} --force ...",
+                ws_name,
+                session,
+                ws_name,
+            );
+        }
+
+        let mut argv = agent.build_argv(prompt, system_prompt, false);
+        argv.extend(passthrough.iter().cloned());
+
+        toren_lib::rmux::ensure_session(&session, ws_path)?;
+        toren_lib::rmux::spawn_agent(&session, ws_path, &argv)?;
+
+        eprintln!("rmux session: {} (detach leaves the agent running)\n", session);
+        let err = toren_lib::rmux::attach_command(&session).exec();
+        return Err(err).context(format!("Failed to attach to rmux session '{}'", session));
+    }
+
+    let mut cmd = agent.build_command(prompt, ws_path, system_prompt);
+    cmd.args(passthrough);
+    let err = cmd.exec();
+    Err(err).context(format!("Failed to exec {}", agent.kind.binary_name()))
 }
 
 // ─── shell ──────────────────────────────────────────────────────────────────
@@ -795,6 +876,7 @@ fn cmd_shell(
     task_title_arg: Option<String>,
     task_url_arg: Option<String>,
     segment_name: Option<&str>,
+    no_rmux: bool,
     cmd: Vec<String>,
 ) -> Result<()> {
     // Hook mode: run setup/destroy from cwd
@@ -851,14 +933,13 @@ fn cmd_shell(
             anyhow::bail!("Workspace '{}' not found at {}", ws_name_lower, ws_path.display());
         }
 
-        let (program, args): (String, Vec<String>) = if cmd.is_empty() {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            (shell, vec![])
-        } else {
-            (cmd[0].clone(), cmd[1..].to_vec())
-        };
-
         println!("{}", ws_path.display());
+
+        if cmd.is_empty() {
+            return launch_shell(&ws_path, &segment.name, &ws_name_lower, no_rmux);
+        }
+
+        let (program, args) = (cmd[0].clone(), cmd[1..].to_vec());
         let err = Command::new(&program)
             .args(&args)
             .current_dir(&ws_path)
@@ -921,11 +1002,29 @@ fn cmd_shell(
         )?;
 
         eprintln!("Created workspace: {}", ws_path.display());
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         println!("{}", ws_path.display());
-        let err = Command::new(&shell).current_dir(&ws_path).exec();
-        Err(err).context("Failed to exec shell")
+        launch_shell(&ws_path, &segment.name, &ws_name, no_rmux)
     }
+}
+
+/// Drop the user into a workspace shell.
+///
+/// Attaches to the `shell` window of the same session `breq do` and the daemon use, so the shell
+/// sits alongside the agent rather than being an unrelated subprocess.
+fn launch_shell(ws_path: &Path, segment_name: &str, ws_name: &str, no_rmux: bool) -> Result<()> {
+    if !no_rmux && toren_lib::rmux::is_available() {
+        let session = toren_lib::rmux::session_name(segment_name, ws_name);
+        toren_lib::rmux::ensure_session(&session, ws_path)?;
+        toren_lib::rmux::ensure_shell(&session, ws_path)?;
+        toren_lib::rmux::select_window(&session, toren_lib::rmux::SHELL_WINDOW)?;
+
+        let err = toren_lib::rmux::attach_command(&session).exec();
+        return Err(err).context(format!("Failed to attach to rmux session '{}'", session));
+    }
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let err = Command::new(&shell).current_dir(ws_path).exec();
+    Err(err).context("Failed to exec shell")
 }
 
 // ─── list ───────────────────────────────────────────────────────────────────

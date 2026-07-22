@@ -207,7 +207,7 @@ class TorenClient {
 export const client = new TorenClient();
 
 // Status mapping helpers
-const BUSY_STATUSES: Set<AncillaryStatus> = new Set(['starting', 'working', 'executing']);
+const BUSY_STATUSES: Set<AncillaryStatus> = new Set(['executing']);
 
 export function getAncillaryDisplayStatus(status: AncillaryStatus): AncillaryDisplayStatus {
 	return BUSY_STATUSES.has(status) ? 'busy' : 'ready';

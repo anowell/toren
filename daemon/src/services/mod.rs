@@ -7,6 +7,7 @@ use toren_lib::Config;
 
 pub mod command;
 pub mod filesystem;
+pub mod pane_runner;
 pub mod vcs;
 
 /// Derive approved directories from config segments and workspace root.

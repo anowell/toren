@@ -110,32 +110,36 @@ impl Agent {
         )
     }
 
-    /// Build a `std::process::Command` for interactive (breq) use.
+    /// The full argv (program first) for an interactive agent run.
     ///
-    /// - Sets the binary and working directory
-    /// - Adds model flag if a model override is set
-    /// - For Claude: adds `--append-system-prompt` for intent text
-    /// - For others: prepends intent text to the prompt
-    /// - Adds the prompt as a positional argument
-    pub fn build_command(
+    /// The canonical agent-spawn shape: `breq` turns it into a `Command` to `exec()`, the daemon
+    /// hands it to rmux as a pane argv. Both produce the same process.
+    pub fn build_argv(
         &self,
         prompt: &str,
-        cwd: &Path,
         system_prompt: Option<&str>,
-    ) -> Command {
-        let mut cmd = Command::new(self.kind.binary_name());
-        cmd.current_dir(cwd);
+        auto_approve: bool,
+    ) -> Vec<String> {
+        let mut argv = vec![self.kind.binary_name().to_string()];
 
         if let Some(ref model) = self.model {
-            cmd.arg(self.kind.model_flag()).arg(model);
+            argv.push(self.kind.model_flag().to_string());
+            argv.push(model.clone());
+        }
+
+        if auto_approve {
+            if let Some(flag) = self.kind.auto_approve_flag() {
+                argv.push(flag.to_string());
+            }
         }
 
         match self.kind {
             AgentKind::Claude => {
                 if let Some(sp) = system_prompt {
-                    cmd.arg("--append-system-prompt").arg(sp);
+                    argv.push("--append-system-prompt".to_string());
+                    argv.push(sp.to_string());
                 }
-                cmd.arg(prompt);
+                argv.push(prompt.to_string());
             }
             _ => {
                 // Non-Claude agents: prepend intent to prompt
@@ -143,55 +147,24 @@ impl Agent {
                     Some(sp) => format!("{}\n\n---\n\n{}", sp, prompt),
                     None => prompt.to_string(),
                 };
-                cmd.arg(&full_prompt);
+                argv.push(full_prompt);
             }
         }
 
-        cmd
+        argv
     }
 
-    /// Build a `tokio::process::Command` for daemon (headless) use.
-    ///
-    /// Same as `build_command` but also adds auto-approve flags.
-    pub fn build_daemon_command(
+    /// [`Agent::build_argv`] as a `Command`, with the working directory set.
+    pub fn build_command(
         &self,
         prompt: &str,
         cwd: &Path,
         system_prompt: Option<&str>,
-    ) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new(self.kind.binary_name());
+    ) -> Command {
+        let argv = self.build_argv(prompt, system_prompt, false);
+        let mut cmd = Command::new(&argv[0]);
         cmd.current_dir(cwd);
-
-        if let Some(ref model) = self.model {
-            cmd.arg(self.kind.model_flag()).arg(model);
-        }
-
-        // Auto-approve flag for daemon mode
-        if let Some(flag) = self.kind.auto_approve_flag() {
-            cmd.arg(flag);
-        }
-
-        // Print mode for non-interactive use (Claude-specific)
-        if self.kind == AgentKind::Claude {
-            cmd.arg("--print");
-        }
-
-        match self.kind {
-            AgentKind::Claude => {
-                if let Some(sp) = system_prompt {
-                    cmd.arg("--append-system-prompt").arg(sp);
-                }
-                cmd.arg(prompt);
-            }
-            _ => {
-                let full_prompt = match system_prompt {
-                    Some(sp) => format!("{}\n\n---\n\n{}", sp, prompt),
-                    None => prompt.to_string(),
-                };
-                cmd.arg(&full_prompt);
-            }
-        }
-
+        cmd.args(&argv[1..]);
         cmd
     }
 }
@@ -289,6 +262,29 @@ mod tests {
             "-m", "o3",
             "You are a coder\n\n---\n\nfix the bug",
         ]);
+    }
+
+    #[test]
+    fn build_argv_leads_with_the_binary() {
+        let agent = Agent::parse("claude").unwrap();
+        let argv = agent.build_argv("fix the bug", None, false);
+        assert_eq!(argv, vec!["claude", "fix the bug"]);
+    }
+
+    #[test]
+    fn build_argv_adds_auto_approve_only_when_asked() {
+        let agent = Agent::parse("claude").unwrap();
+        assert_eq!(
+            agent.build_argv("go", None, true),
+            vec!["claude", "--dangerously-skip-permissions", "go"]
+        );
+        assert_eq!(agent.build_argv("go", None, false), vec!["claude", "go"]);
+    }
+
+    #[test]
+    fn build_argv_skips_auto_approve_for_agents_without_a_flag() {
+        let agent = Agent::parse("gemini").unwrap();
+        assert_eq!(agent.build_argv("go", None, true), vec!["gemini", "go"]);
     }
 
     #[test]

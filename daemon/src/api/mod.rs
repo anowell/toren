@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::{
-    extract::{ws::WebSocketUpgrade, Path, Query, State},
+    extract::{ws::WebSocketUpgrade, Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -11,9 +11,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
-use crate::ancillary::{AncillaryManager, WorkManager};
+use crate::ancillary::AncillaryManager;
 use crate::plugins::PluginManager;
 use crate::security::SecurityContext;
+use crate::services::pane_runner::{PaneRunner, PaneStatus};
 use crate::services::Services;
 use tokio::sync::RwLock;
 use toren_lib::{
@@ -36,7 +37,7 @@ pub struct AppState {
     pub assignments: Arc<RwLock<AssignmentManager>>,
     pub segments: Arc<std::sync::RwLock<SegmentManager>>,
     pub workspaces: Option<Arc<WorkspaceManager>>,
-    pub work_manager: Arc<WorkManager>,
+    pub panes: Arc<PaneRunner>,
     pub agent: Arc<Agent>,
 }
 
@@ -52,13 +53,10 @@ pub async fn serve(
     assignment_manager: AssignmentManager,
     segment_manager: SegmentManager,
     workspace_manager: Option<WorkspaceManager>,
-    mut work_manager: WorkManager,
+    pane_runner: PaneRunner,
     agent: Agent,
 ) -> Result<()> {
     let assignments = Arc::new(RwLock::new(assignment_manager));
-
-    // Give work manager a reference to assignments for status persistence
-    work_manager.set_assignments(assignments.clone());
 
     let state = AppState {
         config: Arc::new(config),
@@ -70,7 +68,7 @@ pub async fn serve(
         assignments,
         segments: Arc::new(std::sync::RwLock::new(segment_manager)),
         workspaces: workspace_manager.map(Arc::new),
-        work_manager: Arc::new(work_manager),
+        panes: Arc::new(pane_runner),
         agent: Arc::new(agent),
     };
 
@@ -167,25 +165,43 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
     ws.on_upgrade(|socket| ws_handler::handle_websocket(socket, state))
 }
 
-#[derive(Debug, Deserialize)]
-struct AncillaryWsQuery {
-    from_seq: Option<u64>,
-}
-
 async fn ancillary_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(ancillary_id): Path<String>,
-    Query(query): Query<AncillaryWsQuery>,
 ) -> impl IntoResponse {
     // URL decode the ancillary ID (spaces become %20)
     let ancillary_id = urlencoding::decode(&ancillary_id)
         .map(|s| s.into_owned())
         .unwrap_or(ancillary_id);
 
-    ws.on_upgrade(move |socket| {
-        ancillary_ws::handle_ancillary_ws(socket, state, ancillary_id, query.from_seq)
-    })
+    // Adopts a `breq do` session, and re-points a mirror whose pane has since been replaced.
+    adopt_current_session(&state, &ancillary_id).await;
+
+    ws.on_upgrade(move |socket| ancillary_ws::handle_ancillary_ws(socket, state, ancillary_id))
+}
+
+async fn adopt_current_session(state: &AppState, ancillary_id: &str) {
+    let assignment = {
+        let mut assignments = state.assignments.write().await;
+        assignments.get_active_for_ancillary(ancillary_id).cloned()
+    };
+
+    let Some(assignment) = assignment else { return };
+
+    match state
+        .panes
+        .ensure_current(
+            ancillary_id,
+            &assignment.segment,
+            &assignment.workspace_path,
+            &assignment.id,
+        )
+        .await
+    {
+        Ok(session) => tracing::debug!("Mirroring current pane of rmux session {}", session),
+        Err(e) => tracing::debug!("No live pane for {}: {}", ancillary_id, e),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,11 +236,16 @@ async fn ancillary_start_work(
         )
     })?;
 
-    // Check if ancillary already has active work
-    if state.work_manager.has_active_work(&ancillary_id).await {
+    // The pane is shared with any attached terminal.
+    if state
+        .panes
+        .status(&assignment.segment, &assignment.workspace_path)
+        .await
+        == PaneStatus::Working
+    {
         return Err((
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Ancillary already has active work"})),
+            Json(serde_json::json!({"error": "Ancillary already has an agent running"})),
         ));
     }
 
@@ -240,25 +261,139 @@ async fn ancillary_start_work(
         (*state.agent).clone()
     };
 
-    // Start work
-    match state
-        .work_manager
-        .start_work(ancillary_id.clone(), assignment, &agent)
+    start_agent(&state, &ancillary_id, &assignment, &agent, None)
         .await
-    {
-        Ok(work) => {
-            let status = work.status().await;
-            Ok(Json(serde_json::json!({
+        .map(|session| {
+            Json(serde_json::json!({
                 "success": true,
                 "ancillary_id": ancillary_id,
-                "status": status.to_string()
-            })))
-        }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )),
+                "session": session,
+            }))
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{:#}", e)})),
+            )
+        })
+}
+
+/// Spawn an agent into the ancillary's rmux session and begin mirroring it.
+///
+/// `prompt_override` is for resume, which has already rendered a continuation prompt.
+async fn start_agent(
+    state: &AppState,
+    ancillary_id: &str,
+    assignment: &Assignment,
+    agent: &Agent,
+    prompt_override: Option<String>,
+) -> Result<String> {
+    let prompt = prompt_override.unwrap_or_else(|| assignment_prompt(assignment, &state.config));
+
+    // Nothing is watching this terminal to answer permission prompts.
+    let argv = agent.build_argv(&prompt, None, true);
+
+    let session = state
+        .panes
+        .start_agent(
+            ancillary_id,
+            &assignment.segment,
+            &assignment.workspace_path,
+            &argv,
+            &assignment.id,
+        )
+        .await?;
+
+    capture_session_id(state, assignment, std::time::SystemTime::now());
+    Ok(session)
+}
+
+/// The prompt an assignment starts its agent with: its own text, or the `act` intent rendered
+/// against the task, as `breq do -i act` would.
+fn assignment_prompt(assignment: &Assignment, config: &Config) -> String {
+    if let toren_lib::AssignmentSource::Prompt { original_prompt } = &assignment.source {
+        return original_prompt.clone();
     }
+
+    let task_id = assignment.task_id.clone().unwrap_or_default();
+    let title = assignment
+        .task_title
+        .clone()
+        .unwrap_or_else(|| task_id.clone());
+
+    let ctx = toren_lib::WorkspaceContext {
+        ws: toren_lib::WorkspaceInfo {
+            name: assignment
+                .workspace_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string(),
+            num: assignment.ancillary_num.unwrap_or(0),
+            path: assignment.workspace_path.display().to_string(),
+        },
+        repo: toren_lib::RepoInfo {
+            root: String::new(),
+            name: assignment.segment.clone(),
+        },
+        task: Some(toren_lib::TaskInfo {
+            id: task_id.clone(),
+            title,
+            description: None,
+            url: assignment.task_url.clone(),
+            source: assignment.task_source.clone(),
+        }),
+        vars: std::collections::HashMap::new(),
+    };
+
+    config
+        .intents
+        .get("act")
+        .and_then(|template| toren_lib::render_template(template, &ctx).ok())
+        .unwrap_or_else(|| format!("implement {}", task_id))
+}
+
+/// Record the agent's Claude session id on the assignment, once it exists.
+///
+/// The agent runs in a terminal, so there is no message to read the id out of; Claude names its
+/// session log `<session-id>.jsonl`, so watch for one instead. Best-effort: a non-Claude agent
+/// just leaves `session_id` unset.
+fn capture_session_id(state: &AppState, assignment: &Assignment, started_at: std::time::SystemTime) {
+    let assignments = state.assignments.clone();
+    let assignment_id = assignment.id.clone();
+    let workspace_path = assignment.workspace_path.clone();
+
+    tokio::spawn(async move {
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            // Unbounded, a workspace with prior logs hands back the previous run's id.
+            let Some(session_id) = toren_lib::composite_status::latest_claude_session_id_since(
+                &workspace_path,
+                started_at,
+            ) else {
+                continue;
+            };
+
+            let mut mgr = assignments.write().await;
+            if mgr.get(&assignment_id).and_then(|a| a.session_id.clone()).as_deref()
+                == Some(session_id.as_str())
+            {
+                return;
+            }
+            if mgr
+                .update_session_id(&assignment_id, Some(session_id.clone()))
+                .is_ok()
+            {
+                tracing::info!(
+                    "Captured session_id {} for assignment {}",
+                    session_id,
+                    assignment_id
+                );
+            }
+            return;
+        }
+    });
 }
 
 async fn ancillary_stop_work(
@@ -270,13 +405,28 @@ async fn ancillary_stop_work(
         .map(|s| s.into_owned())
         .unwrap_or(ancillary_id);
 
-    match state.work_manager.stop_work(&ancillary_id).await {
-        Some(_) => Ok(Json(serde_json::json!({
-            "success": true,
-            "ancillary_id": ancillary_id
-        }))),
-        None => Err(StatusCode::NOT_FOUND),
+    // From the assignment, not from what this process tracks: a `breq do` agent is equally
+    // stoppable, and reporting success without killing it would be a lie.
+    let assignment = {
+        let mut assignments = state.assignments.write().await;
+        assignments.get_active_for_ancillary(&ancillary_id).cloned()
+    };
+    let assignment = assignment.ok_or(StatusCode::NOT_FOUND)?;
+
+    let stopped = state
+        .panes
+        .stop_agent(&ancillary_id, &assignment.segment, &assignment.workspace_path)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !stopped {
+        return Err(StatusCode::NOT_FOUND);
     }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "ancillary_id": ancillary_id
+    })))
 }
 
 async fn ancillaries_list(State(state): State<AppState>) -> impl IntoResponse {
@@ -422,8 +572,13 @@ async fn compute_composite_status(
     assignment: &Assignment,
     state: &AppState,
 ) -> CompositeStatus {
-    // 1. Agent activity — check work manager first, then Claude session logs
-    let agent_activity = if state.work_manager.has_active_work(&assignment.ancillary_id).await {
+    // 1. Agent activity — a live rmux pane is authoritative; session logs also catch agents
+    //    started outside toren entirely.
+    let pane_status = state
+        .panes
+        .status(&assignment.segment, &assignment.workspace_path)
+        .await;
+    let agent_activity = if pane_status == PaneStatus::Working {
         "busy".to_string()
     } else {
         // Fall back to Claude session log recency check
@@ -825,10 +980,14 @@ async fn assignments_complete(
         Json(serde_json::json!({"error": "Assignment not found"})),
     ))?;
 
-    // Stop active work if running
+    // Stop the agent if one is running; the workspace is about to be cleaned up.
     let _ = state
-        .work_manager
-        .stop_work(&assignment.ancillary_id)
+        .panes
+        .stop_agent(
+            &assignment.ancillary_id,
+            &assignment.segment,
+            &assignment.workspace_path,
+        )
         .await;
 
     // Get segment path
@@ -909,10 +1068,14 @@ async fn assignments_abort(
         Json(serde_json::json!({"error": "Assignment not found"})),
     ))?;
 
-    // Stop active work if running
+    // Stop the agent if one is running; the workspace is about to be cleaned up.
     let _ = state
-        .work_manager
-        .stop_work(&assignment.ancillary_id)
+        .panes
+        .stop_agent(
+            &assignment.ancillary_id,
+            &assignment.segment,
+            &assignment.workspace_path,
+        )
         .await;
 
     // Get segment path
@@ -1034,37 +1197,31 @@ async fn assignments_resume(
         (*state.agent).clone()
     };
 
-    // Optionally start SDK work
+    // Optionally relaunch the agent with the resume prompt.
     let work_started = if request.start_work {
-        // Check if ancillary already has active work
         if state
-            .work_manager
-            .has_active_work(&assignment.ancillary_id)
+            .panes
+            .status(&updated_assignment.segment, &updated_assignment.workspace_path)
             .await
+            == PaneStatus::Working
         {
             false
         } else {
-            // Use the assignment with the resume prompt as source
-            let mut resume_assignment = updated_assignment.clone();
-            resume_assignment.source = toren_lib::AssignmentSource::Prompt {
-                original_prompt: resume_result.prompt.clone(),
-            };
-
-            match state
-                .work_manager
-                .start_work(assignment.ancillary_id.clone(), resume_assignment, &agent)
-                .await
-            {
-                Ok(_) => true,
-                Err(e) => {
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(
-                            serde_json::json!({"error": format!("Failed to start work: {}", e)}),
-                        ),
-                    ));
-                }
-            }
+            start_agent(
+                &state,
+                &assignment.ancillary_id,
+                &updated_assignment,
+                &agent,
+                Some(resume_result.prompt.clone()),
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to start agent: {:#}", e)})),
+                )
+            })?;
+            true
         }
     } else {
         false

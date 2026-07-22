@@ -91,9 +91,11 @@ async fn main() -> Result<()> {
     );
     let workspace_manager = Some(WorkspaceManager::new(workspace_root, local_domain));
 
-    // Initialize work manager (for embedded ancillary runtime)
-    let work_manager = ancillary::WorkManager::new();
-    info!("Work manager initialized");
+    // Agents run in rmux panes; transcripts of those panes live under the toren root.
+    let pane_runner = services::pane_runner::PaneRunner::new(
+        toren_lib::toren_root().join("transcripts"),
+    );
+    info!("Pane runner initialized");
 
     // Resolve coding agent
     let agent = config.resolve_agent(None)?;
@@ -114,7 +116,7 @@ async fn main() -> Result<()> {
         assignment_manager,
         segment_manager,
         workspace_manager,
-        work_manager,
+        pane_runner,
         agent,
     )
     .await?;

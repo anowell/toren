@@ -6,6 +6,7 @@ pub mod composite_status;
 pub mod config;
 pub mod plugins;
 pub mod process;
+pub mod rmux;
 pub mod segments;
 pub mod tasks;
 pub mod workspace;

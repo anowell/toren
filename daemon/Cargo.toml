@@ -8,8 +8,8 @@ license.workspace = true
 [dependencies]
 toren-lib = { path = "../lib" }
 
-# Claude Agent SDK for embedded ancillary runtime
-claude-agent-sdk-rs = "0.5"
+# Terminal multiplexer backing the agent panes the web UI mirrors
+rmux-sdk = "0.9"
 
 tokio.workspace = true
 serde.workspace = true
