@@ -41,15 +41,13 @@ default_model = "claude-sonnet-4-5-20250929"
 # Pool size for ancillaries per segment
 pool_size = 10
 
-# Intent templates: workflow guidance appended as system prompt via --append-system-prompt.
-# Omitting -i/--intent passes only the user prompt with no additional system prompt.
-# Built-in intents (debug, design, implement, review) are used if not overridden here.
-# Available template variables: task.id, task.title, task.description, task.source, ws.name, ws.num, ws.path, repo.root, repo.name
-# [intents]
-# debug = "Focus on root cause analysis, not fixing. ..."
-# design = "Act as architect. Investigate the codebase, then propose a design — not code. ..."
-# implement = "Implement the task. Prove it works — tests should pass, lints should be clean. ..."
-# review = "You are NOT the implementer — review with fresh eyes. ..."
+# Default coding agent (an agents/ resolver plugin name; auto-detects from PATH if unset).
+# agent = "claude"
+
+[delivery]
+# Which delivery resolver reads PR/CI state. With exactly one delivery plugin installed breq
+# uses it; a workspace can also override per-place with a `delivery` annotation.
+# source = "github"
 
 [security]
 # Whether to require authentication

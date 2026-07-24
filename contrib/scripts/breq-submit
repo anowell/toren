@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# breq submit [workspace] — push the workspace's work, open a PR, mark its tasks in review.
+#
+# The github + runes flavour of "I'm ready for eyes on this". Installed by `breq init` when it
+# detects that combination; edit freely for yours.
+#
+# Deliberately partial delivery: the workspace stays warm and its data intact, so you can keep
+# working (or `breq setup --from` a follow-up) while this piece is in review.
+
+set -euo pipefail
+
+ws="${1:-${TOREN_WORKSPACE:-}}"
+if [ -z "$ws" ]; then
+    echo "usage: breq submit <workspace>" >&2
+    exit 2
+fi
+
+path=$(breq get "$ws" workspace.path)
+
+echo "==> pushing"
+if [ -d "$path/.jj" ]; then
+    breq sh "$ws" -- jj git push --allow-new
+else
+    breq sh "$ws" -- git push -u origin HEAD
+fi
+
+echo "==> opening a pull request"
+if ! breq sh "$ws" -- gh pr view --json url --jq .url 2>/dev/null; then
+    title=$(breq get "$ws" title)
+    breq sh "$ws" -- gh pr create --fill ${title:+--title "$title"}
+fi
+
+echo "==> marking tasks in review"
+for link in $(breq get "$ws" task || true); do
+    source="${link%%:*}"
+    case "$source" in
+        runes)  status="in-review" ;;
+        linear) status="In Review" ;;
+        *)      status="in-review" ;;
+    esac
+    breq set "$ws" task.status "$status" --task "$link" || true
+done
+
+# Cache the fresh PR/CI state so `breq list` shows it without a network call.
+breq get "$ws" --refresh >/dev/null || true
+
+echo
+echo "Submitted. The workspace is still here — 'breq list' will show the PR as it moves."

@@ -2,27 +2,43 @@
 //!
 //! Host functions are organized into Rhai static modules:
 //! - `json::parse`, `json::stringify`
-//! - `fs::read`, `fs::write`, `fs::exists`, `fs::glob`, `fs::ls`
+//! - `fs::read`, `fs::write`, `fs::exists`, `fs::glob`, `fs::ls`, `fs::newest`, `fs::head`,
+//!   `fs::tail`, `fs::age_secs`
 //! - `path::join`, `path::parent`, `path::filename`, `path::ext`
 //! - `toml::parse`
 //! - `http::get`, `http::post`, `http::put`, `http::patch`, `http::delete`
-//! - `toren::config`, `toren::assignment`
-//! - `task::info`, `task::claim`, `task::complete`, `task::abort`, `task::create`
-//! - `ws::changes`
+//! - `toren::config`
 //!
-//! Flat aliases (`task`, `claim_task`, `complete_task`, `abort_task`, `ancillary`,
-//! `config`, `ws_changes`, `json_parse`, `shell_status`) are kept for backwards
-//! compatibility.
+//! Plus flat `shell`, `env`, `cwd`, `platform`, `parse_args`, `eprint`, and the legacy
+//! `json_parse` / `shell_status` / `config` aliases.
+//!
+//! Every plugin is a resolver, so there is exactly one engine shape. Resolvers deliberately
+//! cannot reach back into breq's own state: they adapt an external system and return data.
 
 use anyhow::Result;
 use rhai::{Dynamic, Engine, Map, Module, Scope, AST};
 use std::sync::Arc;
 
-use super::{DeferredAction, PluginContext, PluginResult};
+use super::PluginContext;
+
+/// Nesting limit for plugin scripts.
+///
+/// Rhai defaults function bodies to a depth that a plainly-written resolver hits quickly —
+/// an `if` inside a `for` inside two `if`s is enough. Plugins are the user's own trusted
+/// code, so the limit buys nothing here.
+const MAX_EXPR_DEPTH: usize = 128;
+
+/// A bare engine with breq's parser limits, for compiling without registering host functions.
+pub fn compiler() -> Engine {
+    let mut engine = Engine::new();
+    engine.set_max_expr_depths(MAX_EXPR_DEPTH, MAX_EXPR_DEPTH);
+    engine
+}
 
 /// Create a Rhai engine with all host functions registered.
 pub fn create_engine(ctx: Arc<PluginContext>) -> Engine {
     let mut engine = Engine::new();
+    engine.set_max_expr_depths(MAX_EXPR_DEPTH, MAX_EXPR_DEPTH);
 
     // Plugin print goes to stdout
     engine.on_print(|s| println!("{}", s));
@@ -49,95 +65,24 @@ pub fn create_engine(ctx: Arc<PluginContext>) -> Engine {
     engine.register_static_module("path", build_path_module().into());
     engine.register_static_module("toml", build_toml_module().into());
     engine.register_static_module("http", build_http_module().into());
-    engine.register_static_module("task", build_task_module(ctx.clone()));
-    engine.register_static_module("toren", build_toren_module(ctx.clone()));
-    engine.register_static_module("ws", build_ws_module());
+    engine.register_static_module("toren", build_toren_module());
 
     // ── Flat aliases for backwards compat (DEPRECATED) ───────────────
     register_flat_aliases(&mut engine);
-    register_ctx_flat_aliases(&mut engine, ctx);
 
+    let _ = ctx;
     engine
 }
 
-/// Create a resolver engine — same as `create_engine` but without `toren::task()`
-/// to prevent infinite recursion when resolvers are called from `toren::task()`.
-pub fn create_resolver_engine(_ctx: Arc<PluginContext>) -> Engine {
-    let mut engine = Engine::new();
-
-    engine.on_print(|s| println!("{}", s));
-    engine.on_debug(|s, src, pos| {
-        if let Some(src) = src {
-            eprintln!("[{}:{:?}] {}", src, pos, s);
-        } else {
-            eprintln!("[{:?}] {}", pos, s);
-        }
-    });
-
-    register_shell(&mut engine);
-    register_shell_extended(&mut engine);
-    register_env(&mut engine);
-    register_cwd(&mut engine);
-    register_platform(&mut engine);
-    register_parse_args(&mut engine);
-    register_print_eprint(&mut engine);
-
-    engine.register_static_module("json", build_json_module().into());
-    engine.register_static_module("fs", build_fs_module().into());
-    engine.register_static_module("path", build_path_module().into());
-    engine.register_static_module("toml", build_toml_module().into());
-    engine.register_static_module("http", build_http_module().into());
-    // No toren module (prevents recursion)
-    // No ws module (needs PluginContext with segment, not useful in resolvers)
-
-    // Flat aliases minus task/ancillary/ws_changes/config
-    register_json_parse_alias(&mut engine);
-    register_shell_status_alias(&mut engine);
-
-    engine
-}
-
-/// Run a compiled AST with the given arguments, return interpreted result.
-pub fn run_ast(engine: &Engine, ast: &AST, args: &[String]) -> Result<PluginResult> {
+/// Run a compiled AST with `ARGS` in scope.
+pub fn eval_with_args(engine: &Engine, ast: &AST, args: &[String]) -> Result<Dynamic> {
     let mut scope = Scope::new();
-
-    // Set ARGS as a Rhai array
     let args_array: rhai::Array = args.iter().map(|a| Dynamic::from(a.clone())).collect();
     scope.push("ARGS", args_array);
 
-    let result = engine
+    engine
         .eval_ast_with_scope::<Dynamic>(&mut scope, ast)
-        .map_err(|e| anyhow::anyhow!("Plugin script error: {}", e))?;
-
-    interpret_result(result)
-}
-
-/// Interpret the script's return value.
-///
-/// If the script returns a map with `action: "do"` (or legacy `"cmd"`), it becomes a `DeferredAction::Do`.
-/// Otherwise, it's `PluginResult::Ok`.
-pub fn interpret_result(value: Dynamic) -> Result<PluginResult> {
-    if value.is::<Map>() {
-        let map = value.cast::<Map>();
-        if let Some(action) = map.get("action") {
-            let action_str = action.clone().into_string().ok();
-            if action_str.as_deref() == Some("do") || action_str.as_deref() == Some("cmd") {
-                let get_str = |key: &str| -> Option<String> {
-                    map.get(key).and_then(|v| v.clone().into_string().ok())
-                };
-
-                return Ok(PluginResult::Action(DeferredAction::Do {
-                    task_id: get_str("task_id"),
-                    task_title: get_str("task_title"),
-                    task_url: get_str("task_url"),
-                    task_source: get_str("task_source"),
-                    prompt: get_str("prompt"),
-                    intent: get_str("intent"),
-                }));
-            }
-        }
-    }
-    Ok(PluginResult::Ok)
+        .map_err(|e| anyhow::anyhow!("Plugin script error: {}", e))
 }
 
 // ── Shell ───────────────────────────────────────────────────────────────────
@@ -539,6 +484,72 @@ fn build_fs_module() -> Module {
         },
     );
 
+    // The three below exist for agent resolvers introspecting session logs: find the newest
+    // one, read an end of it, and judge staleness — all without slurping a multi-megabyte
+    // JSONL into the script.
+
+    // Path of the most recently modified file in `dir` with extension `ext` (`""` for any).
+    module.set_native_fn(
+        "newest",
+        |dir: &str, ext: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return Ok(String::new());
+            };
+            let mut best: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !ext.is_empty() && path.extension().and_then(|e| e.to_str()) != Some(ext) {
+                    continue;
+                }
+                let Ok(modified) = path.metadata().and_then(|m| m.modified()) else {
+                    continue;
+                };
+                if best.as_ref().is_none_or(|(_, t)| modified > *t) {
+                    best = Some((path, modified));
+                }
+            }
+            Ok(best
+                .map(|(p, _)| p.display().to_string())
+                .unwrap_or_default())
+        },
+    );
+
+    // First non-empty line of a file.
+    module.set_native_fn(
+        "head",
+        |path: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            use std::io::BufRead;
+            let Ok(file) = std::fs::File::open(path) else {
+                return Ok(String::new());
+            };
+            for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+                if !line.trim().is_empty() {
+                    return Ok(line);
+                }
+            }
+            Ok(String::new())
+        },
+    );
+
+    // Last non-empty line of a file, read by seeking from the end.
+    module.set_native_fn(
+        "tail",
+        |path: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            Ok(crate::fsutil::read_last_line(std::path::Path::new(path)).unwrap_or_default())
+        },
+    );
+
+    // Seconds since a file was last modified; -1 when it doesn't exist.
+    module.set_native_fn(
+        "age_secs",
+        |path: &str| -> Result<i64, Box<rhai::EvalAltResult>> {
+            let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+                return Ok(-1);
+            };
+            Ok(modified.elapsed().map(|d| d.as_secs() as i64).unwrap_or(0))
+        },
+    );
+
     module
 }
 
@@ -765,13 +776,11 @@ fn http_with_body(method: &str, url: &str, opts: &Map) -> Result<Map, Box<rhai::
     }
 }
 
-/// Register `toren::config`, `toren::task`, `toren::assignment` as flat functions
-/// with a `toren` module prefix via engine.register_fn + static module.
+/// Build the `toren` module: `toren::config(key)`.
 ///
-/// Since Rhai's `set_native_fn` on Module doesn't support closures that capture state,
-/// we register these as flat functions and also build a static module for the
-/// non-capturing `toren::config`.
-fn build_toren_module(ctx: Arc<PluginContext>) -> rhai::Shared<Module> {
+/// Read-only, and the only breq-owned data a resolver can see. Resolvers adapt external
+/// systems; workspace state reaches them as function arguments, not ambient lookups.
+fn build_toren_module() -> rhai::Shared<Module> {
     let mut module = Module::new();
 
     module.set_native_fn(
@@ -779,121 +788,6 @@ fn build_toren_module(ctx: Arc<PluginContext>) -> rhai::Shared<Module> {
         |key: &str| -> Result<String, Box<rhai::EvalAltResult>> { config_impl(key) },
     );
 
-    let assign_ctx = ctx.clone();
-    module.set_native_fn(
-        "assignment",
-        move |workspace: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
-            assignment_impl(workspace, &assign_ctx)
-        },
-    );
-
-    module.into()
-}
-
-fn build_task_module(ctx: Arc<PluginContext>) -> rhai::Shared<Module> {
-    let mut module = Module::new();
-
-    let info_ctx = ctx.clone();
-    module.set_native_fn(
-        "info",
-        move |id: &str| -> Result<Map, Box<rhai::EvalAltResult>> { task_impl(id, &info_ctx) },
-    );
-
-    let claim_ctx = ctx.clone();
-    module.set_native_fn(
-        "claim",
-        move |source: &str, id: &str, assignee: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-            claim_task_impl(source, id, assignee, &claim_ctx)
-        },
-    );
-
-    let complete_ctx = ctx.clone();
-    module.set_native_fn(
-        "complete",
-        move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-            complete_task_impl(source, id, &complete_ctx)
-        },
-    );
-
-    let abort_ctx = ctx.clone();
-    module.set_native_fn(
-        "abort",
-        move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-            abort_task_impl(source, id, &abort_ctx)
-        },
-    );
-
-    let create_ctx = ctx.clone();
-    module.set_native_fn(
-        "create",
-        move |source: &str, title: &str, desc: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-            create_task_impl(source, title, Some(desc), &create_ctx)
-        },
-    );
-
-    let create_no_desc_ctx = ctx;
-    module.set_native_fn(
-        "create",
-        move |source: &str, title: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-            create_task_impl(source, title, None, &create_no_desc_ctx)
-        },
-    );
-
-    module.into()
-}
-
-/// Register context-dependent flat aliases (DEPRECATED — use task:: and toren:: modules).
-fn register_ctx_flat_aliases(engine: &mut Engine, ctx: Arc<PluginContext>) {
-    let task_ctx = ctx.clone();
-    engine.register_fn(
-        "task",
-        move |id: &str| -> Result<Map, Box<rhai::EvalAltResult>> { task_impl(id, &task_ctx) },
-    );
-
-    let assign_ctx = ctx.clone();
-    engine.register_fn(
-        "ancillary",
-        move |workspace: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
-            assignment_impl(workspace, &assign_ctx)
-        },
-    );
-
-    let ws_ctx = ctx.clone();
-    engine.register_fn(
-        "ws_changes",
-        move |workspace: &str| -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
-            ws_changes_impl(workspace, &ws_ctx)
-        },
-    );
-
-    let claim_ctx = ctx.clone();
-    engine.register_fn(
-        "claim_task",
-        move |source: &str, id: &str, assignee: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-            claim_task_impl(source, id, assignee, &claim_ctx)
-        },
-    );
-
-    let complete_ctx = ctx.clone();
-    engine.register_fn(
-        "complete_task",
-        move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-            complete_task_impl(source, id, &complete_ctx)
-        },
-    );
-
-    engine.register_fn(
-        "abort_task",
-        move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-            abort_task_impl(source, id, &ctx)
-        },
-    );
-}
-
-/// Build the `ws` module — currently empty since ws::changes needs context.
-/// ws::changes is registered as a flat function via register_ctx_flat_aliases.
-fn build_ws_module() -> rhai::Shared<Module> {
-    let module = Module::new();
     module.into()
 }
 
@@ -935,289 +829,6 @@ fn config_impl(key: &str) -> Result<String, Box<rhai::EvalAltResult>> {
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
     };
-    Ok(result)
-}
-
-fn task_impl(id: &str, ctx: &PluginContext) -> Result<Map, Box<rhai::EvalAltResult>> {
-    let config = crate::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
-
-    let inferred = crate::infer_task_fields(Some(id), None, None, None);
-
-    // Try to fetch task via resolver
-    let fetched = if let Some(ref task_id) = inferred.task_id {
-        // Determine which sources to try
-        let sources_to_try: Vec<String> = if let Some(ref explicit_source) = inferred.task_source {
-            vec![explicit_source.clone()]
-        } else if !ctx.task_sources.is_empty() {
-            ctx.task_sources.clone()
-        } else if !config.tasks.sources.is_empty() {
-            config.tasks.sources.clone()
-        } else {
-            // Auto-detect: try all available resolvers
-            ctx.resolvers.keys().cloned().collect()
-        };
-
-        // Try each source's resolver until one succeeds
-        let mut result = None;
-        for source in &sources_to_try {
-            if let Some(resolver_ast) = ctx.resolvers.get(source.as_str()) {
-                let resolver_ctx = Arc::new(PluginContext::default());
-                let engine = super::runtime::create_resolver_engine(resolver_ctx);
-                let mut scope = Scope::new();
-                if let Some(task) = engine
-                    .call_fn::<Dynamic>(&mut scope, resolver_ast, "info", (task_id.clone(),))
-                    .ok()
-                    .and_then(|d| d.try_cast::<Map>())
-                    .map(|m| {
-                        let get_opt = |key: &str| -> Option<String> {
-                            m.get(key).and_then(|v| {
-                                if v.is::<()>() {
-                                    None
-                                } else {
-                                    v.clone().into_string().ok()
-                                }
-                            })
-                        };
-                        crate::tasks::ResolvedTask {
-                            id: get_opt("id").unwrap_or_else(|| task_id.clone()),
-                            source: source.clone(),
-                            kind: get_opt("kind"),
-                            title: get_opt("title").unwrap_or_default(),
-                            status: get_opt("status"),
-                            assignee: get_opt("assignee"),
-                            description: get_opt("description"),
-                            created_at: get_opt("created_at"),
-                            updated_at: get_opt("updated_at"),
-                        }
-                    })
-                {
-                    result = Some(task);
-                    break;
-                }
-            }
-        }
-        result
-    } else {
-        None
-    };
-
-    let mut map = Map::new();
-    if let Some(id) = inferred.task_id {
-        map.insert("id".into(), Dynamic::from(id));
-    }
-    let title = fetched
-        .as_ref()
-        .map(|t| t.title.clone())
-        .or(inferred.task_title);
-    if let Some(t) = title {
-        map.insert("title".into(), Dynamic::from(t));
-    }
-    if let Some(desc) = fetched.as_ref().and_then(|t| t.description.clone()) {
-        map.insert("description".into(), Dynamic::from(desc));
-    }
-    if let Some(url) = inferred.task_url {
-        map.insert("url".into(), Dynamic::from(url));
-    }
-    // Use source from fetched task (which was resolved) or inferred
-    let source = fetched
-        .as_ref()
-        .map(|t| t.source.clone())
-        .or(inferred.task_source);
-    if let Some(source) = source {
-        map.insert("source".into(), Dynamic::from(source));
-    }
-    if let Some(status) = fetched.as_ref().and_then(|t| t.status.clone()) {
-        map.insert("status".into(), Dynamic::from(status));
-    }
-    if let Some(assignee) = fetched.as_ref().and_then(|t| t.assignee.clone()) {
-        map.insert("assignee".into(), Dynamic::from(assignee));
-    }
-    if let Some(kind) = fetched.as_ref().and_then(|t| t.kind.clone()) {
-        map.insert("kind".into(), Dynamic::from(kind));
-    }
-    Ok(map)
-}
-
-fn call_resolver_void(
-    source: &str,
-    fn_name: &str,
-    args: impl rhai::FuncArgs,
-    ctx: &PluginContext,
-) -> Result<(), Box<rhai::EvalAltResult>> {
-    let resolver_ast = ctx
-        .resolvers
-        .get(source)
-        .ok_or_else(|| format!("No task resolver found for source '{}'", source))?;
-
-    let resolver_ctx = Arc::new(PluginContext::default());
-    let engine = super::runtime::create_resolver_engine(resolver_ctx);
-    let mut scope = Scope::new();
-    let _ = engine
-        .call_fn::<Dynamic>(&mut scope, resolver_ast, fn_name, args)
-        .map_err(|e| format!("Resolver '{}' {}() failed: {}", source, fn_name, e))?;
-    Ok(())
-}
-
-fn claim_task_impl(
-    source: &str,
-    id: &str,
-    assignee: &str,
-    ctx: &PluginContext,
-) -> Result<(), Box<rhai::EvalAltResult>> {
-    call_resolver_void(source, "claim", (id.to_string(), assignee.to_string()), ctx)
-}
-
-fn complete_task_impl(
-    source: &str,
-    id: &str,
-    ctx: &PluginContext,
-) -> Result<(), Box<rhai::EvalAltResult>> {
-    call_resolver_void(source, "complete", (id.to_string(),), ctx)
-}
-
-fn abort_task_impl(
-    source: &str,
-    id: &str,
-    ctx: &PluginContext,
-) -> Result<(), Box<rhai::EvalAltResult>> {
-    call_resolver_void(source, "abort", (id.to_string(),), ctx)
-}
-
-fn create_task_impl(
-    source: &str,
-    title: &str,
-    desc: Option<&str>,
-    ctx: &PluginContext,
-) -> Result<String, Box<rhai::EvalAltResult>> {
-    let resolver_ast = ctx
-        .resolvers
-        .get(source)
-        .ok_or_else(|| format!("No task resolver found for source '{}'", source))?;
-
-    let resolver_ctx = Arc::new(PluginContext::default());
-    let engine = super::runtime::create_resolver_engine(resolver_ctx);
-    let mut scope = Scope::new();
-
-    let desc_arg = match desc {
-        Some(d) => Dynamic::from(d.to_string()),
-        None => Dynamic::UNIT,
-    };
-    let result = engine
-        .call_fn::<Dynamic>(
-            &mut scope,
-            resolver_ast,
-            "create",
-            (title.to_string(), desc_arg),
-        )
-        .map_err(|e| format!("Resolver '{}' create() failed: {}", source, e))?;
-    Ok(result.into_string().unwrap_or_default())
-}
-
-fn assignment_impl(workspace: &str, ctx: &PluginContext) -> Result<Map, Box<rhai::EvalAltResult>> {
-    let mut assignment_mgr = crate::AssignmentManager::new()
-        .map_err(|e| format!("Failed to load assignments: {}", e))?;
-
-    let segment_name = ctx.segment_name.as_deref().unwrap_or("");
-
-    // Resolve workspace to assignment
-    let ws_name = workspace.to_lowercase();
-    let ancillary_num = crate::word_to_number(&ws_name).unwrap_or(0);
-    let anc_id = crate::ancillary_id(segment_name, ancillary_num);
-
-    let assignment = assignment_mgr
-        .get_active_for_ancillary(&anc_id)
-        .ok_or_else(|| format!("No assignment found for workspace '{}'", workspace))?;
-
-    let mut map = Map::new();
-    map.insert("id".into(), Dynamic::from(assignment.id.clone()));
-    map.insert(
-        "ancillary_id".into(),
-        Dynamic::from(assignment.ancillary_id.clone()),
-    );
-    map.insert("segment".into(), Dynamic::from(assignment.segment.clone()));
-    map.insert(
-        "workspace_path".into(),
-        Dynamic::from(assignment.workspace_path.display().to_string()),
-    );
-    map.insert(
-        "status".into(),
-        Dynamic::from(format!("{:?}", assignment.status)),
-    );
-    map.insert(
-        "task_id".into(),
-        Dynamic::from(assignment.task_id.clone().unwrap_or_default()),
-    );
-    map.insert(
-        "task_title".into(),
-        Dynamic::from(assignment.task_title.clone().unwrap_or_default()),
-    );
-    map.insert(
-        "task_url".into(),
-        Dynamic::from(assignment.task_url.clone().unwrap_or_default()),
-    );
-    map.insert(
-        "task_source".into(),
-        Dynamic::from(assignment.task_source.clone().unwrap_or_default()),
-    );
-    map.insert(
-        "session_id".into(),
-        Dynamic::from(assignment.session_id.clone().unwrap_or_default()),
-    );
-    map.insert(
-        "ancillary_num".into(),
-        Dynamic::from(assignment.ancillary_num.unwrap_or(0) as i64),
-    );
-    map.insert(
-        "base_branch".into(),
-        Dynamic::from(assignment.base_branch.clone().unwrap_or_default()),
-    );
-    Ok(map)
-}
-
-fn ws_changes_impl(
-    workspace: &str,
-    ctx: &PluginContext,
-) -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
-    let config = crate::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
-    let mut assignment_mgr = crate::AssignmentManager::new()
-        .map_err(|e| format!("Failed to load assignments: {}", e))?;
-
-    let segment_name = ctx.segment_name.as_deref().unwrap_or("");
-    let segment_path = ctx
-        .segment_path
-        .as_ref()
-        .ok_or_else(|| "No segment path available".to_string())?;
-
-    // Resolve workspace to assignment
-    let ws_name = workspace.to_lowercase();
-    let ancillary_num = crate::word_to_number(&ws_name).unwrap_or(0);
-    let anc_id = crate::ancillary_id(segment_name, ancillary_num);
-
-    let assignment = assignment_mgr
-        .get_active_for_ancillary(&anc_id)
-        .ok_or_else(|| format!("No assignment found for workspace '{}'", workspace))?;
-
-    let workspace_root = config.ancillaries.workspace_root.clone();
-    let ws_mgr = crate::WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
-
-    let commits = ws_mgr
-        .workspace_info(
-            segment_path,
-            &assignment.workspace_path,
-            assignment.base_branch.as_deref(),
-        )
-        .map_err(|e| format!("Failed to get workspace info: {}", e))?;
-
-    let result: rhai::Array = commits
-        .into_iter()
-        .map(|c| {
-            let mut m = Map::new();
-            m.insert("id".into(), Dynamic::from(c.id));
-            m.insert("summary".into(), Dynamic::from(c.summary));
-            Dynamic::from(m)
-        })
-        .collect();
-
     Ok(result)
 }
 
@@ -1266,57 +877,6 @@ fn register_shell_status_alias(engine: &mut Engine) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_interpret_result_ok() {
-        let result = interpret_result(Dynamic::from(42)).unwrap();
-        assert!(matches!(result, PluginResult::Ok));
-    }
-
-    #[test]
-    fn test_interpret_result_do_action() {
-        let mut map = Map::new();
-        map.insert("action".into(), Dynamic::from("do"));
-        map.insert("task_id".into(), Dynamic::from("breq-123"));
-        map.insert("task_title".into(), Dynamic::from("Fix the bug"));
-
-        let result = interpret_result(Dynamic::from(map)).unwrap();
-        match result {
-            PluginResult::Action(DeferredAction::Do {
-                task_id,
-                task_title,
-                ..
-            }) => {
-                assert_eq!(task_id.as_deref(), Some("breq-123"));
-                assert_eq!(task_title.as_deref(), Some("Fix the bug"));
-            }
-            _ => panic!("Expected DeferredAction::Do"),
-        }
-    }
-
-    #[test]
-    fn test_interpret_result_legacy_cmd_action() {
-        let mut map = Map::new();
-        map.insert("action".into(), Dynamic::from("cmd"));
-        map.insert("task_id".into(), Dynamic::from("breq-456"));
-
-        let result = interpret_result(Dynamic::from(map)).unwrap();
-        match result {
-            PluginResult::Action(DeferredAction::Do { task_id, .. }) => {
-                assert_eq!(task_id.as_deref(), Some("breq-456"));
-            }
-            _ => panic!("Expected DeferredAction::Do from legacy 'cmd'"),
-        }
-    }
-
-    #[test]
-    fn test_interpret_result_non_cmd_map() {
-        let mut map = Map::new();
-        map.insert("action".into(), Dynamic::from("other"));
-
-        let result = interpret_result(Dynamic::from(map)).unwrap();
-        assert!(matches!(result, PluginResult::Ok));
-    }
 
     #[test]
     fn test_json_parse_via_engine() {
@@ -1399,7 +959,7 @@ mod tests {
             )
             .unwrap();
         let result: rhai::Array = engine.eval_ast(&ast).unwrap();
-        assert_eq!(result[0].clone().cast::<bool>(), true);
+        assert!(result[0].clone().cast::<bool>());
         assert_eq!(result[1].clone().cast::<i64>(), 0);
     }
 
@@ -1510,7 +1070,7 @@ mod tests {
         let result: rhai::Array = engine.eval_ast(&ast).unwrap();
         assert_eq!(result[0].clone().into_string().unwrap(), "foo");
         assert_eq!(result[1].clone().into_string().unwrap(), "bar");
-        assert_eq!(result[2].clone().cast::<bool>(), true);
+        assert!(result[2].clone().cast::<bool>());
     }
 
     #[test]
@@ -1526,7 +1086,7 @@ mod tests {
             )
             .unwrap();
         let result: rhai::Array = engine.eval_ast(&ast).unwrap();
-        assert_eq!(result[0].clone().cast::<bool>(), false);
+        assert!(!result[0].clone().cast::<bool>());
         assert_eq!(result[1].clone().into_string().unwrap(), "--push");
     }
 
@@ -1567,7 +1127,7 @@ mod tests {
             .unwrap();
         let result: rhai::Array = engine.eval_ast(&ast).unwrap();
         assert_eq!(result[0].clone().into_string().unwrap(), "task-123");
-        assert_eq!(result[1].clone().cast::<bool>(), true);
+        assert!(result[1].clone().cast::<bool>());
         assert_eq!(result[2].clone().into_string().unwrap(), "act");
     }
 

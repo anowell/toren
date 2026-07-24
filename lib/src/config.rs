@@ -5,8 +5,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
-use crate::agent::Agent;
-
 /// Return the toren root directory (~/.toren).
 pub fn toren_root() -> PathBuf {
     dirs::home_dir()
@@ -34,10 +32,10 @@ pub struct Config {
     pub proxy: ProxyConfig,
 
     #[serde(default)]
-    pub intents: IntentsConfig,
+    pub tasks: TasksConfig,
 
     #[serde(default)]
-    pub tasks: TasksConfig,
+    pub delivery: DeliveryConfig,
 
     #[serde(default = "crate::alias::default_aliases")]
     pub aliases: HashMap<String, String>,
@@ -118,30 +116,14 @@ impl Default for ProxyConfig {
     }
 }
 
-/// Intent templates keyed by name (e.g., "act", "plan", "review").
-/// Additional custom intents can be added via config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntentsConfig {
-    #[serde(flatten)]
-    pub entries: HashMap<String, String>,
-}
-
-impl IntentsConfig {
-    /// Get an intent template by name, falling back to default if not found.
-    pub fn get(&self, name: &str) -> Option<&str> {
-        self.entries.get(name).map(|s| s.as_str())
-    }
-}
-
-impl Default for IntentsConfig {
-    fn default() -> Self {
-        let mut entries = HashMap::new();
-        entries.insert("debug".to_string(), default_intent_debug());
-        entries.insert("design".to_string(), default_intent_design());
-        entries.insert("implement".to_string(), default_intent_implement());
-        entries.insert("review".to_string(), default_intent_review());
-        Self { entries }
-    }
+/// Which delivery resolver reads PR/CI state.
+///
+/// Optional: with exactly one delivery plugin installed, breq uses it. A workspace can also
+/// override per-place with a `delivery` annotation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeliveryConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Configuration for task tracking defaults.
@@ -189,33 +171,6 @@ impl Default for TasksConfig {
             sources: default_task_sources(),
         }
     }
-}
-
-fn default_intent_debug() -> String {
-    "Focus on root cause analysis, not fixing. Reproduce the issue — a failing test is ideal. \
-     Trace from symptom to cause, identify contributing factors, then suggest fix options with \
-     a clear recommendation. Document findings as a task comment."
-        .to_string()
-}
-
-fn default_intent_design() -> String {
-    "Act as architect. Investigate the codebase, then propose a design — not code. \
-     Identify impact surface, risks, and open questions that need human input. \
-     Write the proposal to the task's design field."
-        .to_string()
-}
-
-fn default_intent_implement() -> String {
-    "Implement the task. Prove it works with high value tests. Ensure clean build and lints. \
-     Keep changes minimal and focused. When done, summarize changes as a task comment."
-        .to_string()
-}
-
-fn default_intent_review() -> String {
-    "You are NOT the implementer — review with fresh eyes. Check correctness against \
-     requirements, look for bugs and edge cases, assess test coverage. Categorize issues \
-     as critical/important/suggestion. Comment on task with findings and an overall confidence for shipping."
-        .to_string()
 }
 
 /// Expand shell-style paths (e.g., `~` to home directory)
@@ -374,8 +329,8 @@ impl Default for Config {
             server: default_server(),
             ancillaries: AncillariesConfig::default(),
             proxy: ProxyConfig::default(),
-            intents: IntentsConfig::default(),
             tasks: TasksConfig::default(),
+            delivery: DeliveryConfig::default(),
             aliases: crate::alias::default_aliases(),
         }
     }
@@ -389,21 +344,6 @@ impl Config {
 
     pub fn port(&self) -> u16 {
         self.server.port
-    }
-}
-
-impl Config {
-    /// Resolve the coding agent to use.
-    ///
-    /// Priority: CLI override > config file > auto-detect from PATH.
-    pub fn resolve_agent(&self, cli_override: Option<&str>) -> Result<Agent> {
-        if let Some(s) = cli_override {
-            return Agent::parse(s);
-        }
-        if let Some(ref s) = self.ancillaries.agent {
-            return Agent::parse(s);
-        }
-        Agent::detect()
     }
 }
 

@@ -1,7 +1,7 @@
 <script lang="ts">
-import type { BeadDisplayStatus } from '$lib/types/toren';
+import type { TaskDisplayStatus } from '$lib/types/toren';
 
-export let status: BeadDisplayStatus;
+export let status: TaskDisplayStatus;
 </script>
 
 {#if status === 'open'}

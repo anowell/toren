@@ -5,7 +5,7 @@
 Toren is a set of composable tools to orchestrate workspaces for agentic development.
 
 - Manage work in git worktrees or jj workspaces
-- Easily spawn agents (Claude, Codex, Gemini, or OpenCode) in workspaces
+- Easily spawn agents (Claude, Codex, Gemini, OpenCode, or Pi) in workspaces
 
 Built-in support for:
 
@@ -16,7 +16,7 @@ Bring your own work-tracking system (e.g. Linear, GH Issues, [runes](https://git
 
 ## Introduction
 
-- **Breq** - CLI for assigning work and managing agent sessions
+- **Breq** - CLI for managing workspaces and the agent sessions inside them
 - **Toren Daemon** - REST + WebSocket workspace API (experimental)
 - **Station** - Manage reverse proxy configuration (e.g. proxies per workspace)
 - **Web** - Browser-based interface connecting to the daemon (experimental)
@@ -24,11 +24,16 @@ Bring your own work-tracking system (e.g. Linear, GH Issues, [runes](https://git
 
 **Mental Model**:
 
-- Breq (CLI) or Toren (API) assign work to ancillaries
-- A single ancillary (e.g. App One) manages
-  - a single workspace ("@one") or worktree (branch "one")
-  - one or more agents (e.g. claude)
-- Services in the workspace become accessible via one.app.lvh.me (or other local-resolving domain)
+A **workspace is a place** — a working copy + VCS state + an rmux session + annotations. Agents run
+*in* a place; tasks and delivery (a PR, a CI run) are *annotations on* a place.
+
+- A segment (e.g. `app`) is a repo; its places are named `one`, `two`, ... (branch/workspace `one`)
+- A place holds one or more agents (e.g. claude) and the shell alongside them
+- Managing the place and updating the tracker are separate axes: tearing a workspace down is not the
+  same act as marking its task done. `breq list` shows when they've diverged.
+- Services in a place become accessible via `one.app.lvh.me` (or another local-resolving domain)
+
+See [docs/CONCEPTS.md](docs/CONCEPTS.md) for the full model.
 
 
 ## Installation
@@ -51,9 +56,11 @@ cd ~/projects/app
 breq init --stealth
 ```
 
-This does two things:
+`breq init` does the out-of-box setup:
 1. Creates `toren.kdl` in your repo with auto-discovered workspace hooks (e.g. copying `node_modules`)
-2. Ensures the repo is registered as an ancillary in `~/.toren/config.toml`
+2. Offers to register the repo as a segment in `~/.toren/config.toml`
+3. Installs the shipped workflow scripts (`breq-complete`, `breq-abort`) into `~/.toren/bin`, plus
+   `breq-submit` when it detects a GitHub remote with `gh` installed
 
 Then start an agent session:
 
@@ -61,42 +68,80 @@ Then start an agent session:
 breq do -p "Add input validation to the signup form"
 ```
 
-Breq creates a workspace (git worktree or jj workspace), runs your setup hooks, and launches Claude Code with your prompt. Each ancillary gets a named workspace ("one", "two", etc.).
+Breq creates a workspace (git worktree or jj workspace), runs your setup hooks, and launches Claude
+Code with your prompt. Each workspace gets a name ("one", "two", etc.).
 
 ## Breq CLI
 
+`breq`'s verbs fall into two families. **Place verbs** manage the workspace; **task verbs** update
+your tracker and never touch the workspace. The only crossing point is `breq do <task>`, which
+claims the task it starts on.
+
 ```bash
-# Assign work to a coding agent
-breq do -p <prompt>                # Launch agent in a new workspace
-breq do <workspace> -p <prompt>    # Launch agent in an existing workspace
-breq do -i <intent>                # Use a configured prompt template
-runes show proj-123 | breq do         # Prompt from stdin
-breq do <workspace> --force        # Replace an agent already running there
+# Run a coding agent in a place (needs a task or a prompt)
+breq do -p <prompt>                # New (or cwd-inferred) workspace, from a prompt
+breq do -w <workspace> -p <prompt> # A specific workspace
+breq do <task-id>                  # Claim a task, compose its context into the prompt
+breq do <task-id> --agent codex    # Choose the agent; --model overrides the model
+breq do --resume                   # Resume the workspace's previous agent session
+runes show tor-123 | breq do       # Prompt from stdin
+breq do -w <workspace> --force     # Replace an agent already running there
 breq do -p <prompt> --no-rmux      # Skip rmux; exec the agent directly
 
-# Manage active sessions
-breq list                          # Show active assignments
-breq destroy <workspace>           # Teardown workspace
+# Create and tear down places
+breq setup [workspace]             # Create a workspace (no task, no agent)
+breq setup --from <workspace>      # Stack a child workspace on another
+breq setup <name>                  # Adopt an existing working copy in place
+breq teardown <workspace>          # Delete a workspace (no status changes, no push)
+breq teardown <workspace> --kill   # ...also stop live panes
+breq teardown <workspace> --no-delete  # ...keep the working copy, drop only breq's state
+
+# Read and annotate
+breq list                          # One row per workspace: sessions, changes, delivery, tasks
+breq list --all --refresh          # Every segment; refresh delivery (the only networked path)
+breq get <workspace>               # Full detail for one place (--json for scripts)
+breq get <workspace> <key>         # One value, e.g. workspace.path, session, task.status
+breq set <workspace> title "..."   # Write an annotation
+breq set <workspace> +task runes:tor-1   # Link a task (+/- for list keys)
+breq set <workspace> task.status done    # Write a task field (pass-through to the tracker)
 
 # Work in a workspace directly
-breq shell <workspace>             # Open shell in workspace
-breq shell <workspace> -- <cmd>    # Run command in workspace
+breq sh <workspace>                # Open a shell in the place
+breq sh <workspace> -- <cmd>       # Run a command there
+
+# Housekeeping
+breq doctor --fix                  # Detect and repair known-bad state (migrates old assignments)
+breq cleanup --all                 # Remove orphaned dirs; --transcripts <days> prunes transcripts
 ```
 
 With [rmux](https://rmux.io/) installed, `breq do` runs the agent inside a persistent session and
 attaches you to it — detaching leaves the agent running, and the same session is attachable from
 the toren web UI. See [docs/terminals.md](docs/terminals.md).
 
-The plugin system makes it trivial to integrate these primitives with any work-tracking workflow. Install example plugins with
-`breq plugin install commands/<name>` or `breq plugin install tasks/<name>` (or `breq plugin list` to browse), then modify them to fit your workflow: 
+### Workflow verbs are scripts
+
+Anything that isn't a built-in verb is dispatched git-style to a `breq-<name>` script on your `PATH`
+(or in `~/.toren/bin`). The shipped defaults are task verbs — they update your tracker over the
+place/task surface above, and are meant to be edited:
 
 ```bash
-# breq plugin install commands/assign
-breq assign <task_id>              # Runs `breq do` with --prompt, --task-id, and --task-title derived from task
-
-# breq plugin install commands/complete
-breq complete <ws>                 # Runs `breq clean` and closes the task associated with the workspace
+breq complete <ws>                 # Mark the workspace's linked tasks done (no teardown, no push)
+breq abort <ws>                    # Reopen the workspace's linked tasks and drop their assignee
+breq submit <ws>                   # Push, open a PR, mark tasks in-review (github + runes flavour)
 ```
+
+### Plugins
+
+Trackers, agents, and forges are Rhai resolver plugins under `~/.toren/plugins/`, in three families:
+`tasks/`, `agents/`, and `delivery/`. Adding a new one is a single `.rhai` file — no release.
+
+```bash
+breq plugin list                   # Browse installed and available plugins
+breq plugin install tasks/linear   # Fetch a tracker resolver from contrib
+breq plugin install agents/codex   # ...or an agent, or delivery/<forge>
+```
+
+See [docs/plugins.md](docs/plugins.md).
 
 
 ## Workspace Hooks (toren.kdl)
@@ -122,6 +167,13 @@ setup {
     proxy "http" upstream="{{vars.web_port}}"
 }
 
+// Runs instead of `setup` for a child created with `breq setup --from <ws>`.
+// {{ parent.path }} is the workspace being forked, so runtime state can be
+// cloned rather than rebuilt. Falls back to `setup` if omitted.
+fork {
+    copy src="data" from="{{ parent.path }}"
+}
+
 destroy {
     run "just destroy-db"
 }
@@ -138,14 +190,15 @@ destroy {
 
 All string arguments support `{{ ... }}` template variables.
 
-**Template variables:** `{{ ws.name }}`, `{{ ws.num }}`, `{{ ws.path }}`, `{{ repo.root }}`, `{{ repo.name }}`, `{{ task.id }}`, `{{ task.title }}`, `{{ vars.<name> }}`
+**Template variables:** `{{ ws.name }}`, `{{ ws.num }}`, `{{ ws.path }}`, `{{ repo.root }}`, `{{ repo.name }}`, `{{ task.id }}`, `{{ task.title }}`, `{{ vars.<name> }}`, and `{{ parent.path }}` inside a `fork` block
 
 ## More
 
-- [Configuration](docs/configuration.md) - Global config, proxy, intents, and aliases
+- [docs/CONCEPTS.md](docs/CONCEPTS.md) - The model: places, the two verb families, the extension census
+- [Configuration](docs/configuration.md) - Global config, proxy, delivery, tasks, and aliases
+- [Plugins](docs/plugins.md) - The task / agent / delivery resolver families and the shipped scripts
 - [Terminals](docs/terminals.md) - rmux sessions, zellij interop, and transcripts
 - [Toren Daemon](daemon/README.md) - REST + WebSocket API for programmatic workspace and agent management
 - [Station](station/README.md) - Reverse proxy management for per-workspace local domains
-- [docs/CONCEPTS.md](docs/CONCEPTS.md) - Naming and metaphor
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Technical design
 

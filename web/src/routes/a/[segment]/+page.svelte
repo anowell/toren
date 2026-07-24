@@ -1,23 +1,20 @@
 <script lang="ts">
 import { goto } from '$app/navigation';
 import { page } from '$app/stores';
-import BeadStatusIcon from '$lib/components/BeadStatusIcon.svelte';
 import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
+import TaskStatusIcon from '$lib/components/TaskStatusIcon.svelte';
 import { connectionStore } from '$lib/stores/connection';
 import {
-	getAncillaryDisplayStatus,
-	getBeadDisplayStatus,
-	getTaskId,
-	getTaskTitle,
-	segmentAssignments,
-	stripBeadPrefix,
+	getTaskDisplayStatus,
+	getWorkspaceDisplayStatus,
+	primaryTask,
+	segmentWorkspaces,
+	stripTaskPrefix,
 	torenStore,
 } from '$lib/stores/toren';
+import type { WorkspaceView } from '$lib/types/toren';
 
-let messageInput = '';
 let showMobilePanel = false;
-let sending = false;
-let sendError: string | null = null;
 
 function goToSegmentSelector() {
 	torenStore.selectSegment(null);
@@ -32,64 +29,15 @@ function closeMobilePanel() {
 	showMobilePanel = false;
 }
 
-function navigateToAncillary(ancillaryId: string) {
-	const parts = ancillaryId.split(' ');
-	const unit = parts[parts.length - 1].toLowerCase();
-	goto(`/a/${$page.params.segment}/${unit}`);
+function navigateToWorkspace(ws: WorkspaceView) {
+	goto(`/a/${$page.params.segment}/${encodeURIComponent(ws.name)}`);
 	closeMobilePanel();
-}
-
-function navigateToNewAncillary() {
-	closeMobilePanel();
-}
-
-function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment): 'busy' | 'ready' {
-	if (assignment.agent_activity === 'busy') return 'busy';
-	if (assignment.agent_activity === 'idle') return 'ready';
-	const ancillary = $torenStore.ancillaries.find((a) => a.id === assignment.ancillary_id);
-	if (!ancillary) return 'ready';
-	return getAncillaryDisplayStatus(ancillary.status);
-}
-
-async function handleSendMessage() {
-	if (!messageInput.trim() || sending) return;
-
-	const content = messageInput.trim();
-	const segment = $torenStore.selectedSegment?.name;
-	if (!segment) return;
-
-	sending = true;
-	sendError = null;
-	messageInput = '';
-
-	try {
-		const shipUrl = $torenStore.shipUrl;
-
-		// 1. Create assignment (creates bead + workspace)
-		const assignment = await torenStore.createAssignment(shipUrl, {
-			prompt: content,
-			segment,
-		});
-
-		// 2. Start the Claude agent work
-		await torenStore.startWork(shipUrl, assignment.ancillary_id, assignment.id);
-
-		// 3. Navigate to the ancillary's chat page
-		const unit = assignment.ancillary_id.split(' ').pop()?.toLowerCase();
-		goto(`/a/${$page.params.segment}/${unit}`);
-	} catch (err) {
-		sendError = err instanceof Error ? err.message : 'Failed to create ancillary';
-		// Restore the message so user can retry
-		messageInput = content;
-	} finally {
-		sending = false;
-	}
 }
 </script>
 
-<div class="chat-view">
+<div class="workspace-view">
 	<!-- Header -->
-	<header class="chat-header">
+	<header class="workspace-header">
 		<div class="header-left">
 			<button class="logo-link" on:click={goToSegmentSelector}>
 				<span class="logo">Toren</span>
@@ -114,47 +62,22 @@ async function handleSendMessage() {
 		</div>
 	</header>
 
-	<!-- Ancillary indicator -->
-	<div class="ancillary-indicator new">
-		<svg
-			xmlns="http://www.w3.org/2000/svg"
-			width="14"
-			height="14"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			stroke-width="2"
-			stroke-linecap="round"
-			stroke-linejoin="round"
-		>
-			<line x1="12" y1="5" x2="12" y2="19"></line>
-			<line x1="5" y1="12" x2="19" y2="12"></line>
-		</svg>
-		<span>New Ancillary</span>
-		<span class="hint">Will be assigned on first message</span>
-	</div>
-
-	<!-- Messages area -->
-	<div class="chat-messages">
+	<!-- Landing / empty state -->
+	<div class="landing-body">
 		<div class="empty-state">
-			{#if sending}
-				<div class="empty-icon spinning">+</div>
-				<h2>Spinning up ancillary...</h2>
-				<p>Creating workspace and starting agent</p>
+			<div class="empty-icon">#</div>
+			<h2>{$torenStore.selectedSegment?.name ?? 'Segment'}</h2>
+			{#if $segmentWorkspaces.length === 0}
+				<p>No workspaces in this segment yet.</p>
 			{:else}
-				<div class="empty-icon">+</div>
-				<h2>New Ancillary</h2>
-				<p>Send a message to start a new task. An ancillary will be assigned automatically.</p>
-				{#if sendError}
-					<p class="error-text">{sendError}</p>
-				{/if}
+				<p>Select a workspace to view its sessions, changes, and tasks.</p>
 			{/if}
 		</div>
 	</div>
 
-	<!-- Input area -->
-	<div class="chat-input">
-		<button class="panel-toggle mobile-only" on:click={toggleMobilePanel} aria-label="View ancillaries">
+	<!-- Mobile panel toggle -->
+	<div class="mobile-bar mobile-only">
+		<button class="panel-toggle" on:click={toggleMobilePanel} aria-label="View workspaces">
 			<svg
 				xmlns="http://www.w3.org/2000/svg"
 				width="20"
@@ -171,40 +94,11 @@ async function handleSendMessage() {
 				<path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
 				<path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
 			</svg>
-			{#if $segmentAssignments.length > 0}
-				<span class="badge">{$segmentAssignments.length}</span>
+			<span>Workspaces</span>
+			{#if $segmentWorkspaces.length > 0}
+				<span class="badge">{$segmentWorkspaces.length}</span>
 			{/if}
 		</button>
-		<form on:submit|preventDefault={handleSendMessage}>
-			<textarea
-				bind:value={messageInput}
-				placeholder="Describe a task..."
-				rows="1"
-				disabled={sending}
-				on:keydown={(e) => {
-					if (e.key === 'Enter' && !e.shiftKey) {
-						e.preventDefault();
-						handleSendMessage();
-					}
-				}}
-			></textarea>
-			<button type="submit" disabled={!messageInput.trim() || sending} aria-label="Send message">
-				<svg
-					xmlns="http://www.w3.org/2000/svg"
-					width="20"
-					height="20"
-					viewBox="0 0 24 24"
-					fill="none"
-					stroke="currentColor"
-					stroke-width="2"
-					stroke-linecap="round"
-					stroke-linejoin="round"
-				>
-					<line x1="22" y1="2" x2="11" y2="13"></line>
-					<polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-				</svg>
-			</button>
-		</form>
 	</div>
 </div>
 
@@ -214,7 +108,7 @@ async function handleSendMessage() {
 	<div class="mobile-overlay" on:click={closeMobilePanel} role="presentation">
 		<div class="mobile-panel" on:click|stopPropagation role="dialog" tabindex="-1">
 			<div class="mobile-panel-header">
-				<h3>Ancillaries</h3>
+				<h3>Workspaces</h3>
 				<button class="close-btn" on:click={closeMobilePanel} aria-label="Close">
 					<svg
 						xmlns="http://www.w3.org/2000/svg"
@@ -233,36 +127,19 @@ async function handleSendMessage() {
 				</button>
 			</div>
 			<div class="mobile-panel-list">
-				<!-- New Ancillary option -->
-				<button class="mobile-item selected" on:click={navigateToNewAncillary}>
-					<div class="item-main">
-						<svg
-							xmlns="http://www.w3.org/2000/svg"
-							width="16"
-							height="16"
-							viewBox="0 0 24 24"
-							fill="none"
-							stroke="currentColor"
-							stroke-width="2"
-							stroke-linecap="round"
-							stroke-linejoin="round"
-						>
-							<line x1="12" y1="5" x2="12" y2="19"></line>
-							<line x1="5" y1="12" x2="19" y2="12"></line>
-						</svg>
-						<span>New Ancillary</span>
-					</div>
-				</button>
-
-				{#each $segmentAssignments as assignment (assignment.id)}
-					{@const agentStatus = lookupAgentActivity(assignment)}
-					{@const beadStatus = getBeadDisplayStatus(assignment)}
-					<button class="mobile-item" on:click={() => navigateToAncillary(assignment.ancillary_id)}>
+				{#each $segmentWorkspaces as ws (ws.name)}
+					{@const agentStatus = getWorkspaceDisplayStatus(ws)}
+					{@const task = primaryTask(ws)}
+					<button class="mobile-item" on:click={() => navigateToWorkspace(ws)}>
 						<div class="item-main">
-							<span class="ancillary-status-dot" class:busy={agentStatus === 'busy'} class:ready={agentStatus === 'ready'}></span>
-							<span class="item-name">{assignment.ancillary_id}</span>
+							<span class="workspace-status-dot" class:busy={agentStatus === 'busy'} class:ready={agentStatus === 'ready'}></span>
+							<span class="item-name">{ws.name}</span>
 						</div>
-						<span class="item-bead"><BeadStatusIcon status={beadStatus} /> {stripBeadPrefix(getTaskId(assignment))}{#if getTaskTitle(assignment)}: {getTaskTitle(assignment)}{/if}</span>
+						{#if task}
+							<span class="item-task"><TaskStatusIcon status={getTaskDisplayStatus(task)} /> {stripTaskPrefix(task.id)}{#if task.title}: {task.title}{/if}</span>
+						{:else if ws.title}
+							<span class="item-task">{ws.title}</span>
+						{/if}
 					</button>
 				{/each}
 			</div>
@@ -271,7 +148,7 @@ async function handleSendMessage() {
 {/if}
 
 <style>
-	.chat-view {
+	.workspace-view {
 		display: flex;
 		flex-direction: column;
 		height: 100%;
@@ -279,8 +156,7 @@ async function handleSendMessage() {
 		background: var(--color-bg);
 	}
 
-	/* Header */
-	.chat-header {
+	.workspace-header {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
@@ -341,30 +217,7 @@ async function handleSendMessage() {
 		color: var(--color-text-secondary);
 	}
 
-	/* Ancillary indicator */
-	.ancillary-indicator {
-		display: flex;
-		align-items: center;
-		gap: var(--spacing-xs);
-		padding: var(--spacing-xs) var(--spacing-md);
-		background: var(--color-bg-tertiary);
-		border-bottom: 1px solid var(--color-border);
-		font-size: 0.85rem;
-		color: var(--color-text);
-	}
-
-	.ancillary-indicator.new {
-		color: var(--color-primary);
-	}
-
-	.ancillary-indicator .hint {
-		color: var(--color-text-secondary);
-		font-size: 0.75rem;
-		margin-left: auto;
-	}
-
-	/* Messages */
-	.chat-messages {
+	.landing-body {
 		flex: 1;
 		overflow-y: auto;
 		padding: var(--spacing-md);
@@ -393,24 +246,6 @@ async function handleSendMessage() {
 		margin-bottom: var(--spacing-md);
 	}
 
-	.empty-icon.spinning {
-		animation: spin 1.5s linear infinite;
-		border-style: solid;
-		border-color: var(--color-primary) transparent transparent transparent;
-	}
-
-	@keyframes spin {
-		to {
-			transform: rotate(360deg);
-		}
-	}
-
-	.error-text {
-		color: var(--color-error);
-		font-size: 0.85rem;
-		margin-top: var(--spacing-sm);
-	}
-
 	.empty-state h2 {
 		margin: 0 0 var(--spacing-sm) 0;
 		color: var(--color-text);
@@ -419,14 +254,10 @@ async function handleSendMessage() {
 
 	.empty-state p {
 		margin: 0;
-		max-width: 300px;
+		max-width: 320px;
 	}
 
-	/* Input */
-	.chat-input {
-		display: flex;
-		align-items: flex-end;
-		gap: var(--spacing-sm);
+	.mobile-bar {
 		padding: var(--spacing-sm) var(--spacing-md);
 		background: var(--color-bg-secondary);
 		border-top: 1px solid var(--color-border);
@@ -434,17 +265,17 @@ async function handleSendMessage() {
 	}
 
 	.panel-toggle {
-		width: 44px;
-		height: 44px;
 		display: flex;
 		align-items: center;
-		justify-content: center;
+		gap: var(--spacing-sm);
+		width: 100%;
+		height: 44px;
+		padding: 0 var(--spacing-md);
 		background: var(--color-bg-tertiary);
 		border: 1px solid var(--color-border);
 		border-radius: var(--radius-md);
 		color: var(--color-text-secondary);
 		position: relative;
-		flex-shrink: 0;
 	}
 
 	.panel-toggle:hover {
@@ -453,9 +284,7 @@ async function handleSendMessage() {
 	}
 
 	.panel-toggle .badge {
-		position: absolute;
-		top: -4px;
-		right: -4px;
+		margin-left: auto;
 		min-width: 18px;
 		height: 18px;
 		padding: 0 4px;
@@ -469,56 +298,8 @@ async function handleSendMessage() {
 		justify-content: center;
 	}
 
-	form {
-		flex: 1;
-		display: flex;
-		gap: var(--spacing-sm);
-		align-items: flex-end;
-	}
-
-	textarea {
-		flex: 1;
-		min-height: 44px;
-		max-height: 150px;
-		padding: var(--spacing-sm) var(--spacing-md);
-		background: var(--color-bg-tertiary);
-		border: 1px solid var(--color-border);
-		border-radius: var(--radius-md);
-		resize: none;
-		font-size: 1rem;
-		line-height: 1.4;
-		color: var(--color-text);
-	}
-
-	textarea:focus {
-		border-color: var(--color-primary);
-		outline: none;
-	}
-
-	button[type='submit'] {
-		width: 44px;
-		height: 44px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		background: var(--color-primary);
-		border-radius: var(--radius-md);
-		color: white;
-		flex-shrink: 0;
-	}
-
-	button[type='submit']:hover:not(:disabled) {
-		background: var(--color-primary-hover);
-	}
-
-	button[type='submit']:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	/* Mobile panel */
 	.mobile-only {
-		display: flex;
+		display: block;
 	}
 
 	.mobile-overlay {
@@ -597,8 +378,7 @@ async function handleSendMessage() {
 		margin-bottom: var(--spacing-sm);
 	}
 
-	.mobile-item:hover,
-	.mobile-item.selected {
+	.mobile-item:hover {
 		border-color: var(--color-primary);
 		background: var(--color-bg-tertiary);
 	}
@@ -609,22 +389,18 @@ async function handleSendMessage() {
 		gap: var(--spacing-sm);
 	}
 
-	.mobile-item.selected .item-main {
-		color: var(--color-primary);
-	}
-
-	.ancillary-status-dot {
+	.workspace-status-dot {
 		width: 8px;
 		height: 8px;
 		border-radius: 50%;
 		flex-shrink: 0;
 	}
 
-	.ancillary-status-dot.ready {
+	.workspace-status-dot.ready {
 		background: var(--color-success);
 	}
 
-	.ancillary-status-dot.busy {
+	.workspace-status-dot.busy {
 		background: var(--color-warning);
 	}
 
@@ -633,7 +409,7 @@ async function handleSendMessage() {
 		color: var(--color-text);
 	}
 
-	.item-bead {
+	.item-task {
 		font-size: 0.8rem;
 		color: var(--color-text-secondary);
 		font-family: var(--font-mono);

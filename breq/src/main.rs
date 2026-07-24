@@ -1,3 +1,15 @@
+//! breq — the CLI for workspaces as places.
+//!
+//! Two orthogonal verb families:
+//!
+//! - **Place verbs** (`setup`, `do`, `sh`, `teardown`) manage the workspace. The only tracker
+//!   side effect anywhere in them is `do <task-id>` claiming the task it was handed.
+//! - **Task verbs** (`set <ws> task.status ...`, and the `breq-complete` / `breq-abort` scripts
+//!   over it) update the tracker, and never touch the workspace.
+//!
+//! They're different axes, which is the point: shipping a piece of work and being finished with
+//! the place you did it in are separate decisions. `breq list` shows when they've diverged.
+
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use colored::Colorize;
@@ -6,11 +18,12 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use toren_lib::{
-    AssignmentManager, AssignmentRef, AssignmentSource, Config, Segment, SegmentManager,
-    WorkspaceManager,
+    AgentSpec, CollectOptions, Config, Family, Place, PlaceRegistry, PluginContext, PluginManager,
+    Segment, Sets,
 };
-use tracing::info;
 use tracing_subscriber::fmt::time::FormatTime;
+
+mod render;
 
 /// Custom time formatter that displays only HH:MM:SS (UTC)
 struct ShortTime;
@@ -25,23 +38,31 @@ impl FormatTime for ShortTime {
             .as_secs();
 
         let secs_of_day = now % 86400;
-        let hours = secs_of_day / 3600;
-        let minutes = (secs_of_day % 3600) / 60;
-        let seconds = secs_of_day % 60;
-
-        write!(w, "{:02}:{:02}:{:02}", hours, minutes, seconds)
+        write!(
+            w,
+            "{:02}:{:02}:{:02}",
+            secs_of_day / 3600,
+            (secs_of_day % 3600) / 60,
+            secs_of_day % 60
+        )
     }
 }
 
 #[derive(Parser)]
 #[command(name = "breq")]
-#[command(about = "Composable workspace orchestration for Claude ancillaries")]
+#[command(about = "Composable workspace orchestration for coding agents")]
+#[command(
+    after_help = "Workflow verbs (breq-<name> scripts on PATH) are dispatched by name:\n  \
+                        breq complete <ws>   ship: mark the workspace's tasks done\n  \
+                        breq abort <ws>      hand the workspace's tasks back\n\
+                        \nSee `breq doctor` to install the shipped ones."
+)]
 struct Cli {
     /// Increase verbosity (-v for DEBUG, -vv for TRACE)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
-    /// Path to config file (default: auto-discovered toren.toml)
+    /// Path to config file (default: auto-discovered ~/.toren/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
@@ -51,38 +72,36 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Assign work to a coding agent in a workspace
+    /// Run a coding agent in a workspace
+    ///
+    /// Needs a task or a prompt. With neither, use `breq sh` to open a shell instead.
     Do {
-        /// Assign to an existing workspace (e.g. "one", "three"); omit to create a new one
+        /// Task to work on (e.g. "tor-bau" or "runes:tor-bau"); claims it and adds its context
+        task: Option<String>,
+
+        /// Target workspace; defaults to the one you're standing in, else a new one
+        #[arg(short = 'w', long)]
         workspace: Option<String>,
 
-        /// Prompt for the agent session
+        /// Prompt for the agent
         #[arg(short, long)]
         prompt: Option<String>,
 
-        /// Intent-specific system prompt (see available intents below)
+        /// Model override, passed through to the agent
         #[arg(short, long)]
-        intent: Option<String>,
+        model: Option<String>,
 
-        /// Tag assignment with a task identifier (e.g., bead ID)
-        #[arg(long = "task-id", alias = "id")]
-        task_id: Option<String>,
-
-        /// Task title
-        #[arg(long = "task-title")]
-        task_title: Option<String>,
-
-        /// Task URL
-        #[arg(long = "task-url")]
-        task_url: Option<String>,
-
-        /// Segment to use (defaults to current directory's segment)
-        #[arg(short, long)]
-        segment: Option<String>,
-
-        /// Agent to use (e.g., "claude", "codex:o3"). Overrides config; auto-detects if unset.
+        /// Agent to use (e.g. "claude", "codex"); defaults to the workspace's, then config
         #[arg(long)]
         agent: Option<String>,
+
+        /// Resume the workspace's previous agent session instead of starting a new one
+        #[arg(long)]
+        resume: bool,
+
+        /// Segment to use (defaults to the current directory's segment)
+        #[arg(short, long)]
+        segment: Option<String>,
 
         /// Exec the agent directly instead of running it inside an rmux session
         #[arg(long = "no-rmux")]
@@ -97,33 +116,21 @@ enum Commands {
         passthrough: Vec<String>,
     },
 
-    /// Open a shell in a workspace, optionally running a command
+    /// Open a shell in a workspace, or run a command there
     #[command(visible_alias = "sh")]
     Shell {
         /// Workspace name (e.g. "one", "two")
         workspace: Option<String>,
 
-        /// Run a specific hook (setup or destroy)
+        /// Run a workspace hook (setup or destroy) from the current directory
         #[arg(long)]
         hook: Option<HookArg>,
-
-        /// Tag assignment with a task identifier
-        #[arg(long = "task-id")]
-        task_id: Option<String>,
-
-        /// Task title
-        #[arg(long = "task-title")]
-        task_title: Option<String>,
-
-        /// Task URL
-        #[arg(long = "task-url")]
-        task_url: Option<String>,
 
         /// Segment to use
         #[arg(short, long)]
         segment: Option<String>,
 
-        /// Exec the shell directly instead of attaching to the workspace's rmux session
+        /// Exec directly instead of attaching to the workspace's rmux session
         #[arg(long = "no-rmux")]
         no_rmux: bool,
 
@@ -132,72 +139,101 @@ enum Commands {
         cmd: Vec<String>,
     },
 
-    /// List active assignments
-    List {
-        /// Workspace or external ID to show detail for
-        reference: Option<String>,
-
-        /// List from all segments
-        #[arg(short, long)]
-        all: bool,
-
-        /// List from a specific segment
-        #[arg(short, long, conflicts_with = "all")]
-        segment: Option<String>,
-
-        /// Show detailed assignment info
-        #[arg(long)]
-        detail: bool,
-    },
-
-    /// Set up a workspace without starting an agent
+    /// Create a workspace (no task, no agent)
     Setup {
-        /// Workspace name (e.g. "one"); omit to create next available
+        /// Workspace name (e.g. "one"); omit to take the next free slot
         workspace: Option<String>,
 
-        /// Tag assignment with a task identifier (e.g., bead ID)
-        #[arg(long = "task-id", alias = "id")]
-        task_id: Option<String>,
-
-        /// Task title
-        #[arg(long = "task-title")]
-        task_title: Option<String>,
-
-        /// Task URL
-        #[arg(long = "task-url")]
-        task_url: Option<String>,
-
-        /// Segment to use (defaults to current directory's segment)
-        #[arg(short, long)]
-        segment: Option<String>,
-    },
-
-    /// Teardown a workspace (bead-free), output JSON to stdout
-    #[command(visible_alias = "clean")]
-    Destroy {
-        /// Workspace name (e.g. "one", "three")
-        workspace: String,
-
-        /// Kill processes running in the workspace
+        /// Stack on another workspace instead of the segment tip
         #[arg(long)]
-        kill: bool,
-
-        /// Push changes before cleanup
-        #[arg(long)]
-        push: bool,
-
-        /// Run destroy hooks and clean up workspace state even if no
-        /// assignment record exists. Useful when a prior destroy failed
-        /// or setup never completed.
-        #[arg(long)]
-        force: bool,
+        from: Option<String>,
 
         /// Segment to use
         #[arg(short, long)]
         segment: Option<String>,
     },
 
-    /// Remove orphaned workspace directories
+    /// Destroy a workspace. Task-agnostic: no status changes, no push.
+    Teardown {
+        /// Workspace name
+        workspace: String,
+
+        /// Kill processes and live panes running in the workspace
+        #[arg(long)]
+        kill: bool,
+
+        /// Keep the working copy and its VCS registration; drop only breq's state
+        #[arg(long = "no-delete")]
+        no_delete: bool,
+
+        /// Segment to use
+        #[arg(short, long)]
+        segment: Option<String>,
+    },
+
+    /// One row per workspace: sessions, changes, delivery, tasks
+    List {
+        /// List every segment
+        #[arg(short, long)]
+        all: bool,
+
+        /// List a specific segment
+        #[arg(short, long, conflicts_with = "all")]
+        segment: Option<String>,
+
+        /// Refresh delivery status before rendering (the only path that hits the network)
+        #[arg(long)]
+        refresh: bool,
+
+        /// Skip task lookups (no resolver calls at all)
+        #[arg(long)]
+        local: bool,
+    },
+
+    /// Read a workspace: everything, or one key
+    Get {
+        /// Workspace name, and/or a key. With one argument, a known workspace wins.
+        #[arg(num_args = 0..=2)]
+        args: Vec<String>,
+
+        /// Read a specific linked task's fields
+        #[arg(long)]
+        task: Option<String>,
+
+        /// Refresh delivery status first
+        #[arg(long)]
+        refresh: bool,
+
+        /// Render as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Segment to use
+        #[arg(short, long)]
+        segment: Option<String>,
+    },
+
+    /// Write a workspace annotation, or a task field (pass-through to its source)
+    ///
+    /// List-valued keys take +/- prefixes: `breq set one +task runes:tor-456`.
+    Set {
+        /// Workspace name (optional inside a workspace), key, value
+        ///
+        /// `allow_hyphen_values` is what lets `-task` read as a list-removal key rather than
+        /// an unknown flag.
+        #[arg(num_args = 2..=3, allow_hyphen_values = true)]
+        args: Vec<String>,
+
+        /// Apply a task field write to one linked task rather than all of them
+        #[arg(long)]
+        task: Option<String>,
+
+        /// Segment to use
+        #[arg(short, long)]
+        segment: Option<String>,
+    },
+
+    /// Remove leftovers: orphaned workspace dirs, aged-out transcripts
     Cleanup {
         /// Segment to clean up
         #[arg(short, long)]
@@ -206,6 +242,10 @@ enum Commands {
         /// Clean up all segments
         #[arg(short, long, conflicts_with = "segment")]
         all: bool,
+
+        /// Delete transcripts older than this many days
+        #[arg(long)]
+        transcripts: Option<u64>,
     },
 
     /// Initialize toren.kdl in the current repository
@@ -215,28 +255,14 @@ enum Commands {
         stealth: bool,
     },
 
-    /// Show a specific field from an assignment (for scripting)
-    Show {
-        /// Workspace name (e.g. "one", "two")
-        workspace: String,
-
-        /// Field path to show (e.g., "task.id", "task.title", "task.url", "task.source",
-        /// "workspace.path", "segment", "ancillary_id", "session_id")
+    /// Detect known-bad state and fix it. Nothing here ever runs implicitly.
+    Doctor {
+        /// Apply the repairs instead of only reporting them
         #[arg(long)]
-        field: String,
-
-        /// Segment to use
-        #[arg(short, long)]
-        segment: Option<String>,
+        fix: bool,
     },
 
-    /// Remove assignment record without workspace cleanup
-    Dismiss {
-        /// Workspace or task ID reference
-        reference: String,
-    },
-
-    /// Manage Rhai plugins under ~/.toren/plugins
+    /// Manage Rhai resolver plugins under ~/.toren/plugins
     Plugin {
         #[command(subcommand)]
         cmd: PluginCmd,
@@ -245,16 +271,15 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum PluginCmd {
-    /// List plugins available from the contrib repo (and which are installed)
+    /// List installed and available plugins
     List,
 
-    /// Install a plugin from a local path or the contrib repo
+    /// Install a plugin from the contrib repo or a local path
     ///
-    /// TARGET is one of:
-    ///   - `commands/<name>` or `tasks/<name>` (fetched from github.com/anowell/toren)
-    ///   - a local .rhai path whose parent dir is `commands` or `tasks`
+    /// TARGET is `<family>/<name>` (tasks, agents, delivery) or a local .rhai path whose
+    /// parent directory names the family.
     Install {
-        /// `commands/<name>`, `tasks/<name>`, or a local path to a .rhai file
+        /// `tasks/<name>`, `agents/<name>`, `delivery/<name>`, or a local .rhai path
         target: String,
     },
 }
@@ -265,154 +290,17 @@ enum HookArg {
     Destroy,
 }
 
+/// Subcommands clap owns. Anything else is looked up as a `breq-<name>` script.
+const BUILTIN_VERBS: &[&str] = &[
+    "do", "shell", "sh", "setup", "teardown", "list", "get", "set", "cleanup", "init", "doctor",
+    "plugin", "help",
+];
+
 fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
 
-    // Pre-parse: check for alias match before clap gets involved
-    if raw_args.len() > 1 {
-        // Skip global flags to find the subcommand
-        let mut subcmd_idx = 1;
-        while subcmd_idx < raw_args.len() {
-            let arg = &raw_args[subcmd_idx];
-            if arg == "-v" || arg == "-vv" || arg == "-vvv" || arg == "--verbose" {
-                subcmd_idx += 1;
-                continue;
-            }
-            if arg == "--config" {
-                subcmd_idx += 2; // skip --config <path>
-                continue;
-            }
-            break;
-        }
-
-        if subcmd_idx < raw_args.len() {
-            let subcmd = &raw_args[subcmd_idx];
-            let plugin_args: Vec<String> = raw_args[subcmd_idx + 1..].to_vec();
-
-            // `breq do --help`: inject available intents into help text
-            if subcmd == "do" && plugin_args.iter().any(|a| a == "--help" || a == "-h") {
-                if let Ok(config) = Config::load() {
-                    let mut intent_names: Vec<&str> =
-                        config.intents.entries.keys().map(|s| s.as_str()).collect();
-                    intent_names.sort();
-                    let intent_list = intent_names.join(", ");
-                    let section = format!("Available intents:\n  {}", intent_list);
-                    Cli::command()
-                        .find_subcommand_mut("do")
-                        .expect("do subcommand exists")
-                        .clone()
-                        .after_help(section)
-                        .print_help()
-                        .ok();
-                    std::process::exit(0);
-                }
-                // Fall through to normal clap help if config fails
-            }
-
-            // Top-level help: inject plugin descriptions
-            if subcmd == "--help" || subcmd == "-h" {
-                if let Ok(plugin_mgr) =
-                    toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))
-                {
-                    let plugins = plugin_mgr.list_with_descriptions();
-                    if !plugins.is_empty() {
-                        let mut section = String::from("Plugins:");
-                        for (name, desc) in &plugins {
-                            match desc {
-                                Some(d) => section.push_str(&format!("\n  {:<16}{}", name, d)),
-                                None => section.push_str(&format!("\n  {}", name)),
-                            }
-                        }
-                        Cli::command().after_help(section).print_help().ok();
-                        std::process::exit(0);
-                    }
-                }
-                // Fall through to normal clap --help if no plugins
-            }
-
-            // Try loading config for plugin/alias check (silently ignore config errors)
-            if let Ok(config) = Config::load() {
-                // Set up logging helper (shared by plugin and alias paths)
-                let verbose_count: usize = raw_args[1..subcmd_idx]
-                    .iter()
-                    .map(|a| match a.as_str() {
-                        "-vvv" => 3,
-                        "-vv" => 2,
-                        "-v" | "--verbose" => 1,
-                        _ => 0,
-                    })
-                    .sum();
-                let init_logging = |count: usize| {
-                    if count > 0 {
-                        let log_level = match count {
-                            1 => tracing::Level::DEBUG,
-                            _ => tracing::Level::TRACE,
-                        };
-                        tracing_subscriber::fmt()
-                            .with_max_level(log_level)
-                            .with_target(false)
-                            .with_timer(ShortTime)
-                            .init();
-                    }
-                };
-
-                // 1. Plugin dispatch (highest priority)
-                if let Ok(plugin_mgr) =
-                    toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))
-                {
-                    if plugin_mgr.has(subcmd) {
-                        // Per-plugin help
-                        if plugin_args.iter().any(|a| a == "--help" || a == "-h") {
-                            if let Some(usage) = plugin_mgr.usage(subcmd) {
-                                println!("{}", usage);
-                            } else {
-                                println!("Plugin '{}' (no help available)", subcmd);
-                            }
-                            std::process::exit(0);
-                        }
-
-                        init_logging(verbose_count);
-                        info!("Plugin '{}'", subcmd);
-
-                        // Resolve segment from CWD for plugin context
-                        let (seg_path, seg_name) = resolve_segment_for_plugin(&config);
-
-                        let mut ctx = toren_lib::PluginContext::new(seg_path, seg_name);
-                        ctx.task_sources = config.tasks.sources.clone();
-
-                        match plugin_mgr.run(subcmd, &plugin_args, ctx) {
-                            Ok(toren_lib::PluginResult::Ok) => std::process::exit(0),
-                            Ok(toren_lib::PluginResult::Action(action)) => {
-                                match execute_deferred_action(&config, action) {
-                                    Ok(()) => std::process::exit(0),
-                                    Err(e) => {
-                                        eprintln!("Error: {:#}", e);
-                                        std::process::exit(1);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Plugin '{}' error: {:#}", subcmd, e);
-                                std::process::exit(1);
-                            }
-                        }
-                    }
-                }
-
-                // 2. Alias dispatch (shell fallback)
-                if let Some(template) = config.aliases.get(subcmd) {
-                    init_logging(verbose_count);
-
-                    let expanded = toren_lib::alias::expand_alias(template, &plugin_args);
-                    info!("Alias '{}' -> {}", subcmd, expanded);
-                    let code = toren_lib::alias::execute_alias(
-                        &expanded,
-                        &std::collections::HashMap::new(),
-                    )?;
-                    std::process::exit(code);
-                }
-            }
-        }
+    if let Some(exit) = dispatch_external(&raw_args)? {
+        std::process::exit(exit);
     }
 
     let cli = Cli::parse();
@@ -422,482 +310,376 @@ fn main() -> Result<()> {
         1 => tracing::Level::DEBUG,
         _ => tracing::Level::TRACE,
     };
-
     tracing_subscriber::fmt()
         .with_max_level(log_level)
         .with_target(false)
         .with_timer(ShortTime)
         .init();
 
-    // Load config once, shared across all commands
     let config = Config::load_from(cli.config.as_deref())?;
 
     match cli.command {
         Commands::Do {
+            task,
             workspace,
             prompt,
-            intent,
-            task_id,
-            task_title,
-            task_url,
-            segment,
+            model,
             agent,
+            resume,
+            segment,
             no_rmux,
             force,
             passthrough,
         } => cmd_do(
             &config,
-            workspace,
-            prompt,
-            intent,
-            task_id,
-            task_title,
-            task_url,
-            None, // task_source inferred from task_id prefix or plugin resolution
-            segment.as_deref(),
-            agent,
-            no_rmux,
-            force,
-            passthrough,
+            DoArgs {
+                task,
+                workspace,
+                prompt,
+                model,
+                agent,
+                resume,
+                segment,
+                no_rmux,
+                force,
+                passthrough,
+            },
         ),
         Commands::Shell {
             workspace,
             hook,
-            task_id,
-            task_title,
-            task_url,
             segment,
             no_rmux,
             cmd,
-        } => cmd_shell(
-            &config,
-            workspace,
-            hook,
-            task_id,
-            task_title,
-            task_url,
-            segment.as_deref(),
-            no_rmux,
-            cmd,
-        ),
-        Commands::List {
-            reference,
-            all,
-            segment,
-            detail,
-        } => cmd_list(&config, reference, all, segment, detail),
+        } => cmd_shell(&config, workspace, hook, segment.as_deref(), no_rmux, cmd),
         Commands::Setup {
             workspace,
-            task_id,
-            task_title,
-            task_url,
+            from,
             segment,
-        } => cmd_setup(
-            &config,
-            workspace,
-            task_id,
-            task_title,
-            task_url,
-            segment.as_deref(),
-        ),
-        Commands::Destroy {
+        } => cmd_setup(&config, workspace, from, segment.as_deref()),
+        Commands::Teardown {
             workspace,
             kill,
-            push,
-            force,
+            no_delete,
             segment,
-        } => cmd_destroy(&config, &workspace, kill, push, force, segment.as_deref()),
-        Commands::Cleanup { segment, all } => cmd_cleanup(&config, all, segment),
+        } => cmd_teardown(&config, &workspace, kill, no_delete, segment.as_deref()),
+        Commands::List {
+            all,
+            segment,
+            refresh,
+            local,
+        } => cmd_list(&config, all, segment.as_deref(), refresh, local),
+        Commands::Get {
+            args,
+            task,
+            refresh,
+            json,
+            segment,
+        } => cmd_get(&config, args, task, refresh, json, segment.as_deref()),
+        Commands::Set {
+            args,
+            task,
+            segment,
+        } => cmd_set(&config, args, task, segment.as_deref()),
+        Commands::Cleanup {
+            segment,
+            all,
+            transcripts,
+        } => cmd_cleanup(&config, all, segment.as_deref(), transcripts),
         Commands::Init { stealth } => cmd_init(stealth),
-        Commands::Show {
-            workspace,
-            field,
-            segment,
-        } => cmd_show(&config, &workspace, &field, segment.as_deref()),
-        Commands::Dismiss { reference } => cmd_dismiss(&config, &reference),
+        Commands::Doctor { fix } => cmd_doctor(&config, fix),
         Commands::Plugin { cmd } => cmd_plugin(cmd),
     }
 }
 
-/// Helper to find segment from current directory or specified name.
-fn resolve_segment(segment_mgr: &SegmentManager, segment_name: Option<&str>) -> Result<Segment> {
-    if let Some(name) = segment_name {
-        segment_mgr
-            .find_by_name(name)
-            .with_context(|| format!("Segment '{}' not found in any segment root", name))
-    } else {
-        let cwd = std::env::current_dir()?;
-        segment_mgr.resolve_from_path(&cwd).with_context(|| {
-            "Current directory is not under any configured segment.\n\
-             Configure segments in ~/.toren/config.toml:\n\
-             [ancillaries]\n\
-             segments = [\"~/proj/*\"]"
-        })
-    }
-}
+// ─── external verbs ─────────────────────────────────────────────────────────
 
-/// Generate workspace name from ancillary number word.
-fn workspace_name_for_number(n: u32) -> String {
-    toren_lib::number_to_word(n).to_lowercase()
-}
-
-/// Resolve segment path and name from CWD for plugin context (best-effort).
-fn resolve_segment_for_plugin(config: &Config) -> (Option<PathBuf>, Option<String>) {
-    if let Ok(segment_mgr) = SegmentManager::new(config) {
-        if let Ok(cwd) = std::env::current_dir() {
-            if let Some(segment) = segment_mgr.resolve_from_path(&cwd) {
-                return (Some(segment.path), Some(segment.name));
-            }
+/// Hand an unknown subcommand to a `breq-<name>` script, git-style.
+///
+/// Returns the exit code if something external ran, `None` if clap should take over.
+fn dispatch_external(raw_args: &[String]) -> Result<Option<i32>> {
+    let mut idx = 1;
+    while idx < raw_args.len() {
+        let arg = &raw_args[idx];
+        if arg == "-v" || arg == "-vv" || arg == "-vvv" || arg == "--verbose" {
+            idx += 1;
+        } else if arg == "--config" {
+            idx += 2;
+        } else {
+            break;
         }
     }
-    (None, None)
-}
 
-/// Execute a deferred action returned by a plugin script.
-fn execute_deferred_action(config: &Config, action: toren_lib::DeferredAction) -> Result<()> {
-    match action {
-        toren_lib::DeferredAction::Do {
-            task_id,
-            task_title,
-            task_url,
-            task_source,
-            prompt,
-            intent,
-        } => {
-            cmd_do(
-                config,
-                None, // workspace (auto-create)
-                prompt,
-                intent,
-                task_id,
-                task_title,
-                task_url,
-                task_source,
-                None,       // segment (resolve from CWD)
-                None,       // agent (use config/auto-detect)
-                false,      // no_rmux
-                false,      // force
-                Vec::new(), // passthrough
-            )
+    let Some(subcmd) = raw_args.get(idx) else {
+        return Ok(None);
+    };
+    if subcmd.starts_with('-') || BUILTIN_VERBS.contains(&subcmd.as_str()) {
+        return Ok(None);
+    }
+
+    let args = &raw_args[idx + 1..];
+
+    if let Some(script) = toren_lib::scripts::find(subcmd) {
+        let status = Command::new(&script)
+            .args(args)
+            .status()
+            .with_context(|| format!("Failed to run {}", script.display()))?;
+        return Ok(Some(status.code().unwrap_or(1)));
+    }
+
+    // Aliases stay as the last resort: one-line shell expansions in config.
+    if let Ok(config) = Config::load() {
+        if let Some(template) = config.aliases.get(subcmd.as_str()) {
+            let expanded = toren_lib::alias::expand_alias(template, args);
+            let code =
+                toren_lib::alias::execute_alias(&expanded, &std::collections::HashMap::new())?;
+            return Ok(Some(code));
         }
     }
+
+    eprintln!("Unknown command '{}'.", subcmd);
+    eprintln!(
+        "Workflow verbs are scripts: create `breq-{}` on your PATH (or in {}).",
+        subcmd,
+        toren_lib::tilde_shorten(&toren_lib::scripts::bin_dir())
+    );
+    eprintln!();
+    Cli::command().print_help().ok();
+    Ok(Some(2))
+}
+
+// ─── shared plumbing ────────────────────────────────────────────────────────
+
+fn plugins() -> Result<PluginManager> {
+    PluginManager::new(&toren_lib::toren_root().join("plugins"))
+}
+
+/// The place a command should act on: `-w`, else where you're standing.
+fn target_place(
+    registry: &PlaceRegistry,
+    workspace: Option<&str>,
+    segment: Option<&str>,
+) -> Result<Option<Place>> {
+    if let Some(name) = workspace {
+        let segment = registry.segment(segment)?;
+        return registry.require(&segment, name).map(Some);
+    }
+    Ok(registry.resolve_from_env())
+}
+
+/// Resolve a place for read/write commands, insisting on one.
+fn require_place(
+    registry: &PlaceRegistry,
+    workspace: Option<&str>,
+    segment: Option<&str>,
+) -> Result<Place> {
+    target_place(registry, workspace, segment)?.with_context(|| {
+        "No workspace given, and this directory isn't inside one.\n\
+         Name it explicitly, or run from inside the workspace."
+            .to_string()
+    })
+}
+
+fn plugin_ctx(place: &Place) -> PluginContext {
+    PluginContext::new(
+        Some(place.segment_path.clone()),
+        Some(place.segment.clone()),
+    )
 }
 
 // ─── do ─────────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_do(
-    config: &Config,
+struct DoArgs {
+    task: Option<String>,
     workspace: Option<String>,
     prompt: Option<String>,
-    intent: Option<String>,
-    task_id_arg: Option<String>,
-    task_title_arg: Option<String>,
-    task_url_arg: Option<String>,
-    task_source_arg: Option<String>,
-    segment_name: Option<&str>,
-    agent_str: Option<String>,
+    model: Option<String>,
+    agent: Option<String>,
+    resume: bool,
+    segment: Option<String>,
     no_rmux: bool,
     force: bool,
     passthrough: Vec<String>,
-) -> Result<()> {
-    let agent = config.resolve_agent(agent_str.as_deref())?;
-    let workspace_root = config.ancillaries.workspace_root.clone();
+}
 
-    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
-    let segment_mgr = SegmentManager::new(config)?;
-    let mut assignment_mgr = AssignmentManager::new()?;
+fn cmd_do(config: &Config, args: DoArgs) -> Result<()> {
+    let registry = PlaceRegistry::new(config)?;
+    let plugins = plugins()?;
 
-    let segment = resolve_segment(&segment_mgr, segment_name)?;
-
-    // Infer task fields from CLI args
-    let mut inferred = toren_lib::infer_task_fields(
-        task_id_arg.as_deref(),
-        task_title_arg.as_deref(),
-        task_url_arg.as_deref(),
-        None, // prompt not known yet
-    );
-
-    // Explicit task_source_arg (from deferred action) takes priority over inferred
-    if task_source_arg.is_some() && inferred.task_source.is_none() {
-        inferred.task_source = task_source_arg;
-    }
-
-    // Resolve task_source from plugins when we have a task_id but no source.
-    // This discovers the source once so downstream operations (complete/abort/resume)
-    // never need to search across plugins.
-    if inferred.task_id.is_some() && inferred.task_source.is_none() {
-        if let Ok(plugin_mgr) =
-            toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))
-        {
-            let sources = plugin_mgr.effective_sources(&config.tasks.sources);
-            if let Some(ref task_id) = inferred.task_id {
-                let ctx = toren_lib::PluginContext::new(
-                    Some(segment.path.clone()),
-                    Some(segment.name.clone()),
-                );
-                if let Ok(task) = plugin_mgr.resolve_info_multi(&sources, task_id, ctx) {
-                    inferred.task_source = Some(task.source);
-                    if inferred.task_title.is_none() {
-                        inferred.task_title = Some(task.title);
-                    }
-                }
-            }
-        }
-    }
-
-    // 1. System prompt from intent (optional, rendered as --append-system-prompt)
-    let system_prompt = if let Some(ref intent_name) = intent {
-        let template = config
-            .intents
-            .get(intent_name)
-            .with_context(|| format!("Unknown intent: {}", intent_name))?;
-
-        // Fetch task description if we have a task_id
-        let task_description = inferred.task_id.as_ref().and_then(|id| {
-            let plugin_mgr =
-                toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")).ok()?;
-            let ctx = toren_lib::PluginContext::new(
-                Some(segment.path.clone()),
-                Some(segment.name.clone()),
-            );
-            if let Some(source) = inferred.task_source.as_deref() {
-                // Source is known (e.g., "runes:foo-123") — direct lookup
-                plugin_mgr.resolve_info(source, id, ctx).ok()
-            } else {
-                // Source unknown — search across all task plugins
-                let sources = plugin_mgr.effective_sources(&config.tasks.sources);
-                plugin_mgr.resolve_info_multi(&sources, id, ctx).ok()
-            }
-            .and_then(|t| t.description)
-        });
-
-        // Build task context for template rendering
-        let task_id = inferred.task_id.clone().unwrap_or_default();
-        let task_title = inferred
-            .task_title
-            .clone()
-            .unwrap_or_else(|| task_id.clone());
-        let ctx = toren_lib::WorkspaceContext {
-            ws: toren_lib::WorkspaceInfo {
-                name: String::new(),
-                num: 0,
-                path: String::new(),
-            },
-            repo: toren_lib::RepoInfo {
-                root: segment.path.display().to_string(),
-                name: segment.name.clone(),
-            },
-            task: Some(toren_lib::TaskInfo {
-                id: task_id,
-                title: task_title,
-                description: task_description,
-                url: inferred.task_url.clone(),
-                source: inferred.task_source.clone(),
-            }),
-            vars: std::collections::HashMap::new(),
-        };
-        Some(toren_lib::render_template(template, &ctx)?)
-    } else {
-        None
+    // Only reach for stdin when nothing else said what to do. Reading it unconditionally
+    // hangs `breq do <task>` any time stdin is an open pipe — which is exactly how scripts and
+    // agents invoke it.
+    let user_prompt = match (&args.prompt, &args.task) {
+        (Some(prompt), _) => Some(prompt.clone()),
+        (None, None) => read_piped_prompt()?,
+        (None, Some(_)) => None,
     };
 
-    // 2. User message: provided prompt > stdin > $EDITOR
-    let user_message = if let Some(ref p) = prompt {
-        p.clone()
-    } else if !std::io::stdin().is_terminal() {
-        // Read from stdin (piped input)
-        use std::io::Read;
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        let trimmed = buf.trim().to_string();
-        if trimmed.is_empty() {
-            anyhow::bail!("Empty input from stdin. Provide -p or pipe a prompt.");
-        }
-        trimmed
-    } else if system_prompt.is_some() {
-        // Intent provides system prompt; open editor for user message
-        let text = edit::edit("").context("Editor returned an error")?;
-        let trimmed = text.trim().to_string();
-        if trimmed.is_empty() {
-            anyhow::bail!("Empty prompt from editor. Provide -p or pipe a prompt.");
-        }
-        trimmed
-    } else {
-        // No intent, no prompt, no stdin — open editor
-        let text = edit::edit("").context("Editor returned an error")?;
-        let trimmed = text.trim().to_string();
-        if trimmed.is_empty() {
-            anyhow::bail!("Empty prompt from editor. Provide -p, -i, or pipe a prompt.");
-        }
-        trimmed
-    };
-
-    // Determine workspace: reuse existing or create new
-    if let Some(ref ws_name) = workspace {
-        let ws_name_lower = ws_name.to_lowercase();
-        let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name_lower);
-
-        if !ws_path.exists() {
-            anyhow::bail!(
-                "Workspace '{}' not found at {}",
-                ws_name_lower,
-                ws_path.display()
-            );
-        }
-
-        // Reuse workspace — update assignment fields if provided
-        if inferred.task_id.is_some()
-            || inferred.task_title.is_some()
-            || inferred.task_url.is_some()
-        {
-            let ancillary_num = toren_lib::word_to_number(&ws_name_lower).unwrap_or(0);
-            let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
-
-            if let Some(assignment) = assignment_mgr
-                .get_active_for_ancillary(&ancillary_id_str)
-                .cloned()
-            {
-                if assignment_mgr.update_task_fields(
-                    &assignment.id,
-                    inferred.task_id.as_deref(),
-                    inferred.task_title.as_deref(),
-                    inferred.task_url.as_deref(),
-                    inferred.task_source.as_deref(),
-                )? {
-                    eprintln!("Updated assignment for workspace '{}'", ws_name_lower);
-                }
-            } else {
-                info!(
-                    "No assignment found for ancillary '{}', skipping update",
-                    ancillary_id_str
-                );
-            }
-        }
-
-        // Start agent session
-        eprintln!("Starting {} session in {}\n", agent, ws_path.display());
-        launch_agent(
-            &agent,
-            &user_message,
-            system_prompt.as_deref(),
-            &ws_path,
-            &segment.name,
-            &ws_name_lower,
-            no_rmux,
-            force,
-            &passthrough,
-        )
-    } else {
-        // Create new workspace
-        let existing_workspaces = workspace_mgr
-            .list_workspaces(&segment.path)
-            .unwrap_or_default();
-        let ancillary_id_str = assignment_mgr.next_available_ancillary(
-            &segment.name,
-            config.ancillaries.max_per_segment,
-            &existing_workspaces,
+    if args.task.is_none() && user_prompt.is_none() && !args.resume {
+        anyhow::bail!(
+            "`breq do` needs a task or a prompt.\n  \
+             breq do <task-id>              work a task\n  \
+             breq do -p \"...\"               work from a prompt\n\
+             \nTo open a shell or run a command in a workspace instead, use `breq sh`."
         );
-        let ancillary_num = toren_lib::ancillary_number(&ancillary_id_str).unwrap_or(1);
-        eprintln!("Ancillary: {}", ancillary_id_str);
-
-        let base_branch = workspace_mgr.active_branch(&segment.path);
-        let ws_name = workspace_name_for_number(ancillary_num);
-
-        let (ws_path, _setup_result) = workspace_mgr.create_workspace_with_setup(
-            &segment.path,
-            &segment.name,
-            &ws_name,
-            ancillary_num,
-        )?;
-        eprintln!("Workspace: {}", ws_path.display());
-
-        // Record assignment
-        let source = if inferred.task_id.is_some() {
-            AssignmentSource::Reference
-        } else {
-            AssignmentSource::Prompt {
-                original_prompt: user_message.clone(),
-            }
-        };
-
-        // Use inferred title, falling back to first 80 chars of user message
-        let title: Option<String> = inferred.task_title.clone().or_else(|| {
-            Some(
-                user_message
-                    .lines()
-                    .next()
-                    .unwrap_or(&user_message)
-                    .chars()
-                    .take(80)
-                    .collect(),
-            )
-        });
-
-        assignment_mgr.create(
-            &ancillary_id_str,
-            inferred.task_id.as_deref(),
-            source,
-            &segment.name,
-            ws_path.clone(),
-            title,
-            base_branch,
-            inferred.task_url.as_deref(),
-            inferred.task_source.as_deref(),
-        )?;
-
-        // Exec into agent
-        eprintln!("Starting {} session in {}\n", agent, ws_path.display());
-        launch_agent(
-            &agent,
-            &user_message,
-            system_prompt.as_deref(),
-            &ws_path,
-            &segment.name,
-            &ws_name,
-            no_rmux,
-            force,
-            &passthrough,
-        )
     }
+
+    // Where: the named workspace, the one we're standing in, or a fresh one.
+    let mut place = match target_place(
+        &registry,
+        args.workspace.as_deref(),
+        args.segment.as_deref(),
+    )? {
+        Some(place) => place,
+        None => {
+            let segment = registry.segment(args.segment.as_deref())?;
+            let place =
+                registry.create(&segment, None, None, config.ancillaries.max_per_segment)?;
+            eprintln!("Workspace: {}", place.path.display());
+            place
+        }
+    };
+
+    // What: task context, if a task was named. Claiming it here is the only tracker side
+    // effect in any place verb.
+    let mut prompt = user_prompt.clone();
+    if let Some(ref task_ref) = args.task {
+        let task = resolve_task(&plugins, config, &place, task_ref)?;
+        let link = toren_lib::format_link(&task.source, &task.id);
+
+        let ctx = plugin_ctx(&place);
+        if let Err(e) = plugins.resolve_claim(&task.source, &task.id, "claude", ctx) {
+            eprintln!("warning: could not claim {}: {:#}", link, e);
+        }
+
+        place.annotations.add_to_list("task", &link);
+        prompt = Some(compose_prompt(&task, user_prompt.as_deref()));
+        eprintln!("Task: {} — {}", link, task.title);
+    } else if let Some(ref p) = user_prompt {
+        // A task-less workspace needs *something* to be legible in `breq list`.
+        place.annotations.set_default("title", first_chars(p, 100));
+    }
+
+    let agent = AgentSpec::resolve(
+        &plugins,
+        args.agent.as_deref(),
+        place.annotations.get_str("agent").as_deref(),
+        config.ancillaries.agent.as_deref(),
+    )?;
+    let agent = AgentSpec {
+        name: agent.name,
+        model: args.model.clone().or(agent.model),
+    };
+    place.annotations.set_str("agent", agent.annotation());
+    place.save()?;
+
+    let argv = if args.resume {
+        agent.resume_argv(&plugins, &place.path, prompt.as_deref(), false)?
+    } else {
+        agent.argv(&plugins, prompt.as_deref(), false)?
+    };
+
+    eprintln!("Starting {} in {}\n", agent, place.path.display());
+    launch(&place, &argv, args.no_rmux, args.force, &args.passthrough)
+}
+
+/// Resolve a `task-id` or `source:task-id` through the task resolvers.
+fn resolve_task(
+    plugins: &PluginManager,
+    config: &Config,
+    place: &Place,
+    task_ref: &str,
+) -> Result<toren_lib::ResolvedTask> {
+    let inferred = toren_lib::infer_task_fields(Some(task_ref), None, None, None);
+    let id = inferred
+        .task_id
+        .clone()
+        .with_context(|| format!("Could not read a task id out of '{}'", task_ref))?;
+
+    let ctx = plugin_ctx(place);
+    match inferred.task_source {
+        Some(source) => plugins.resolve_info(&source, &id, ctx),
+        None => {
+            let sources = plugins.effective_sources(&config.tasks.sources);
+            plugins.resolve_info_multi(&sources, &id, ctx)
+        }
+    }
+}
+
+/// Task context first, then whatever you asked for.
+fn compose_prompt(task: &toren_lib::ResolvedTask, user_prompt: Option<&str>) -> String {
+    let mut prompt = format!("{} {}: {}", task.source, task.id, task.title);
+    if let Some(description) = task.description.as_deref().filter(|d| !d.trim().is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(description);
+    }
+    if let Some(user) = user_prompt.filter(|p| !p.trim().is_empty()) {
+        prompt.push_str("\n\n---\n\n");
+        prompt.push_str(user);
+    }
+    prompt
+}
+
+fn first_chars(s: &str, n: usize) -> String {
+    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s);
+    line.chars().take(n).collect()
+}
+
+fn read_piped_prompt() -> Result<Option<String>> {
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    let trimmed = buf.trim().to_string();
+    Ok(if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    })
 }
 
 /// Hand the terminal to the agent.
 ///
-/// Spawning into the workspace's rmux session and exec'ing `rmux attach` leaves the TUI
-/// experience unchanged, but the session survives detach and is attachable from the web UI.
-#[allow(clippy::too_many_arguments)]
-fn launch_agent(
-    agent: &toren_lib::Agent,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    ws_path: &Path,
-    segment_name: &str,
-    ws_name: &str,
+/// Inside rmux the agent runs in the session's `agent` window and we exec `rmux attach`, so
+/// the TUI experience is unchanged but detaching leaves it running and the browser can attach
+/// to the same pane.
+fn launch(
+    place: &Place,
+    argv: &[String],
     no_rmux: bool,
     force: bool,
     passthrough: &[String],
 ) -> Result<()> {
+    let mut argv = argv.to_vec();
+    argv.extend(passthrough.iter().cloned());
+
     if !no_rmux && toren_lib::rmux::is_available() {
-        let session = toren_lib::rmux::session_name(segment_name, ws_name);
+        let session = place.session_name();
+
+        // Sessions from a previous incarnation of this slot point at a directory that no
+        // longer exists; never attach to one.
+        let killed =
+            toren_lib::rmux::reconcile(&place.segment, &place.name, place.uid().as_deref());
+        if killed > 0 {
+            eprintln!("Reconciled {} stale session(s) for this workspace", killed);
+        }
 
         // Spawning replaces the agent window, SIGKILLing whatever was working there.
         if !force && toren_lib::rmux::agent_is_running(&session) {
             anyhow::bail!(
                 "An agent is already running in workspace '{}'.\n  \
-                 Attach to it:  rmux attach -t {}\n  \
-                 Replace it:    breq do {} --force ...",
-                ws_name,
-                session,
-                ws_name,
+                 Attach to it:  breq sh {}\n  \
+                 Replace it:    breq do -w {} --force ...",
+                place.name,
+                place.name,
+                place.name,
             );
         }
 
-        let mut argv = agent.build_argv(prompt, system_prompt, false);
-        argv.extend(passthrough.iter().cloned());
-
-        toren_lib::rmux::ensure_session(&session, ws_path)?;
-        toren_lib::rmux::spawn_agent(&session, ws_path, &argv)?;
+        toren_lib::rmux::ensure_session(&session, &place.path, &place.env())?;
+        toren_lib::rmux::spawn_agent(&session, &place.path, &argv)?;
 
         eprintln!(
             "rmux session: {} (detach leaves the agent running)\n",
@@ -907,164 +689,94 @@ fn launch_agent(
         return Err(err).context(format!("Failed to attach to rmux session '{}'", session));
     }
 
-    let mut cmd = agent.build_command(prompt, ws_path, system_prompt);
-    cmd.args(passthrough);
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]).current_dir(&place.path);
+    for (key, value) in place.env() {
+        cmd.env(key, value);
+    }
     let err = cmd.exec();
-    Err(err).context(format!("Failed to exec {}", agent.kind.binary_name()))
+    Err(err).context(format!("Failed to exec {}", argv[0]))
 }
 
 // ─── shell ──────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_shell(
     config: &Config,
     workspace: Option<String>,
     hook: Option<HookArg>,
-    task_id_arg: Option<String>,
-    task_title_arg: Option<String>,
-    task_url_arg: Option<String>,
     segment_name: Option<&str>,
     no_rmux: bool,
     cmd: Vec<String>,
 ) -> Result<()> {
-    // Hook mode: run setup/destroy from cwd
+    let registry = PlaceRegistry::new(config)?;
+
     if let Some(hook_type) = hook {
-        let workspace_root = config.ancillaries.workspace_root.clone();
-        let workspace_mgr =
-            WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
-
-        let (segment_path, workspace_path, workspace_name) = detect_workspace_context()?;
-        let ancillary_num = toren_lib::word_to_number(&workspace_name);
-
-        match hook_type {
-            HookArg::Setup => {
-                eprintln!(
-                    "Running setup for workspace '{}' in {}",
-                    workspace_name,
-                    workspace_path.display()
-                );
-                workspace_mgr.run_setup(
-                    &segment_path,
-                    &workspace_path,
-                    &workspace_name,
-                    ancillary_num.unwrap_or(0),
-                )?;
-                eprintln!("Setup complete.");
-            }
-            HookArg::Destroy => {
-                eprintln!(
-                    "Running destroy for workspace '{}' in {}",
-                    workspace_name,
-                    workspace_path.display()
-                );
-                workspace_mgr.run_destroy(&segment_path, &workspace_path, &workspace_name)?;
-                eprintln!("Destroy complete.");
-            }
-        }
-        return Ok(());
+        return run_hook(&registry, hook_type);
     }
 
-    let workspace_root = config.ancillaries.workspace_root.clone();
-
-    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
-    let segment_mgr = SegmentManager::new(config)?;
-    let segment = resolve_segment(&segment_mgr, segment_name)?;
-
-    if let Some(ref ws_name) = workspace {
-        let ws_name_lower = ws_name.to_lowercase();
-        let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name_lower);
-
-        if !ws_path.exists() {
-            anyhow::bail!(
-                "Workspace '{}' not found at {}",
-                ws_name_lower,
-                ws_path.display()
-            );
-        }
-
-        println!("{}", ws_path.display());
-
-        if cmd.is_empty() {
-            return launch_shell(&ws_path, &segment.name, &ws_name_lower, no_rmux);
-        }
-
-        let (program, args) = (cmd[0].clone(), cmd[1..].to_vec());
-        let err = Command::new(&program)
-            .args(&args)
-            .current_dir(&ws_path)
-            .exec();
-        Err(err).with_context(|| format!("Failed to exec: {}", program))
-    } else if !cmd.is_empty() {
-        // No workspace, command given — run in cwd
-        let (program, args) = (cmd[0].clone(), cmd[1..].to_vec());
-        let err = Command::new(&program).args(&args).exec();
-        Err(err).with_context(|| format!("Failed to exec: {}", program))
-    } else {
-        // No workspace, no command — create new workspace and drop into shell
-        let mut assignment_mgr = AssignmentManager::new()?;
-        let existing_workspaces = workspace_mgr
-            .list_workspaces(&segment.path)
-            .unwrap_or_default();
-        let ancillary_id_str = assignment_mgr.next_available_ancillary(
-            &segment.name,
-            config.ancillaries.max_per_segment,
-            &existing_workspaces,
-        );
-        let ancillary_num = toren_lib::ancillary_number(&ancillary_id_str).unwrap_or(1);
-
-        let base_branch = workspace_mgr.active_branch(&segment.path);
-        let ws_name = workspace_name_for_number(ancillary_num);
-
-        let (ws_path, _) = workspace_mgr.create_workspace_with_setup(
-            &segment.path,
-            &segment.name,
-            &ws_name,
-            ancillary_num,
-        )?;
-
-        // Infer task fields from CLI args
-        let inferred = toren_lib::infer_task_fields(
-            task_id_arg.as_deref(),
-            task_title_arg.as_deref(),
-            task_url_arg.as_deref(),
-            None,
-        );
-
-        let source = if inferred.task_id.is_some() {
-            AssignmentSource::Reference
-        } else {
-            AssignmentSource::Prompt {
-                original_prompt: "(interactive shell)".to_string(),
-            }
-        };
-
-        assignment_mgr.create(
-            &ancillary_id_str,
-            inferred.task_id.as_deref(),
-            source,
-            &segment.name,
-            ws_path.clone(),
-            inferred.task_title,
-            base_branch,
-            inferred.task_url.as_deref(),
-            inferred.task_source.as_deref(),
-        )?;
-
-        eprintln!("Created workspace: {}", ws_path.display());
-        println!("{}", ws_path.display());
-        launch_shell(&ws_path, &segment.name, &ws_name, no_rmux)
+    // No workspace and no command: make one and drop into it.
+    if workspace.is_none() && cmd.is_empty() && registry.resolve_from_env().is_none() {
+        let segment = registry.segment(segment_name)?;
+        let place = registry.create(&segment, None, None, config.ancillaries.max_per_segment)?;
+        eprintln!("Created workspace: {}", place.path.display());
+        println!("{}", place.path.display());
+        return launch_shell(&place, no_rmux);
     }
+
+    let place = require_place(&registry, workspace.as_deref(), segment_name)?;
+
+    if cmd.is_empty() {
+        println!("{}", place.path.display());
+        return launch_shell(&place, no_rmux);
+    }
+
+    let (program, args) = (cmd[0].clone(), cmd[1..].to_vec());
+    let mut command = Command::new(&program);
+    command.args(&args).current_dir(&place.path);
+    for (key, value) in place.env() {
+        command.env(key, value);
+    }
+    let err = command.exec();
+    Err(err).with_context(|| format!("Failed to exec: {}", program))
 }
 
-/// Drop the user into a workspace shell.
-///
-/// Attaches to the `shell` window of the same session `breq do` and the daemon use, so the shell
-/// sits alongside the agent rather than being an unrelated subprocess.
-fn launch_shell(ws_path: &Path, segment_name: &str, ws_name: &str, no_rmux: bool) -> Result<()> {
+fn run_hook(registry: &PlaceRegistry, hook: HookArg) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let place = registry
+        .resolve_from_path(&cwd)
+        .context("Not inside a breq-managed workspace")?;
+    let num = toren_lib::word_to_number(&place.name).unwrap_or(0);
+
+    match hook {
+        HookArg::Setup => {
+            eprintln!("Running setup for '{}'", place.name);
+            registry.workspaces.run_setup(
+                &place.segment_path,
+                &place.path,
+                &place.name,
+                num,
+                None,
+            )?;
+        }
+        HookArg::Destroy => {
+            eprintln!("Running destroy for '{}'", place.name);
+            registry
+                .workspaces
+                .run_destroy(&place.segment_path, &place.path, &place.name)?;
+        }
+    }
+    eprintln!("Done.");
+    Ok(())
+}
+
+/// Attach to the session's `shell` window, so the shell sits alongside the agent rather than
+/// being an unrelated subprocess.
+fn launch_shell(place: &Place, no_rmux: bool) -> Result<()> {
     if !no_rmux && toren_lib::rmux::is_available() {
-        let session = toren_lib::rmux::session_name(segment_name, ws_name);
-        toren_lib::rmux::ensure_session(&session, ws_path)?;
-        toren_lib::rmux::ensure_shell(&session, ws_path)?;
+        let session = place.session_name();
+        toren_lib::rmux::reconcile(&place.segment, &place.name, place.uid().as_deref());
+        toren_lib::rmux::ensure_session(&session, &place.path, &place.env())?;
+        toren_lib::rmux::ensure_shell(&session, &place.path)?;
         toren_lib::rmux::select_window(&session, toren_lib::rmux::SHELL_WINDOW)?;
 
         let err = toren_lib::rmux::attach_command(&session).exec();
@@ -1072,628 +784,521 @@ fn launch_shell(ws_path: &Path, segment_name: &str, ws_name: &str, no_rmux: bool
     }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let err = Command::new(&shell).current_dir(ws_path).exec();
+    let mut cmd = Command::new(&shell);
+    cmd.current_dir(&place.path);
+    for (key, value) in place.env() {
+        cmd.env(key, value);
+    }
+    let err = cmd.exec();
     Err(err).context("Failed to exec shell")
+}
+
+// ─── setup ──────────────────────────────────────────────────────────────────
+
+fn cmd_setup(
+    config: &Config,
+    workspace: Option<String>,
+    from: Option<String>,
+    segment_name: Option<&str>,
+) -> Result<()> {
+    let registry = PlaceRegistry::new(config)?;
+    let segment = registry.segment(segment_name)?;
+
+    let parent = match from {
+        Some(name) => Some(registry.require(&segment, &name)?),
+        None => None,
+    };
+
+    // An existing working copy is adopted in place rather than recreated — that's how a
+    // hand-made worktree, or one that outlived its annotations, becomes a place breq manages.
+    if let Some(ref name) = workspace {
+        let mut place = registry.get(&segment, name);
+        if place.exists() {
+            if place.is_decorated() {
+                // Setup hooks are not generally idempotent (a `copy` onto an existing
+                // directory fails), so an already-managed workspace is left alone. Re-run
+                // the hooks deliberately with `breq sh <ws> --hook setup`.
+                eprintln!("Workspace '{}' already exists.", place.name);
+            } else {
+                registry.adopt(&mut place)?;
+                eprintln!(
+                    "Adopted existing working copy '{}' ({})",
+                    place.name,
+                    place.uid().unwrap_or_default()
+                );
+            }
+            println!("{}", place.path.display());
+            return Ok(());
+        }
+    }
+
+    let place = registry.create(
+        &segment,
+        workspace.as_deref(),
+        parent.as_ref(),
+        config.ancillaries.max_per_segment,
+    )?;
+
+    match parent {
+        Some(parent) => eprintln!(
+            "Created workspace '{}' stacked on '{}': {}",
+            place.name,
+            parent.name,
+            place.path.display()
+        ),
+        None => eprintln!(
+            "Created workspace '{}': {}",
+            place.name,
+            place.path.display()
+        ),
+    }
+    println!("{}", place.path.display());
+    Ok(())
+}
+
+// ─── teardown ───────────────────────────────────────────────────────────────
+
+fn cmd_teardown(
+    config: &Config,
+    workspace: &str,
+    kill: bool,
+    no_delete: bool,
+    segment_name: Option<&str>,
+) -> Result<()> {
+    let registry = PlaceRegistry::new(config)?;
+    let segment = registry.segment(segment_name)?;
+    let place = registry.get(&segment, workspace);
+
+    if !place.exists() && !place.vcs_tracked {
+        anyhow::bail!(
+            "Workspace '{}' not found at {}",
+            place.name,
+            place.path.display()
+        );
+    }
+
+    // Children stacked on this workspace lose their base; say so rather than surprising them.
+    let children: Vec<String> = registry
+        .list(&segment)
+        .into_iter()
+        .filter(|p| p.parent().as_deref() == Some(place.name.as_str()))
+        .map(|p| p.name)
+        .collect();
+    if !children.is_empty() {
+        eprintln!(
+            "note: '{}' is the stack parent of {} — their commits survive, but they no longer \
+             have a live parent workspace",
+            place.name,
+            children.join(", ")
+        );
+    }
+
+    eprintln!("Tearing down '{}' ({})", place.name, place.path.display());
+
+    let outcome = toren_lib::teardown(
+        &place,
+        &registry.workspaces,
+        toren_lib::TeardownOptions { kill, no_delete },
+    )?;
+
+    println!("{}", serde_json::to_string(&outcome)?);
+    Ok(())
 }
 
 // ─── list ───────────────────────────────────────────────────────────────────
 
 fn cmd_list(
     config: &Config,
-    reference: Option<String>,
     all_segments: bool,
-    segment_name: Option<String>,
-    detail: bool,
+    segment_name: Option<&str>,
+    refresh: bool,
+    local: bool,
 ) -> Result<()> {
-    let workspace_root = config.ancillaries.workspace_root.clone();
-    let segment_mgr = SegmentManager::new(config)?;
-    let mut assignment_mgr = AssignmentManager::new()?;
+    let registry = PlaceRegistry::new(config)?;
+    let plugins = plugins()?;
 
-    // If a specific reference is given and --detail, show detailed info
-    if let Some(ref reference) = reference {
-        if detail {
-            return cmd_list_detail(config, &segment_mgr, &mut assignment_mgr, reference);
-        }
-    }
-
-    // Determine which segment(s) to list
-    let (assignments, segments, scope_label): (Vec<_>, Vec<Segment>, String) = if all_segments {
-        let assignments = assignment_mgr.list_active().into_iter().collect::<Vec<_>>();
-        let segments = segment_mgr.list_all();
-        (assignments, segments, "all segments".to_string())
-    } else if let Some(ref name) = segment_name {
-        let assignments = assignment_mgr
-            .list_active_segment(name)
-            .into_iter()
-            .collect::<Vec<_>>();
-        let segments = segment_mgr
-            .find_by_name(name)
-            .map(|s| vec![s])
-            .unwrap_or_default();
-        (assignments, segments, name.clone())
+    let (places, scope) = if all_segments {
+        (registry.list_all(), "all segments".to_string())
     } else {
-        let segment = resolve_segment(&segment_mgr, None)?;
-        let name = segment.name.clone();
-        let assignments = assignment_mgr
-            .list_active_segment(&name)
-            .into_iter()
-            .collect::<Vec<_>>();
-        (assignments, vec![segment], name)
+        let segment = registry.segment(segment_name)?;
+        (registry.list(&segment), segment.name.clone())
     };
 
-    let has_assignments = !assignments.is_empty();
+    if places.is_empty() {
+        println!("No workspaces in {}.", scope);
+        if !all_segments {
+            println!("Create one with `breq setup`, or use --all to see every segment.");
+        }
+        return Ok(());
+    }
 
-    let term_width = terminal_size::terminal_size()
-        .map(|(w, _)| w.0 as usize)
-        .unwrap_or(80);
+    let opts = if local {
+        CollectOptions::local()
+    } else {
+        CollectOptions {
+            tasks: true,
+            refresh_delivery: refresh,
+        }
+    };
 
-    // Compute workspace column width from the longest name we'll display
-    let ws_col_width = assignments
-        .iter()
-        .map(|a| {
-            let name = if all_segments {
-                a.ancillary_id.as_str()
-            } else {
-                a.ancillary_id
-                    .split_whitespace()
-                    .last()
-                    .unwrap_or(&a.ancillary_id)
-            };
-            // Account for " *" dirty suffix
-            name.len() + 2
+    let rows: Vec<(Place, Sets)> = places
+        .into_iter()
+        .map(|place| {
+            let sets = Sets::collect(&place, &registry.workspaces, &plugins, config, opts);
+            (place, sets)
         })
-        .max()
-        .unwrap_or(10);
+        .collect();
 
-    // Fixed column widths: workspace(dynamic) + ext_id(15) + activity(6) + spaces(3)
-    let fixed_width: usize = ws_col_width + 15 + 6 + 3;
-
-    for assignment in &assignments {
-        // Agent activity
-        let agent_activity =
-            toren_lib::composite_status::detect_agent_activity(&assignment.workspace_path);
-
-        // Has changes
-        let has_changes = toren_lib::composite_status::workspace_has_changes(
-            &assignment.workspace_path,
-            assignment.base_branch.as_deref(),
-        );
-
-        // Workspace name — extract short name, mark dirty with *
-        // In --all mode, use full ancillary ID for disambiguation
-        let ancillary_name = if all_segments {
-            assignment.ancillary_id.as_str()
-        } else {
-            assignment
-                .ancillary_id
-                .split_whitespace()
-                .last()
-                .unwrap_or(&assignment.ancillary_id)
-        };
-
-        let ws_text = if has_changes {
-            format!(
-                "{:<width$}",
-                format!("{} *", ancillary_name),
-                width = ws_col_width
-            )
-        } else {
-            format!("{:<width$}", ancillary_name, width = ws_col_width)
-        };
-        let ws_colored = if has_changes {
-            ws_text.yellow()
-        } else {
-            ws_text.normal()
-        };
-
-        // Task ID (if any)
-        let task_id_display = assignment.task_id.as_deref().unwrap_or("-");
-
-        let activity_text = format!("{:<6}", agent_activity);
-        let activity_colored = if agent_activity == "busy" {
-            activity_text.yellow()
-        } else {
-            activity_text.green()
-        };
-
-        // Always show title; in detail mode show all task fields
-        let title_max = term_width.saturating_sub(fixed_width);
-        let title = assignment
-            .task_title
-            .as_deref()
-            .map(|t| truncate_title(t, title_max))
-            .unwrap_or_else(|| "-".to_string());
-
-        println!(
-            "{} {:<15} {} {}",
-            ws_colored, task_id_display, activity_colored, title
-        );
-    }
-
-    // Detect orphaned workspace directories
-    {
-        let ws_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
-        let orphans = find_orphaned_workspaces(&ws_mgr, &segments, &assignments);
-
-        if !orphans.is_empty() {
-            for (segment_name, ws_name, path) in &orphans {
-                tracing::debug!(
-                    "orphaned workspace dir: {}/{} ({})",
-                    segment_name,
-                    ws_name,
-                    path.display()
-                );
-            }
-            tracing::debug!(
-                "{} orphaned workspace dir(s) (will be reclaimed on next assign, or run `breq cleanup`)",
-                orphans.len()
-            );
-        }
-    }
-
-    if !has_assignments && !all_segments {
-        println!("No active assignments in {}.", scope_label);
-        println!("Use --all to see assignments across all segments.");
-    } else if !has_assignments {
-        println!("No active assignments in {}.", scope_label);
-    }
-
+    render::list(&rows, &plugins, all_segments);
     Ok(())
 }
 
-fn cmd_list_detail(
+// ─── get ────────────────────────────────────────────────────────────────────
+
+fn cmd_get(
     config: &Config,
-    segment_mgr: &SegmentManager,
-    assignment_mgr: &mut AssignmentManager,
-    reference: &str,
-) -> Result<()> {
-    let segment = resolve_segment(segment_mgr, None)?;
-    let ref_ = AssignmentRef::parse(reference, &segment.name);
-    let assignments = assignment_mgr.resolve(&ref_);
-
-    if assignments.is_empty() {
-        anyhow::bail!("No assignment found for: {}", reference);
-    }
-
-    for assignment in assignments {
-        println!("Assignment: {}", assignment.id);
-        println!("  Ancillary:    {}", assignment.ancillary_id);
-        if let Some(ref task_id) = assignment.task_id {
-            println!("  Task ID:      {}", task_id);
-        }
-        if let Some(ref task_title) = assignment.task_title {
-            println!("  Task Title:   {}", task_title);
-        }
-        if let Some(ref task_url) = assignment.task_url {
-            println!("  Task URL:     {}", task_url);
-        }
-        if let Some(ref task_source) = assignment.task_source {
-            println!("  Task Source:   {}", task_source);
-        }
-        println!("  Segment:      {}", assignment.segment);
-        println!("  Status:       {:?}", assignment.status);
-        println!("  Source:       {:?}", assignment.source);
-        println!("  Workspace:    {}", assignment.workspace_path.display());
-        if let Some(ref branch) = assignment.base_branch {
-            println!("  Base:         {}", branch);
-        }
-        if let Some(ref sid) = assignment.session_id {
-            println!("  Session:      {}", sid);
-        }
-        println!("  Created:      {}", assignment.created_at);
-        println!("  Updated:      {}", assignment.updated_at);
-
-        // Show workspace info if exists
-        if assignment.workspace_path.exists() {
-            println!("\nRecent changes:");
-            if assignment.workspace_path.join(".jj").exists() {
-                let _ = Command::new("jj")
-                    .args(["log", "-n", "5"])
-                    .current_dir(&assignment.workspace_path)
-                    .status();
-            } else if assignment.workspace_path.join(".git").exists() {
-                let base = assignment.base_branch.as_deref().unwrap_or("main");
-                let range = format!("{}..HEAD", base);
-                let _ = Command::new("git")
-                    .args(["log", "--oneline", &range])
-                    .current_dir(&assignment.workspace_path)
-                    .status();
-            }
-        } else {
-            println!("\n(Workspace not found)");
-        }
-
-        // Show task details if task_id present
-        if let Some(ref task_id) = assignment.task_id {
-            let seg_path = segment_mgr
-                .find_by_name(&assignment.segment)
-                .map(|s| s.path);
-            if let Some(seg_path) = seg_path {
-                println!("\nTask details:");
-                let _ = Command::new("bd")
-                    .args(["show", task_id])
-                    .current_dir(&seg_path)
-                    .status();
-            }
-        }
-
-        println!();
-    }
-
-    let _ = config; // suppress unused warning
-    Ok(())
-}
-
-// ─── setup ─────────────────────────────────────────────────────────────────
-
-fn cmd_setup(
-    config: &Config,
-    workspace: Option<String>,
-    task_id_arg: Option<String>,
-    task_title_arg: Option<String>,
-    task_url_arg: Option<String>,
+    args: Vec<String>,
+    task: Option<String>,
+    refresh: bool,
+    json: bool,
     segment_name: Option<&str>,
 ) -> Result<()> {
-    let workspace_root = config.ancillaries.workspace_root.clone();
+    let registry = PlaceRegistry::new(config)?;
+    let plugins = plugins()?;
+    let (place, key) = split_place_args(&registry, args, segment_name, 0)?;
 
-    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
-    let segment_mgr = SegmentManager::new(config)?;
-    let mut assignment_mgr = AssignmentManager::new()?;
+    if let Some(key) = key {
+        return get_key(
+            config,
+            &registry,
+            &plugins,
+            &place,
+            &key,
+            task.as_deref(),
+            refresh,
+        );
+    }
 
-    let segment = resolve_segment(&segment_mgr, segment_name)?;
-
-    // Infer task fields from CLI args
-    let mut inferred = toren_lib::infer_task_fields(
-        task_id_arg.as_deref(),
-        task_title_arg.as_deref(),
-        task_url_arg.as_deref(),
-        None,
+    let sets = Sets::collect(
+        &place,
+        &registry.workspaces,
+        &plugins,
+        config,
+        CollectOptions {
+            tasks: true,
+            refresh_delivery: refresh,
+        },
     );
 
-    // Resolve task_source from plugins when we have a task_id but no source
-    if inferred.task_id.is_some() && inferred.task_source.is_none() {
-        if let Ok(plugin_mgr) =
-            toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))
-        {
-            let sources = plugin_mgr.effective_sources(&config.tasks.sources);
-            if let Some(ref task_id) = inferred.task_id {
-                let ctx = toren_lib::PluginContext::new(
-                    Some(segment.path.clone()),
-                    Some(segment.name.clone()),
-                );
-                if let Ok(task) = plugin_mgr.resolve_info_multi(&sources, task_id, ctx) {
-                    inferred.task_source = Some(task.source);
-                    if inferred.task_title.is_none() {
-                        inferred.task_title = Some(task.title);
-                    }
-                }
-            }
-        }
-    }
-
-    // If workspace exists, just update assignment fields and return
-    if let Some(ref ws_name) = workspace {
-        let ws_name_lower = ws_name.to_lowercase();
-        let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name_lower);
-
-        if ws_path.exists() {
-            let ancillary_num = toren_lib::word_to_number(&ws_name_lower).unwrap_or(0);
-            let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
-
-            if inferred.task_id.is_some()
-                || inferred.task_title.is_some()
-                || inferred.task_url.is_some()
-            {
-                if let Some(assignment) = assignment_mgr
-                    .get_active_for_ancillary(&ancillary_id_str)
-                    .cloned()
-                {
-                    if assignment_mgr.update_task_fields(
-                        &assignment.id,
-                        inferred.task_id.as_deref(),
-                        inferred.task_title.as_deref(),
-                        inferred.task_url.as_deref(),
-                        inferred.task_source.as_deref(),
-                    )? {
-                        eprintln!("Updated assignment for workspace '{}'", ws_name_lower);
-                    }
-                } else {
-                    info!(
-                        "No assignment found for ancillary '{}', skipping update",
-                        ancillary_id_str
-                    );
-                }
-            }
-
-            println!("{}", ws_path.display());
-            return Ok(());
-        }
-    }
-
-    // Resolve workspace name and ancillary ID
-    let (ws_name, ancillary_id_str, ancillary_num) = if let Some(ref name) = workspace {
-        let ws_name = name.to_lowercase();
-        let num = toren_lib::word_to_number(&ws_name)
-            .with_context(|| format!("Invalid workspace name: {}", ws_name))?;
-        let id = toren_lib::ancillary_id(&segment.name, num);
-        (ws_name, id, num)
+    if json {
+        println!("{}", render::detail_json(&place, &sets, &plugins)?);
     } else {
-        let existing_workspaces = workspace_mgr
-            .list_workspaces(&segment.path)
-            .unwrap_or_default();
-        let id = assignment_mgr.next_available_ancillary(
-            &segment.name,
-            config.ancillaries.max_per_segment,
-            &existing_workspaces,
-        );
-        let num = toren_lib::ancillary_number(&id).unwrap_or(1);
-        let ws_name = workspace_name_for_number(num);
-        (ws_name, id, num)
-    };
-
-    // Create workspace
-    let base_branch = workspace_mgr.active_branch(&segment.path);
-    let (ws_path, _) = workspace_mgr.create_workspace_with_setup(
-        &segment.path,
-        &segment.name,
-        &ws_name,
-        ancillary_num,
-    )?;
-
-    let source = if inferred.task_id.is_some() {
-        AssignmentSource::Reference
-    } else {
-        AssignmentSource::Prompt {
-            original_prompt: "(setup)".to_string(),
-        }
-    };
-
-    assignment_mgr.create(
-        &ancillary_id_str,
-        inferred.task_id.as_deref(),
-        source,
-        &segment.name,
-        ws_path.clone(),
-        inferred.task_title,
-        base_branch,
-        inferred.task_url.as_deref(),
-        inferred.task_source.as_deref(),
-    )?;
-
-    eprintln!("Created workspace: {}", ws_path.display());
-    println!("{}", ws_path.display());
+        render::detail(&place, &sets, &plugins);
+    }
     Ok(())
 }
 
-// ─── destroy ───────────────────────────────────────────────────────────────
-
-fn cmd_destroy(
+/// A single value, for scripting.
+fn get_key(
     config: &Config,
-    workspace: &str,
-    kill: bool,
-    push: bool,
-    force: bool,
+    registry: &PlaceRegistry,
+    plugins: &PluginManager,
+    place: &Place,
+    key: &str,
+    task_filter: Option<&str>,
+    refresh: bool,
+) -> Result<()> {
+    // Task-source-owned fields are asked of the source every time. Breq holding a copy is
+    // exactly how a workspace ends up claiming a status the tracker disagrees with.
+    if let Some(field) = key.strip_prefix("task.") {
+        for link in filtered_tasks(place, task_filter)? {
+            let (source, id) = toren_lib::split_link(&link)
+                .with_context(|| format!("Malformed task link '{}'", link))?;
+            let task = plugins.resolve_info(&source, &id, plugin_ctx(place))?;
+            let value = match field {
+                "id" => Some(task.id),
+                "title" => Some(task.title),
+                "status" => task.status,
+                "assignee" => task.assignee,
+                "url" => task.url,
+                "kind" => task.kind,
+                "description" => task.description,
+                "source" => Some(task.source),
+                other => anyhow::bail!(
+                    "Unknown task field '{}'. Known: id, title, status, assignee, url, kind, \
+                     description, source",
+                    other
+                ),
+            };
+            println!("{}", value.unwrap_or_default());
+        }
+        return Ok(());
+    }
+
+    // Derived and core workspace fields.
+    match key {
+        "workspace.path" | "path" => {
+            println!("{}", place.path.display());
+            return Ok(());
+        }
+        "session" => {
+            println!("{}", place.session_name());
+            return Ok(());
+        }
+        "changes" => {
+            let sets = Sets::collect(
+                place,
+                &registry.workspaces,
+                plugins,
+                config,
+                CollectOptions::local(),
+            );
+            for commit in &sets.changes {
+                println!("{} {}", commit.id, commit.summary);
+            }
+            return Ok(());
+        }
+        "branches" => {
+            for branch in registry
+                .workspaces
+                .remote_branches(&place.segment_path, &place.path)
+            {
+                println!("{}", branch);
+            }
+            return Ok(());
+        }
+        "prs" => {
+            let sets = Sets::collect(
+                place,
+                &registry.workspaces,
+                plugins,
+                config,
+                CollectOptions {
+                    tasks: false,
+                    refresh_delivery: refresh,
+                },
+            );
+            for pr in &sets.prs {
+                println!("{} {} {} {}", pr.id, pr.state, pr.ci, pr.url);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Plain annotations. List-valued keys print one per line so `for x in $(breq get ...)`
+    // does the obvious thing.
+    match place.annotations.get(key) {
+        Some(serde_json::Value::Array(_)) | None if !place.annotations.get_list(key).is_empty() => {
+            for item in place.annotations.get_list(key) {
+                println!("{}", item);
+            }
+        }
+        Some(value) => println!(
+            "{}",
+            toren_lib::annotations::value_to_string(value).unwrap_or_default()
+        ),
+        None => {
+            // Cached values are readable by their key too, marked with their age.
+            if let Some(entry) = place.cache().get(key) {
+                println!("{}", entry.value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn filtered_tasks(place: &Place, task_filter: Option<&str>) -> Result<Vec<String>> {
+    let links = place.tasks();
+    if links.is_empty() {
+        anyhow::bail!(
+            "No tasks linked to '{}'. Attach one with: breq set {} +task <source>:<id>",
+            place.name,
+            place.name
+        );
+    }
+    let Some(filter) = task_filter else {
+        return Ok(links);
+    };
+    let matched: Vec<String> = links
+        .into_iter()
+        .filter(|l| l == filter || l.ends_with(&format!(":{}", filter)))
+        .collect();
+    if matched.is_empty() {
+        anyhow::bail!(
+            "No task matching '{}' is linked to '{}'",
+            filter,
+            place.name
+        );
+    }
+    Ok(matched)
+}
+
+// ─── set ────────────────────────────────────────────────────────────────────
+
+fn cmd_set(
+    config: &Config,
+    args: Vec<String>,
+    task: Option<String>,
     segment_name: Option<&str>,
 ) -> Result<()> {
-    let workspace_root = config.ancillaries.workspace_root.clone();
+    let registry = PlaceRegistry::new(config)?;
+    let plugins = plugins()?;
+    let (mut place, rest) = split_place_args_multi(&registry, args, segment_name, 2)?;
 
-    let segment_mgr = SegmentManager::new(config)?;
-    let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
-    let mut assignment_mgr = AssignmentManager::new()?;
+    let key = rest[0].clone();
+    let value = rest[1].clone();
 
-    let segment = resolve_segment(&segment_mgr, segment_name)?;
-
-    let ws_name = workspace.to_lowercase();
-    let ancillary_num = toren_lib::word_to_number(&ws_name).unwrap_or(0);
-    let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
-
-    let assignment = assignment_mgr
-        .get_active_for_ancillary(&ancillary_id_str)
-        .cloned();
-
-    match assignment {
-        Some(assignment) => {
-            let auto_commit_message = toren_lib::render_auto_commit_message(
-                toren_lib::DEFAULT_AUTO_COMMIT_MESSAGE,
-                &assignment,
-                &segment.name,
-                &segment.path,
-            );
-
-            eprintln!(
-                "Destroying workspace: {} ({})",
-                ws_name,
-                assignment.workspace_path.display()
-            );
-
-            let opts = toren_lib::CleanOptions {
-                push,
-                segment_path: &segment.path,
-                kill,
-                auto_commit_message,
-            };
-
-            let result = toren_lib::clean_assignment(
-                &assignment,
-                &mut assignment_mgr,
-                &workspace_mgr,
-                &opts,
-            )?;
-
-            let json = serde_json::to_string(&result)?;
-            println!("{}", json);
-            Ok(())
+    // Writing a task-source-owned field *is* the tracker update. No local copy exists to
+    // fall out of sync.
+    if let Some(field) = key.strip_prefix("task.") {
+        for link in filtered_tasks(&place, task.as_deref())? {
+            let (source, id) = toren_lib::split_link(&link)
+                .with_context(|| format!("Malformed task link '{}'", link))?;
+            plugins.resolve_set_field(&source, &id, field, &value, plugin_ctx(&place))?;
+            eprintln!("{} {} = {}", link, field, value);
         }
-        None if force => {
-            // No assignment record. Run destroy hooks + remove VCS tracking + delete dir
-            // for whatever state is on disk. Skip auto-commit/push (no assignment context).
-            let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name);
-            eprintln!(
-                "Force-destroying workspace: {} ({}) — no assignment record",
-                ws_name,
-                ws_path.display()
-            );
-
-            if push {
-                eprintln!("warning: --push has no effect with --force (no assignment to push)");
-            }
-
-            if ws_path.exists() {
-                let processes = toren_lib::process::find_workspace_processes(&ws_path);
-                if !processes.is_empty() {
-                    if kill {
-                        toren_lib::process::terminate_processes(
-                            &processes,
-                            std::time::Duration::from_secs(5),
-                        )?;
-                    } else {
-                        anyhow::bail!(
-                            toren_lib::process::WorkspaceProcessesRunning { processes }
-                        );
-                    }
-                }
-            }
-
-            workspace_mgr.cleanup_workspace(
-                &segment.path,
-                &segment.name,
-                &ws_name,
-                toren_lib::CleanupMode::Abort,
-            )?;
-
-            let result = serde_json::json!({
-                "workspace": ws_name,
-                "segment": segment.name,
-                "forced": true,
-            });
-            println!("{}", serde_json::to_string(&result)?);
-            Ok(())
-        }
-        None => anyhow::bail!(
-            "No assignment found for workspace '{}'. Use --force to clean up workspace state anyway.",
-            ws_name
-        ),
+        return Ok(());
     }
+
+    // `+key value` / `-key value` mutate a list without rewriting it.
+    if let Some(list_key) = key.strip_prefix('+') {
+        if place.annotations.add_to_list(list_key, &value) {
+            place.save()?;
+            eprintln!("{}: +{} {}", place.name, list_key, value);
+        }
+        return Ok(());
+    }
+    if let Some(list_key) = key.strip_prefix('-') {
+        if place.annotations.remove_from_list(list_key, &value) {
+            place.save()?;
+            eprintln!("{}: -{} {}", place.name, list_key, value);
+        }
+        return Ok(());
+    }
+
+    place
+        .annotations
+        .set(&key, toren_lib::annotations::parse_value(&value));
+    place.save()?;
+    eprintln!("{}: {} = {}", place.name, key, value);
+    Ok(())
+}
+
+/// Split `[workspace] [key]` — with one argument, a known workspace wins over a key.
+fn split_place_args(
+    registry: &PlaceRegistry,
+    args: Vec<String>,
+    segment_name: Option<&str>,
+    trailing: usize,
+) -> Result<(Place, Option<String>)> {
+    let (place, rest) = split_place_args_multi(registry, args, segment_name, trailing)?;
+    Ok((place, rest.into_iter().next()))
+}
+
+/// Split `[workspace] <trailing...>`.
+fn split_place_args_multi(
+    registry: &PlaceRegistry,
+    args: Vec<String>,
+    segment_name: Option<&str>,
+    trailing: usize,
+) -> Result<(Place, Vec<String>)> {
+    // More arguments than the trailing form takes means the first one names a workspace.
+    if args.len() > trailing {
+        let name = args[0].clone();
+        let segment = registry.segment(segment_name)?;
+        let place = registry.get(&segment, &name);
+        if place.exists() {
+            return Ok((place, args[1..].to_vec()));
+        }
+        // Unambiguously meant as a workspace, and it isn't one.
+        if trailing > 0 || args.len() > trailing + 1 {
+            anyhow::bail!("Workspace '{}' not found at {}", name, place.path.display());
+        }
+        // Otherwise it was the optional key, and the workspace comes from where we stand.
+    }
+
+    let place = require_place(registry, None, segment_name)?;
+    Ok((place, args))
 }
 
 // ─── cleanup ────────────────────────────────────────────────────────────────
 
-fn cmd_cleanup(config: &Config, all_segments: bool, segment_name: Option<String>) -> Result<()> {
-    let workspace_root = config.ancillaries.workspace_root.clone();
+fn cmd_cleanup(
+    config: &Config,
+    all_segments: bool,
+    segment_name: Option<&str>,
+    transcript_days: Option<u64>,
+) -> Result<()> {
+    let registry = PlaceRegistry::new(config)?;
 
-    let segment_mgr = SegmentManager::new(config)?;
-    let mut assignment_mgr = AssignmentManager::new()?;
-    let ws_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
-
-    let (assignments, segments): (Vec<_>, Vec<Segment>) = if all_segments {
-        let assignments = assignment_mgr.list_active().into_iter().collect();
-        let segments = segment_mgr.list_all();
-        (assignments, segments)
-    } else if let Some(ref name) = segment_name {
-        let assignments = assignment_mgr
-            .list_active_segment(name)
-            .into_iter()
-            .collect();
-        let segments = segment_mgr
-            .find_by_name(name)
-            .map(|s| vec![s])
-            .unwrap_or_default();
-        (assignments, segments)
+    let segments: Vec<Segment> = if all_segments {
+        registry.segments.list_all()
     } else {
-        let segment = resolve_segment(&segment_mgr, None)?;
-        let name = segment.name.clone();
-        let assignments = assignment_mgr
-            .list_active_segment(&name)
-            .into_iter()
-            .collect();
-        (assignments, vec![segment])
+        vec![registry.segment(segment_name)?]
     };
 
-    let orphans = find_orphaned_workspaces(&ws_mgr, &segments, &assignments);
-
-    if orphans.is_empty() {
-        println!("No orphaned workspace directories found.");
-        return Ok(());
-    }
-
-    println!("Removing {} orphaned workspace dir(s):", orphans.len());
-    for (segment_name, ws_name, path) in &orphans {
-        print!("  {}/{}...", segment_name, ws_name);
-        match std::fs::remove_dir_all(path) {
-            Ok(()) => println!(" removed"),
-            Err(e) => println!(" failed: {}", e),
+    let mut removed = 0;
+    for segment in &segments {
+        for place in registry.list(segment) {
+            // A directory the VCS has forgotten is a leftover: no history can be lost.
+            if place.exists() && !place.vcs_tracked && !place.is_decorated() {
+                print!("  {}/{}...", segment.name, place.name);
+                match std::fs::remove_dir_all(&place.path) {
+                    Ok(()) => {
+                        println!(" removed");
+                        removed += 1;
+                    }
+                    Err(e) => println!(" failed: {}", e),
+                }
+            }
         }
     }
 
-    Ok(())
-}
-
-// ─── dismiss ────────────────────────────────────────────────────────────────
-
-fn cmd_dismiss(config: &Config, reference: &str) -> Result<()> {
-    let segment_mgr = SegmentManager::new(config)?;
-    let mut assignment_mgr = AssignmentManager::new()?;
-    let segment = resolve_segment(&segment_mgr, None)?;
-
-    let ref_ = AssignmentRef::parse(reference, &segment.name);
-    let assignments: Vec<_> = assignment_mgr
-        .resolve(&ref_)
-        .iter()
-        .map(|a| (*a).clone())
-        .collect();
-
-    if assignments.is_empty() {
-        anyhow::bail!("No assignment found for: {}", reference);
+    if removed == 0 {
+        println!("No orphaned workspace directories found.");
     }
 
-    for assignment in &assignments {
-        assignment_mgr.remove(&assignment.id)?;
+    if let Some(days) = transcript_days {
+        let pruned = toren_lib::transcripts::prune(days)?;
         println!(
-            "Dismissed: {} ({})",
-            assignment.ancillary_id,
-            assignment.task_id.as_deref().unwrap_or("-")
+            "Pruned {} transcript director(ies) older than {}d",
+            pruned.len(),
+            days
         );
     }
 
     Ok(())
 }
 
-// ─── show ────────────────────────────────────────────────────────────────────
+// ─── doctor ─────────────────────────────────────────────────────────────────
 
-fn cmd_show(
-    config: &Config,
-    workspace: &str,
-    field: &str,
-    segment_name: Option<&str>,
-) -> Result<()> {
-    let segment_mgr = SegmentManager::new(config)?;
-    let mut assignment_mgr = AssignmentManager::new()?;
-    let segment = resolve_segment(&segment_mgr, segment_name)?;
+fn cmd_doctor(config: &Config, fix: bool) -> Result<()> {
+    let plugins = plugins()?;
+    let reports = toren_lib::doctor::run(config, &plugins, fix)?;
 
-    let ws_name = workspace.to_lowercase();
-    let ancillary_num = toren_lib::word_to_number(&ws_name).unwrap_or(0);
-    let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
+    let mut clean = true;
+    for report in &reports {
+        if report.is_clean() && report.fixed.is_empty() {
+            println!("{} {}", "ok".green(), report.name);
+            continue;
+        }
+        clean = false;
+        println!("{} {}", "!!".yellow(), report.name);
+        for finding in &report.findings {
+            println!("   - {}", finding);
+        }
+        for fixed in &report.fixed {
+            println!("   {} {}", "→".green(), fixed);
+        }
+        if let Some(advice) = &report.advice {
+            println!("   {}", advice.dimmed());
+        }
+    }
 
-    let assignment = assignment_mgr
-        .get_active_for_ancillary(&ancillary_id_str)
-        .with_context(|| format!("No assignment found for workspace '{}'", ws_name))?;
-
-    let value = match field {
-        "task.id" => assignment.task_id.as_deref().unwrap_or("").to_string(),
-        "task.title" => assignment.task_title.as_deref().unwrap_or("").to_string(),
-        "task.url" => assignment.task_url.as_deref().unwrap_or("").to_string(),
-        "task.source" => assignment.task_source.as_deref().unwrap_or("").to_string(),
-        "workspace.path" => assignment.workspace_path.display().to_string(),
-        "segment" => assignment.segment.clone(),
-        "ancillary_id" => assignment.ancillary_id.clone(),
-        "session_id" => assignment.session_id.as_deref().unwrap_or("").to_string(),
-        _ => anyhow::bail!(
-            "Unknown field: {}. Supported: task.id, task.title, task.url, task.source, workspace.path, segment, ancillary_id, session_id",
-            field
-        ),
-    };
-
-    println!("{}", value);
+    if clean {
+        println!("\nNothing to fix.");
+    }
     Ok(())
 }
 
@@ -1711,62 +1316,131 @@ fn cmd_init(stealth: bool) -> Result<()> {
         );
     }
 
-    // Must be at the workspace/repo root
-    if has_jj {
-        let output = Command::new("jj")
-            .args(["workspace", "root"])
-            .current_dir(&cwd)
-            .output()
-            .context("Failed to run jj workspace root")?;
-
-        if !output.status.success() {
-            anyhow::bail!("Failed to determine jj workspace root");
-        }
-
-        let jj_root =
-            std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
-
-        if jj_root != cwd {
-            anyhow::bail!(
-                "breq init must be run from the workspace root: {}",
-                jj_root.display()
-            );
-        }
-    } else {
-        let output = Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .current_dir(&cwd)
-            .output()
-            .context("Failed to run git rev-parse")?;
-
-        if !output.status.success() {
-            anyhow::bail!("Failed to determine git repo root");
-        }
-
-        let git_root =
-            std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
-
-        if git_root != cwd {
-            anyhow::bail!(
-                "breq init must be run from the repo root: {}",
-                git_root.display()
-            );
-        }
-    }
+    ensure_repo_root(&cwd, has_jj)?;
 
     let config_path = cwd.join("toren.kdl");
     if config_path.exists() || cwd.join(".toren.kdl").exists() {
         anyhow::bail!("toren.kdl already exists. Remove it first to re-initialize.");
     }
 
-    // Collect setup actions
+    let (share_entries, copy_entries) = discover_setup_entries(&cwd)?;
+
+    let mut kdl = String::from("// var subdomain=\"{{ ws.name }}.{{ repo.name }}\"\n\nsetup {\n");
+    for entry in &share_entries {
+        kdl.push_str(&format!("    share src=\"{}\"\n", entry));
+    }
+    for entry in &copy_entries {
+        kdl.push_str(&format!("    copy src=\"{}\"\n", entry));
+    }
+    kdl.push_str("}\n\n");
+    kdl.push_str(
+        "// Runs instead of `setup` for a workspace created with `breq setup --from <ws>`.\n\
+         // {{ parent.path }} is the workspace being forked, so runtime state can be cloned\n\
+         // rather than rebuilt:\n\
+         // fork {\n\
+         //     copy src=\"data\" from=\"{{ parent.path }}\"\n\
+         // }\n\n",
+    );
+    kdl.push_str("destroy { }\n");
+
+    std::fs::write(&config_path, &kdl).context("Failed to write toren.kdl")?;
+    println!(
+        "Created {} with {} setup entries",
+        toren_lib::tilde_shorten(&config_path),
+        share_entries.len() + copy_entries.len()
+    );
+    for entry in share_entries.iter().chain(copy_entries.iter()) {
+        println!("  {}", entry);
+    }
+
+    if stealth {
+        add_to_git_exclude(&cwd, "toren.kdl")?;
+    }
+
+    install_stack_scripts(&cwd)?;
+
+    if std::io::stdin().is_terminal() {
+        offer_segment_registration(&cwd)?;
+    }
+
+    Ok(())
+}
+
+/// Install the shipped workflow scripts, plus any that fit the detected stack.
+///
+/// Out-of-box feel comes from here: a github + task-resolver repo gets a working
+/// `breq submit` without anyone writing one.
+fn install_stack_scripts(repo: &Path) -> Result<()> {
+    let mut installed = Vec::new();
+
+    for name in toren_lib::scripts::missing(true) {
+        if let Some(path) = toren_lib::scripts::install(name)? {
+            installed.push(path);
+        }
+    }
+
+    if detects_github(repo) {
+        if let Some(path) = toren_lib::scripts::install("breq-submit")? {
+            installed.push(path);
+        }
+    }
+
+    if !installed.is_empty() {
+        println!("\nInstalled workflow scripts:");
+        for path in &installed {
+            println!("  {}", toren_lib::tilde_shorten(path));
+        }
+        println!("  (edit them — they're yours; `breq <name>` finds them by name)");
+    }
+    Ok(())
+}
+
+fn detects_github(repo: &Path) -> bool {
+    let remotes = Command::new("git")
+        .args(["remote", "-v"])
+        .current_dir(repo)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    remotes.contains("github.com") && which::which("gh").is_ok()
+}
+
+fn ensure_repo_root(cwd: &Path, has_jj: bool) -> Result<()> {
+    let (program, args) = if has_jj {
+        ("jj", vec!["workspace", "root"])
+    } else {
+        ("git", vec!["rev-parse", "--show-toplevel"])
+    };
+
+    let output = Command::new(program)
+        .args(&args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("Failed to run {}", program))?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to determine repository root");
+    }
+
+    let root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    if root != cwd {
+        anyhow::bail!(
+            "breq init must be run from the repo root: {}",
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+/// Guess what a workspace needs copied or shared: build artifacts and untracked local state.
+fn discover_setup_entries(cwd: &Path) -> Result<(Vec<String>, Vec<String>)> {
     let mut copy_entries: Vec<String> = Vec::new();
     let mut share_entries: Vec<String> = Vec::new();
 
     if cwd.join(".beads").exists() {
-        let is_tracked = std::process::Command::new("git")
+        let is_tracked = Command::new("git")
             .args(["ls-files", "--error-unmatch", ".beads"])
-            .current_dir(&cwd)
+            .current_dir(cwd)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -1777,7 +1451,7 @@ fn cmd_init(stealth: bool) -> Result<()> {
         }
     }
 
-    let well_known_artifacts = [
+    let well_known = [
         "target",
         "node_modules",
         "dist",
@@ -1792,119 +1466,125 @@ fn cmd_init(stealth: bool) -> Result<()> {
 
     let gitignore_path = cwd.join(".gitignore");
     if gitignore_path.exists() {
-        let gitignore =
-            std::fs::read_to_string(&gitignore_path).context("Failed to read .gitignore")?;
-
+        let gitignore = std::fs::read_to_string(&gitignore_path)?;
         for line in gitignore.lines() {
             let line = line.trim().trim_end_matches('/');
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-
-            for artifact in &well_known_artifacts {
-                if line == *artifact || line.ends_with(&format!("/{}", artifact)) {
-                    let artifact_path = cwd.join(line);
-                    if artifact_path.is_dir() {
-                        let entry = line.to_string();
-                        if !copy_entries.contains(&entry) {
-                            copy_entries.push(entry);
-                        }
-                    }
+            for artifact in &well_known {
+                if (line == *artifact || line.ends_with(&format!("/{}", artifact)))
+                    && cwd.join(line).is_dir()
+                    && !copy_entries.contains(&line.to_string())
+                {
+                    copy_entries.push(line.to_string());
                 }
             }
         }
     }
 
-    for artifact in &well_known_artifacts {
-        let artifact_path = cwd.join(artifact);
-        if artifact_path.is_dir() {
-            let entry = artifact.to_string();
-            if !copy_entries.contains(&entry) {
-                copy_entries.push(entry);
-            }
+    for artifact in &well_known {
+        if cwd.join(artifact).is_dir() && !copy_entries.contains(&artifact.to_string()) {
+            copy_entries.push(artifact.to_string());
         }
     }
 
-    let mut kdl = String::from("// var subdomain=\"{{ ws.name }}.{{ repo.name }}\"\n\nsetup {\n");
-    for entry in &share_entries {
-        kdl.push_str(&format!("    share src=\"{}\"\n", entry));
-    }
-    for entry in &copy_entries {
-        kdl.push_str(&format!("    copy src=\"{}\"\n", entry));
-    }
-    kdl.push_str("}\n\ndestroy { }\n");
+    Ok((share_entries, copy_entries))
+}
 
-    let total = share_entries.len() + copy_entries.len();
-    std::fs::write(&config_path, &kdl).context("Failed to write toren.kdl")?;
-    println!(
-        "Created {} with {} setup entries",
-        toren_lib::tilde_shorten(&config_path),
-        total
-    );
-
-    for entry in &share_entries {
-        println!("  share src=\"{}\"", entry);
+fn add_to_git_exclude(cwd: &Path, entry: &str) -> Result<()> {
+    let git_info_dir = cwd.join(".git").join("info");
+    if !git_info_dir.exists() {
+        println!("Warning: .git/info directory not found, --stealth had no effect");
+        return Ok(());
     }
-    for entry in &copy_entries {
-        println!("  copy src=\"{}\"", entry);
-    }
-    println!("Edit toren.kdl to customize workspace setup and teardown.");
 
-    if stealth {
-        let git_info_dir = cwd.join(".git").join("info");
-        if git_info_dir.exists() {
-            let exclude_path = git_info_dir.join("exclude");
-            let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-            if !existing.lines().any(|l| l.trim() == "toren.kdl") {
-                let mut content = existing;
-                if !content.ends_with('\n') && !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str("toren.kdl\n");
-                std::fs::write(&exclude_path, content)
-                    .context("Failed to update .git/info/exclude")?;
-                println!("Added toren.kdl to .git/info/exclude");
-            }
+    let exclude_path = git_info_dir.join("exclude");
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == entry) {
+        return Ok(());
+    }
+
+    let mut content = existing;
+    if !content.ends_with('\n') && !content.is_empty() {
+        content.push('\n');
+    }
+    content.push_str(entry);
+    content.push('\n');
+    std::fs::write(&exclude_path, content).context("Failed to update .git/info/exclude")?;
+    println!("Added {} to .git/info/exclude", entry);
+    Ok(())
+}
+
+fn offer_segment_registration(cwd: &Path) -> Result<()> {
+    let Ok(config) = Config::load() else {
+        return Ok(());
+    };
+    let segment_mgr = toren_lib::SegmentManager::new(&config)?;
+    if segment_mgr.resolve_from_path(cwd).is_some() {
+        return Ok(());
+    }
+
+    let repo_path = toren_lib::tilde_shorten(cwd);
+    let parent_glob = cwd
+        .parent()
+        .map(|p| format!("{}/*", toren_lib::tilde_shorten(p)));
+
+    let entry = if let Some(glob) = parent_glob {
+        eprintln!("\nThis repo isn't covered by a segment in ~/.toren/config.toml.");
+        eprint!("Add parent glob '{}'? [Y/n] ", glob);
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let ans = input.trim().to_ascii_lowercase();
+        if ans.is_empty() || ans == "y" || ans == "yes" {
+            glob
         } else {
-            println!("Warning: .git/info directory not found, --stealth had no effect");
+            repo_path
         }
+    } else {
+        repo_path
+    };
+
+    let config_path = dirs::home_dir()
+        .context("Could not determine home directory")?
+        .join(".toren/config.toml");
+    add_segment_to_config(&config_path, &entry)
+}
+
+/// Add a segment entry to ~/.toren/config.toml, preserving comments.
+fn add_segment_to_config(config_path: &Path, entry: &str) -> Result<()> {
+    use toml_edit::{value, Array, DocumentMut};
+
+    let content = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: DocumentMut = content.parse().unwrap_or_default();
+
+    if !doc.contains_table("ancillaries") {
+        doc["ancillaries"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let ancillaries = doc["ancillaries"].as_table_mut().unwrap();
+
+    if !ancillaries.contains_key("segments") {
+        let mut arr = Array::new();
+        arr.push(entry);
+        ancillaries["segments"] = value(arr);
+    } else if let Some(arr) = ancillaries["segments"].as_array_mut() {
+        if arr.iter().any(|v| v.as_str() == Some(entry)) {
+            println!("'{}' already in config", entry);
+            return Ok(());
+        }
+        arr.push(entry);
     }
 
-    // Segment onboarding (TTY only): if this repo isn't already covered by a
-    // configured segment, offer to add its parent as a glob (default yes).
-    // If declined, register just this repo as a literal segment.
-    if std::io::stdin().is_terminal() {
-        if let Ok(config) = Config::load() {
-            let segment_mgr = SegmentManager::new(&config)?;
-            if segment_mgr.resolve_from_path(&cwd).is_none() {
-                let repo_path = toren_lib::tilde_shorten(&cwd);
-                let parent_glob = cwd
-                    .parent()
-                    .map(|p| format!("{}/*", toren_lib::tilde_shorten(p)));
-
-                let entry = if let Some(glob) = parent_glob {
-                    eprintln!("\nThis repo isn't covered by a segment in ~/.toren/config.toml.");
-                    eprint!("Add parent glob '{}'? [Y/n] ", glob);
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input)?;
-                    let ans = input.trim().to_ascii_lowercase();
-                    if ans.is_empty() || ans == "y" || ans == "yes" {
-                        glob
-                    } else {
-                        repo_path
-                    }
-                } else {
-                    repo_path
-                };
-
-                let config_path = dirs::home_dir()
-                    .context("Could not determine home directory")?
-                    .join(".toren/config.toml");
-                add_segment_to_config(&config_path, &entry)?;
-            }
-        }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-
+    std::fs::write(config_path, doc.to_string()).context("Failed to write config file")?;
+    println!("Added '{}' to ~/.toren/config.toml", entry);
     Ok(())
 }
 
@@ -1913,7 +1593,6 @@ fn cmd_init(stealth: bool) -> Result<()> {
 const PLUGIN_REPO_RAW: &str =
     "https://raw.githubusercontent.com/anowell/toren/main/contrib/plugins";
 const PLUGIN_REPO_API: &str = "https://api.github.com/repos/anowell/toren/contents/contrib/plugins";
-const PLUGIN_CATEGORIES: &[&str] = &["commands", "tasks"];
 
 fn cmd_plugin(cmd: PluginCmd) -> Result<()> {
     match cmd {
@@ -1924,36 +1603,33 @@ fn cmd_plugin(cmd: PluginCmd) -> Result<()> {
 
 fn cmd_plugin_list() -> Result<()> {
     let installed_root = toren_lib::toren_root().join("plugins");
+    let mgr = PluginManager::new(&installed_root)?;
 
-    for category in PLUGIN_CATEGORIES {
-        let remote_names = fetch_remote_plugin_names(category).unwrap_or_else(|e| {
-            eprintln!("warning: failed to list remote {}: {:#}", category, e);
-            Vec::new()
-        });
-        let local_names = list_installed_plugins(&installed_root, category);
+    for family in Family::all() {
+        let remote = fetch_remote_plugin_names(family.dir()).unwrap_or_default();
+        let local: Vec<&str> = mgr.list(*family);
 
-        let mut all: Vec<&str> = remote_names
+        let mut all: Vec<&str> = remote
             .iter()
             .map(|s| s.as_str())
-            .chain(local_names.iter().map(|s| s.as_str()))
+            .chain(local.iter().copied())
             .collect();
         all.sort();
         all.dedup();
 
-        println!("{}/", category);
+        println!("{}/", family.dir());
         if all.is_empty() {
             println!("  (none)");
             continue;
         }
         let width = all.iter().map(|n| n.len()).max().unwrap_or(0);
         for name in all {
-            let installed = local_names.iter().any(|n| n == name);
-            let remote = remote_names.iter().any(|n| n == name);
-            let marker = match (installed, remote) {
-                (true, true) => "installed",
-                (true, false) => "installed (local only)",
-                (false, true) => "available",
-                (false, false) => unreachable!(),
+            let meta = mgr.get_meta(*family, name);
+            let marker = match (meta, remote.iter().any(|n| n == name)) {
+                (Some(m), _) if m.is_builtin() => "built-in",
+                (Some(_), _) => "installed",
+                (None, true) => "available",
+                (None, false) => "unknown",
             };
             println!("  {:<width$}  {}", name, marker, width = width);
         }
@@ -1972,21 +1648,20 @@ fn cmd_plugin_install(target: &str) -> Result<()> {
     }
 }
 
-/// Install from a local .rhai file. The parent directory name must be
-/// `commands` or `tasks` to determine the category.
 fn install_from_local(src: &Path, installed_root: &Path) -> Result<()> {
     if src.extension().and_then(|s| s.to_str()) != Some("rhai") {
         anyhow::bail!("Local plugin must be a .rhai file: {}", src.display());
     }
 
-    let category = src
+    let family = src
         .parent()
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
-        .filter(|c| PLUGIN_CATEGORIES.contains(c))
+        .and_then(Family::parse)
         .with_context(|| {
             format!(
-                "Cannot infer plugin category from path: {} (parent dir must be 'commands' or 'tasks')",
+                "Cannot infer plugin family from path: {} (parent dir must be tasks, agents, \
+                 or delivery)",
                 src.display()
             )
         })?;
@@ -1995,15 +1670,10 @@ fn install_from_local(src: &Path, installed_root: &Path) -> Result<()> {
         .file_name()
         .with_context(|| format!("Invalid plugin path: {}", src.display()))?;
 
-    let dest_dir = installed_root.join(category);
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("Failed to create {}", dest_dir.display()))?;
+    let dest_dir = installed_root.join(family.dir());
+    std::fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join(file_name);
-
-    let contents =
-        std::fs::read(src).with_context(|| format!("Failed to read {}", src.display()))?;
-    std::fs::write(&dest, contents)
-        .with_context(|| format!("Failed to write {}", dest.display()))?;
+    std::fs::copy(src, &dest)?;
 
     println!(
         "Installed {} -> {}",
@@ -2013,17 +1683,11 @@ fn install_from_local(src: &Path, installed_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Install from the remote contrib repo. `target` must be `<category>/<name>`.
 fn install_from_remote(target: &str, installed_root: &Path) -> Result<()> {
-    let (category, name) = parse_remote_target(target)?;
+    let (family, name) = parse_remote_target(target)?;
 
-    let url = format!("{}/{}/{}.rhai", PLUGIN_REPO_RAW, category, name);
-    let agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .timeout_global(Some(std::time::Duration::from_secs(30)))
-            .http_status_as_error(false)
-            .build(),
-    );
+    let url = format!("{}/{}/{}.rhai", PLUGIN_REPO_RAW, family.dir(), name);
+    let agent = http_agent();
 
     let response = agent
         .get(&url)
@@ -2034,8 +1698,8 @@ fn install_from_remote(target: &str, installed_root: &Path) -> Result<()> {
     if status == 404 {
         anyhow::bail!(
             "Plugin '{}/{}' not found in contrib repo.\n\
-             Run `breq plugin list` to see available plugins.",
-            category,
+             Run `breq plugin list` to see what's available.",
+            family.dir(),
             name
         );
     }
@@ -2043,66 +1707,51 @@ fn install_from_remote(target: &str, installed_root: &Path) -> Result<()> {
         anyhow::bail!("Failed to fetch {} (HTTP {})", url, status);
     }
 
-    let body = response
-        .into_body()
-        .read_to_string()
-        .with_context(|| format!("Failed to read body from {}", url))?;
+    let body = response.into_body().read_to_string()?;
 
-    let dest_dir = installed_root.join(category);
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("Failed to create {}", dest_dir.display()))?;
+    let dest_dir = installed_root.join(family.dir());
+    std::fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join(format!("{}.rhai", name));
-    std::fs::write(&dest, body).with_context(|| format!("Failed to write {}", dest.display()))?;
+    std::fs::write(&dest, body)?;
 
     println!(
         "Installed {}/{} -> {}",
-        category,
+        family.dir(),
         name,
         toren_lib::tilde_shorten(&dest)
     );
     Ok(())
 }
 
-/// Parse `<category>/<name>` into (category, name). Errors on unknown category
-/// or missing `/`.
-fn parse_remote_target(target: &str) -> Result<(&'static str, String)> {
-    let (category, name) = target.split_once('/').with_context(|| {
+fn parse_remote_target(target: &str) -> Result<(Family, String)> {
+    let (family, name) = target.split_once('/').with_context(|| {
         format!(
-            "Plugin target '{}' must be 'commands/<name>' or 'tasks/<name>' (or a local .rhai path)",
+            "Plugin target '{}' must be '<family>/<name>' (tasks, agents, delivery) or a local \
+             .rhai path",
             target
         )
     })?;
 
-    let category = PLUGIN_CATEGORIES
-        .iter()
-        .copied()
-        .find(|c| *c == category)
-        .with_context(|| {
-            format!(
-                "Unknown plugin category '{}' — must be 'commands' or 'tasks'",
-                category
-            )
-        })?;
+    let family = Family::parse(family).with_context(|| {
+        format!(
+            "Unknown plugin family '{}' — must be tasks, agents, or delivery",
+            family
+        )
+    })?;
 
     if name.is_empty() || name.contains('/') || name.contains("..") {
         anyhow::bail!("Invalid plugin name: '{}'", name);
     }
 
-    let name = name.strip_suffix(".rhai").unwrap_or(name).to_string();
-    Ok((category, name))
+    Ok((
+        family,
+        name.strip_suffix(".rhai").unwrap_or(name).to_string(),
+    ))
 }
 
-/// Fetch the list of .rhai filenames (without extension) from a contrib category.
-fn fetch_remote_plugin_names(category: &str) -> Result<Vec<String>> {
-    let url = format!("{}/{}", PLUGIN_REPO_API, category);
-    let agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .timeout_global(Some(std::time::Duration::from_secs(30)))
-            .http_status_as_error(false)
-            .build(),
-    );
-
-    let response = agent
+fn fetch_remote_plugin_names(family: &str) -> Result<Vec<String>> {
+    let url = format!("{}/{}", PLUGIN_REPO_API, family);
+    let response = http_agent()
         .get(&url)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "breq-plugin-list")
@@ -2115,8 +1764,7 @@ fn fetch_remote_plugin_names(category: &str) -> Result<Vec<String>> {
     }
 
     let body = response.into_body().read_to_string()?;
-    let entries: Vec<serde_json::Value> =
-        serde_json::from_str(&body).context("Failed to parse GitHub API response")?;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&body)?;
 
     let mut names: Vec<String> = entries
         .iter()
@@ -2129,230 +1777,11 @@ fn fetch_remote_plugin_names(category: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// List installed .rhai plugin names (without extension) for a given category.
-fn list_installed_plugins(installed_root: &Path, category: &str) -> Vec<String> {
-    let dir = installed_root.join(category);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("rhai"))
-        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
-        .collect();
-    names.sort();
-    names
-}
-
-// ─── helpers ────────────────────────────────────────────────────────────────
-
-/// Add a segment entry to ~/.toren/config.toml using toml_edit for
-/// targeted insertion (preserves comments, doesn't expand defaults).
-fn add_segment_to_config(config_path: &std::path::Path, entry: &str) -> Result<()> {
-    use toml_edit::{value, Array, DocumentMut};
-
-    let content = if config_path.exists() {
-        std::fs::read_to_string(config_path)?
-    } else {
-        String::new()
-    };
-
-    let mut doc: DocumentMut = content.parse().unwrap_or_default();
-
-    // Ensure [ancillaries] table exists
-    if !doc.contains_table("ancillaries") {
-        doc["ancillaries"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-
-    let ancillaries = doc["ancillaries"].as_table_mut().unwrap();
-
-    // Get or create the segments array
-    if !ancillaries.contains_key("segments") {
-        let mut arr = Array::new();
-        arr.push(entry);
-        ancillaries["segments"] = value(arr);
-        write_config(config_path, &doc)?;
-        println!("Added '{}' to ~/.toren/config.toml", entry);
-        return Ok(());
-    }
-
-    if let Some(arr) = ancillaries["segments"].as_array_mut() {
-        // Check for duplicates
-        let already_present = arr.iter().any(|v| v.as_str() == Some(entry));
-        if already_present {
-            println!("'{}' already in config", entry);
-            return Ok(());
-        }
-        arr.push(entry);
-    }
-
-    write_config(config_path, &doc)?;
-    println!("Added '{}' to ~/.toren/config.toml", entry);
-    Ok(())
-}
-
-fn write_config(path: &std::path::Path, doc: &toml_edit::DocumentMut) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("Failed to create config directory")?;
-    }
-    std::fs::write(path, doc.to_string()).context("Failed to write config file")
-}
-
-/// Find workspace directories that exist on disk but are not tracked by VCS
-/// and have no assignment record.
-fn find_orphaned_workspaces(
-    ws_mgr: &WorkspaceManager,
-    segments: &[Segment],
-    assignments: &[&toren_lib::Assignment],
-) -> Vec<(String, String, std::path::PathBuf)> {
-    let mut orphans = Vec::new();
-
-    for segment in segments {
-        let tracked_workspaces = ws_mgr.list_workspaces(&segment.path).unwrap_or_default();
-
-        let assigned_paths: std::collections::HashSet<_> = assignments
-            .iter()
-            .filter(|a| a.segment.to_lowercase() == segment.name.to_lowercase())
-            .map(|a| a.workspace_path.clone())
-            .collect();
-
-        let segment_ws_dir = ws_mgr.workspace_path(&segment.name, "");
-        if let Ok(entries) = std::fs::read_dir(&segment_ws_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let ws_name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                };
-
-                if tracked_workspaces.contains(&ws_name) {
-                    continue;
-                }
-                if assigned_paths.contains(&path) {
-                    continue;
-                }
-
-                orphans.push((segment.name.clone(), ws_name, path));
-            }
-        }
-    }
-
-    orphans
-}
-
-fn truncate_title(title: &str, max_len: usize) -> String {
-    if title.chars().count() <= max_len {
-        title.to_string()
-    } else if max_len > 3 {
-        let end: String = title.chars().take(max_len - 3).collect();
-        format!("{}...", end)
-    } else {
-        title.chars().take(max_len).collect()
-    }
-}
-
-/// Detect workspace context from current directory.
-fn detect_workspace_context() -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
-    let cwd = std::env::current_dir()?;
-
-    if cwd.join(".jj").exists() {
-        return detect_jj_workspace_context(&cwd);
-    }
-
-    let git_entry = cwd.join(".git");
-    if git_entry.exists() && git_entry.is_file() {
-        return detect_git_worktree_context(&cwd);
-    }
-
-    anyhow::bail!(
-        "Not in a VCS workspace. Run this command from within a jj workspace or git worktree."
-    );
-}
-
-fn detect_jj_workspace_context(
-    cwd: &std::path::Path,
-) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
-    let output = Command::new("jj")
-        .args(["workspace", "root"])
-        .current_dir(cwd)
-        .output()
-        .context("Failed to run jj workspace root")?;
-
-    if !output.status.success() {
-        anyhow::bail!("Failed to determine workspace root");
-    }
-
-    let workspace_path =
-        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
-
-    let workspace_name = workspace_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("Invalid workspace path")?
-        .to_string();
-
-    let mut segment_path = None;
-    let mut check_path = workspace_path.parent();
-    while let Some(parent) = check_path {
-        if parent.join("toren.kdl").exists() || parent.join(".toren.kdl").exists() {
-            segment_path = Some(parent.to_path_buf());
-            break;
-        }
-        if parent.join(".jj").exists() && parent != workspace_path {
-            segment_path = Some(parent.to_path_buf());
-            break;
-        }
-        check_path = parent.parent();
-    }
-
-    let segment_path = segment_path
-        .context("Could not find segment root. Ensure you're in a breq-managed workspace.")?;
-
-    Ok((segment_path, workspace_path, workspace_name))
-}
-
-fn detect_git_worktree_context(
-    cwd: &std::path::Path,
-) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(cwd)
-        .output()
-        .context("Failed to run git rev-parse --show-toplevel")?;
-
-    if !output.status.success() {
-        anyhow::bail!("Failed to determine git worktree root");
-    }
-
-    let workspace_path =
-        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
-
-    let workspace_name = workspace_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("Invalid workspace path")?
-        .to_string();
-
-    let mut segment_path = None;
-    let mut check_path = workspace_path.parent();
-    while let Some(parent) = check_path {
-        if parent.join("toren.kdl").exists() || parent.join(".toren.kdl").exists() {
-            segment_path = Some(parent.to_path_buf());
-            break;
-        }
-        if parent.join(".git").is_dir() && parent != workspace_path {
-            segment_path = Some(parent.to_path_buf());
-            break;
-        }
-        check_path = parent.parent();
-    }
-
-    let segment_path = segment_path
-        .context("Could not find segment root. Ensure you're in a breq-managed workspace.")?;
-
-    Ok((segment_path, workspace_path, workspace_name))
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build(),
+    )
 }

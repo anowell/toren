@@ -37,6 +37,7 @@ pub fn render_template(template: &str, ctx: &WorkspaceContext) -> Result<String>
         ws => ctx.ws,
         repo => ctx.repo,
         task => ctx.task,
+        parent => ctx.parent,
         vars => ctx.vars,
     })?;
     Ok(rendered)
@@ -80,8 +81,19 @@ pub struct WorkspaceContext {
     pub repo: RepoInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskInfo>,
+    /// The workspace this one was forked from, during a `fork` block. `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ParentInfo>,
     #[serde(default)]
     pub vars: HashMap<String, serde_json::Value>,
+}
+
+/// The parent workspace of a stacked child, available to `fork` actions as
+/// `{{ parent.name }}` / `{{ parent.path }}`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ParentInfo {
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -168,6 +180,7 @@ pub fn evaluate_vars(
             ws => ctx.ws,
             repo => ctx.repo,
             task => ctx.task,
+            parent => ctx.parent,
             vars => &result,
         })?;
 
@@ -297,6 +310,9 @@ pub struct SetupResult;
 #[derive(Debug, Default)]
 pub struct BreqConfig {
     pub setup: Vec<ParsedAction>,
+    /// Actions for a workspace forked from another (`breq setup --from`). Falls back to
+    /// `setup` when absent, so stacking works without any config change.
+    pub fork: Vec<ParsedAction>,
     pub destroy: Vec<ParsedAction>,
     pub vars: Vec<VarDef>,
     /// Top-level `env` directives, applied in source order before setup or destroy actions.
@@ -349,6 +365,9 @@ impl BreqConfig {
             match node.name().value() {
                 "setup" => {
                     config.setup = Self::parse_block(node)?;
+                }
+                "fork" => {
+                    config.fork = Self::parse_block(node)?;
                 }
                 "destroy" => {
                     config.destroy = Self::parse_block(node)?;
@@ -641,6 +660,8 @@ pub struct WorkspaceSetup {
     ancillary_num: u32,
     /// Local domain for station proxy (e.g. "lvh.me")
     local_domain: Option<String>,
+    /// Set when this workspace is a stacked child, for the `fork` block.
+    parent: Option<ParentInfo>,
     /// Fallback base dir for `run` actions during destroy when `workspace_path`
     /// is missing. Set in `run_destroy` *only* when we actually had to fall
     /// back (sibling `.cleanup-*` dir or a freshly created empty temp dir).
@@ -663,8 +684,18 @@ impl WorkspaceSetup {
             workspace_name,
             ancillary_num,
             local_domain,
+            parent: None,
             destroy_fallback_workdir: None,
         }
+    }
+
+    /// Mark this workspace as forked from `parent`, enabling the `fork` block.
+    pub fn with_parent(mut self, name: &str, path: &Path) -> Self {
+        self.parent = Some(ParentInfo {
+            name: name.to_string(),
+            path: path.display().to_string(),
+        });
+        self
     }
 
     /// Compute the STATION_DOMAIN value: `{repo_name}.{local_domain}`
@@ -735,15 +766,20 @@ impl WorkspaceSetup {
                 name: repo_name,
             },
             task: None,
+            parent: self.parent.clone(),
             vars: HashMap::new(),
         }
     }
 
-    /// Run the setup block
+    /// Run the setup block — or the `fork` block, when this workspace was forked from
+    /// another and the config defines one.
     pub fn run_setup(&self) -> Result<SetupResult> {
         let config = BreqConfig::parse(&self.repo_root)?;
 
-        if config.setup.is_empty() && config.vars.is_empty() && config.global_env.is_empty() {
+        let forking = self.parent.is_some() && !config.fork.is_empty();
+        let actions = if forking { &config.fork } else { &config.setup };
+
+        if actions.is_empty() && config.vars.is_empty() && config.global_env.is_empty() {
             debug!("No setup actions defined");
             return Ok(SetupResult);
         }
@@ -768,7 +804,7 @@ impl WorkspaceSetup {
             self.apply_env_directive(directive, &mut env_state, &ctx)?;
         }
 
-        self.execute_actions(&config.setup, &ctx, &mut env_state)?;
+        self.execute_actions(actions, &ctx, &mut env_state)?;
 
         info!("Workspace setup complete");
         Ok(SetupResult)
@@ -1051,6 +1087,7 @@ impl WorkspaceSetup {
             ws => ctx.ws,
             repo => ctx.repo,
             task => ctx.task,
+            parent => ctx.parent,
             vars => ctx.vars,
         })?;
 
@@ -1730,6 +1767,7 @@ setup { }
                 name: "myrepo".to_string(),
             },
             task: None,
+            parent: None,
             vars: HashMap::new(),
         };
 
@@ -1751,6 +1789,7 @@ setup { }
                 name: "myrepo".to_string(),
             },
             task: None,
+            parent: None,
             vars: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2106,6 +2145,7 @@ setup {
                 name: "myrepo".to_string(),
             },
             task: None,
+            parent: None,
             vars: HashMap::new(),
         };
         let actions = vec![
@@ -2354,6 +2394,7 @@ setup {
                 name: "repo".to_string(),
             },
             task: None,
+            parent: None,
             vars: HashMap::new(),
         }
     }

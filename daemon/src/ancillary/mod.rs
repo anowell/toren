@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 /// Connection state of an ancillary client on `/ws`.
@@ -24,8 +24,6 @@ pub struct Ancillary {
     pub connected_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_instruction: Option<String>,
     /// The workspace name if this ancillary is using a jj workspace
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
@@ -59,7 +57,6 @@ impl AncillaryManager {
             status: AncillaryStatus::Connected,
             connected_at: chrono::Utc::now().to_rfc3339(),
             last_activity: None,
-            current_instruction: None,
             workspace,
             working_dir,
         };
@@ -67,15 +64,6 @@ impl AncillaryManager {
         let mut ancillaries = self.ancillaries.write().unwrap();
         ancillaries.insert(id.clone(), ancillary);
         tracing::info!("Ancillary {} registered", id);
-    }
-
-    /// Check if a workspace is already in use by another ancillary
-    pub fn is_workspace_in_use(&self, working_dir: &Path) -> Option<String> {
-        let ancillaries = self.ancillaries.read().unwrap();
-        ancillaries
-            .values()
-            .find(|a| a.working_dir == working_dir)
-            .map(|a| a.id.clone())
     }
 
     pub fn unregister(&self, id: &str) {
@@ -91,19 +79,6 @@ impl AncillaryManager {
             ancillary.status = status;
             ancillary.last_activity = Some(chrono::Utc::now().to_rfc3339());
         }
-    }
-
-    pub fn set_instruction(&self, id: &str, instruction: Option<String>) {
-        let mut ancillaries = self.ancillaries.write().unwrap();
-        if let Some(ancillary) = ancillaries.get_mut(id) {
-            ancillary.current_instruction = instruction;
-            ancillary.last_activity = Some(chrono::Utc::now().to_rfc3339());
-        }
-    }
-
-    pub fn get(&self, id: &str) -> Option<Ancillary> {
-        let ancillaries = self.ancillaries.read().unwrap();
-        ancillaries.get(id).cloned()
     }
 
     pub fn list(&self) -> Vec<Ancillary> {

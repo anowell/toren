@@ -1,374 +1,162 @@
 # Plugins
 
-Toren's plugin system lets you extend `breq` with [Rhai](https://rhai.rs/) scripts that call native Rust operations via a host API. Plugins replace the old shell-based aliases for complex workflows that need conditional logic, JSON parsing, or multi-step orchestration.
+Toren integrates with your tracker, your coding agents, and your forge through [Rhai](https://rhai.rs/)
+**resolver plugins** under `~/.toren/plugins/`. A resolver answers the small, source-specific
+questions that breq's core can't: *how do I read this task? how do I spawn this agent? what happened
+to this branch after it left the workspace?* Adding support for a new tracker, agent, or forge is a
+single `.rhai` file — no rebuild, no release.
 
-## How it works
+> Resolvers are one of toren's four extension layers. The others are `toren.kdl` hooks (per repo),
+> workflow shell scripts (per workflow, see below), and agent skills (per session). See
+> [CONCEPTS.md](CONCEPTS.md#the-extension-census-four-layers).
 
-1. **User plugins** in `~/.toren/plugins/` are discovered at startup
-2. **Community plugins** in `contrib/plugins/` can be copied into your plugin directory
-3. **Dispatch order**: plugins > aliases > clap subcommands
+## The three families
 
-Plugins are organized into two directories by kind:
+Plugins live in three directories under `~/.toren/plugins/`, one per family. The filename (without
+`.rhai`) is the name breq keys on — `tasks/runes.rhai` handles the `runes` source, `agents/claude.rhai`
+is the `claude` agent.
 
-- `commands/` — breq subcommands (e.g., `assign.rhai`, `complete.rhai`)
-- `tasks/` — task source resolvers, keyed by source name (e.g., `beads.rhai`, `runes.rhai`)
+| Family | Directory | Answers | Shipped |
+|--------|-----------|---------|---------|
+| **Tasks** | `tasks/` | read & update a tracker | `beads`, `github`, `linear`, `runes` |
+| **Agents** | `agents/` | spawn & observe a coding agent | `claude`, `codex`, `gemini`, `opencode`, `pi` |
+| **Delivery** | `delivery/` | PR/CI state for a forge | `github` |
 
-When you run `breq <name> [args...]`, breq checks for a matching command plugin first. If found, it executes the Rhai script with `ARGS` set to the positional arguments.
+The shipped agent resolvers are *vendored* — present out of the box and user-overridable. Drop a
+file with the same name in your own `agents/` directory and it wins.
 
-**Lazy loading**: Plugin metadata (descriptions, usage) is parsed from doc comments without compiling the Rhai AST. Compilation happens on demand — only when a plugin is actually executed.
+**Lazy loading**: plugin metadata (the doc comment) is parsed without compiling the Rhai AST.
+Compilation happens on demand, only when a resolver function is actually called.
 
-## Writing command plugins
+## Task resolvers (`tasks/`)
 
-Create a `.rhai` file in `~/.toren/plugins/commands/`. The filename (without extension) becomes the command name.
-
-```rhai
-// ~/.toren/plugins/commands/hello.rhai
-// Usage: breq hello <name>
-
-let name = ARGS[0];
-print(`Hello, ${name}!`);
-```
-
-### Doc comments
-
-Add `///` doc comments at the top of your plugin for help metadata:
-
-```rhai
-/// Short description shown in `breq --help`.
-///
-/// Usage: breq myplugin <arg>
-///
-/// Detailed help text shown by `breq myplugin --help`.
-/// Can span multiple lines.
-
-let arg = ARGS[0];
-```
-
-- The first paragraph (before a blank `///` line) is the **description** — shown in `breq --help`
-- The full text is the **usage** — shown by `breq <plugin> --help`
-
-### Variables
-
-- **`ARGS`** — Array of positional arguments passed after the command name
-
-### Deferred actions
-
-Plugins that need to start a coding agent session can't directly exec into another process. Instead, return a map with `action: "do"`:
+A task resolver reads and mutates one tracker. breq calls its functions when you `breq do <task>`,
+`breq get <ws> task.<field>`, or `breq set <ws> task.<field> <value>`.
 
 ```rhai
-#{
-    action: "do",
-    task_id: "breq-123",
-    task_title: "Fix the bug",
-    // Optional fields:
-    // task_url: "https://...",
-    // prompt: "user message text",
-    // intent: "act",  // rendered as system prompt via --append-system-prompt
-}
-```
+/// My tracker. Resolves tasks via the `mytool` CLI.
 
-The host interprets this after the script completes and calls `breq do` with the specified fields. The `intent` and `prompt` are independent and composable — intent becomes a system prompt that frames the session, while prompt is the user message.
-
-## Writing task resolver plugins
-
-Create a `.rhai` file in `~/.toren/plugins/tasks/`. The filename becomes the source name (e.g., `beads.rhai` handles source `"beads"`).
-
-A resolver plugin implements these functions:
-
-```rhai
-/// Required: return task info as a map.
-/// Fields: id, title, status, assignee, description, kind (all optional except id, title)
 fn info(id) {
-    let result = shell("mytool", ["show", id, "--json"]);
-    let data = json::parse(result);
-    #{ id: data.id, title: data.title, status: data.status, assignee: data.assignee, description: data.description }
+    let data = json::parse(shell("mytool", ["show", id, "--json"]));
+    #{ id: data.id, title: data.title, status: data.status,
+       assignee: data.assignee, description: data.description, kind: data.kind }
 }
 
-/// Claim a task — update status and assignee.
 fn claim(id, assignee) {
-    shell("mytool", ["update", id, "--status", "in_progress", "--assignee", assignee]);
+    shell("mytool", ["update", id, "--status", "in-progress", "--assignee", assignee]);
 }
 
-/// Mark a task as complete.
-fn complete(id) {
-    shell("mytool", ["update", id, "--status", "done"]);
+fn set_field(id, field, value) {
+    shell("mytool", ["update", id, "--" + field, value]);
 }
 
-/// Abort/reopen a task.
-fn abort(id) {
-    shell("mytool", ["update", id, "--status", "todo", "--assignee", ""]);
-}
+fn complete(id) { shell("mytool", ["update", id, "--status", "done"]); }
+fn abort(id)    { shell("mytool", ["update", id, "--status", "todo", "--assignee", ""]); }
 
-/// Create a new task. Return the created task ID.
 fn create(title, desc) {
     let args = ["create", "--title", title];
-    if desc != () {
-        args += ["--description", desc];
+    if desc != () { args += ["--description", desc]; }
+    shell("mytool", args)   // return the created id
+}
+```
+
+`info` is the only required function; return `{ id, title, status?, assignee?, description?, kind?,
+url? }`. Task-source-owned fields (status, assignee, title) are always read live — breq never caches
+them, so a workspace can't claim a status the tracker disagrees with.
+
+## Agent resolvers (`agents/`)
+
+An agent resolver answers two questions core can't: how to spawn the agent, and how to read what it's
+doing. Everything else — sessions, windows, attaching — is agent-agnostic.
+
+```rhai
+/// ctx for argv/resume_argv: #{ prompt, model, auto_approve, session_id, workspace }
+
+fn argv(ctx) {
+    let args = ["myagent"];
+    if ctx.model != () && ctx.model != "" { args += ["--model", ctx.model]; }
+    if ctx.prompt != () && ctx.prompt != "" { args += [ctx.prompt]; }
+    args
+}
+
+fn resume_argv(ctx) {
+    let args = ["myagent", "--resume"];
+    if ctx.session_id != () && ctx.session_id != "" { args += [ctx.session_id]; }
+    args
+}
+
+/// "running" mid-turn, "idle" otherwise, "" with no session at all.
+fn activity(ws_path) { ... }
+
+/// A session summary, used as a workspace title of last resort.
+fn title(ws_path) { ... }
+
+/// The agent's own session id, for --resume.
+fn session_id(ws_path) { ... }
+```
+
+`argv` / `resume_argv` are what breq execs; `activity` / `title` / `session_id` are what `breq list`
+and `breq get` read to show what the agent is doing. See `contrib/plugins/agents/claude.rhai` for a
+full worked example (it reads Claude's per-directory JSONL logs).
+
+## Delivery resolvers (`delivery/`)
+
+A delivery resolver reports on a branch after it has left the workspace — the PR and its CI. It is
+read-only and slow (network), so breq caches its result with a timestamp and **never calls it on the
+`breq list` hot path** — only on `--refresh` or from the daemon's poll.
+
+```rhai
+/// ctx: #{ path, branches }  — branches are VCS-derived (e.g. "feature@origin" or "origin/feature")
+/// returns: array of #{ branch, id, url, state, ci }
+
+fn prs(ctx) {
+    let found = [];
+    for branch in ctx.branches {
+        let out = shell("gh", ["pr", "list", "--head", local_name(branch),
+            "--state", "all", "--json", "number,url,state,headRefName,statusCheckRollup"],
+            #{ dir: ctx.path });
+        // ...parse and push #{ branch, id, url, state, ci } ...
     }
-    shell("mytool", args)
+    found
 }
 ```
 
-Resolvers are called by the `task::` host API and by the `PluginManager` internals for multi-source resolution.
-
-## Host API reference
-
-### `task::` — task operations
-
-#### `task::info(id) -> Map`
-
-Resolve a task by ID. Tries configured task sources in order until one succeeds. Splits `source:id` prefixes (e.g., `"beads:abc-123"`) to target a specific source.
-
-Returns `{ id, source, title, description?, status?, assignee?, kind? }`.
-
-```rhai
-let t = task::info("abc-123");
-print(`Task: ${t.id} [${t.source}] - ${t.title}`);
-```
-
-#### `task::claim(source, id, assignee)`
-
-Claim a task via its resolver — typically updates status and assignee.
-
-```rhai
-task::claim("beads", "abc-123", "claude");
-```
-
-#### `task::complete(source, id)`
-
-Mark a task as complete via its resolver.
-
-```rhai
-task::complete("beads", "abc-123");
-```
-
-#### `task::abort(source, id)`
-
-Abort/reopen a task via its resolver.
-
-```rhai
-task::abort("beads", "abc-123");
-```
-
-#### `task::create(source, title [, desc]) -> String`
-
-Create a new task via a resolver. Returns the created task ID.
-
-```rhai
-let id = task::create("beads", "Fix the login bug", "Users can't log in after password reset");
-```
-
-### `toren::` — toren context
-
-#### `toren::config(key) -> String`
-
-Read a config value by dot-separated key path.
-
-```rhai
-let source = toren::config("tasks.default_source");
-let port = toren::config("server.port");
-```
-
-#### `toren::assignment(workspace) -> Map`
-
-Resolve a workspace name to its active assignment.
-
-Returns: `id`, `ancillary_id`, `segment`, `workspace_path`, `status`, `task_id`, `task_title`, `task_url`, `task_source`, `session_id`, `ancillary_num`, `base_branch`.
-
-```rhai
-let info = toren::assignment("one");
-print(`Task: ${info.task_id} in ${info.workspace_path}`);
-```
-
-### `json::` — JSON operations
-
-#### `json::parse(text) -> Dynamic`
-
-Parse a JSON string into a Rhai value.
-
-```rhai
-let data = json::parse(shell("bd", ["show", "abc", "--json"]));
-```
-
-#### `json::stringify(value) -> String`
-
-Serialize a Rhai value to JSON.
-
-### `fs::` — filesystem operations
-
-- `fs::read(path) -> String` — read file contents
-- `fs::write(path, content)` — write file contents
-- `fs::exists(path) -> bool` — check if path exists
-- `fs::glob(pattern) -> Array` — glob for files
-- `fs::ls(path) -> Array` — list directory entries
-
-### `path::` — path operations
-
-- `path::join(a, b) -> String` — join path segments
-- `path::parent(path) -> String` — parent directory
-- `path::filename(path) -> String` — filename component
-- `path::ext(path) -> String` — file extension
-
-### `toml::` — TOML operations
-
-- `toml::parse(text) -> Dynamic` — parse TOML string
-
-### `http::` — HTTP client
-
-- `http::get(url [, opts]) -> Map` — GET request
-- `http::post(url, opts) -> Map` — POST request
-- `http::put(url, opts) -> Map` — PUT request
-- `http::patch(url, opts) -> Map` — PATCH request
-- `http::delete(url [, opts]) -> Map` — DELETE request
-
-Options: `headers` (map), `body` (string), `json` (value, auto-serialized). Returns `{ status, body, ok }`.
-
-### Core functions
-
-#### `shell(program, args) -> String`
-
-Run a command and return its stdout (trimmed). Errors on non-zero exit.
-
-```rhai
-let output = shell("git", ["rev-parse", "HEAD"]);
-```
-
-#### `shell(program, args, opts) -> Map`
-
-Extended shell with options: `dir` (working directory), `env` (environment map), `stdin` (input string), `timeout` (milliseconds). Returns `{ stdout, stderr, status }`.
-
-#### `shell_status(program, args) -> i64`
-
-Run a command and return its exit code (doesn't error on non-zero).
-
-```rhai
-let code = shell_status("git", ["diff", "--quiet"]);
-if code != 0 {
-    print("Uncommitted changes detected");
-}
-```
-
-#### `env(name) -> String`
-
-Get an environment variable, or empty string if not set.
-
-#### `cwd() -> String`
-
-Get the current working directory.
-
-#### `platform() -> String`
-
-Get the platform identifier (e.g., "macos", "linux").
-
-#### `parse_args(args, spec) -> Map`
-
-Parse CLI-style arguments according to a spec. Returns `{ args, opts }` where `args` is an array of positional arguments and `opts` is a map of parsed option values keyed by long name.
-
-Spec is a map where each key is a long option name and each value is a config map:
-
-- `type` (required): `"bool"`, `"string"`, or `"int"`
-- `short` (optional): single-char short alias (e.g. `"s"` for `-s`)
-- `default_val` (optional): default value if not provided (bool defaults to `false`, string/int default to `()`)
-
-```rhai
-let parsed = parse_args(ARGS, #{
-    push: #{ type: "bool" },
-    segment: #{ type: "string", short: "s" },
-    count: #{ type: "int", default_val: 5 },
-});
-// parsed.args -> positional arguments
-// parsed.opts.push -> true/false
-// parsed.opts.segment -> string or ()
-// parsed.opts.count -> int (5 if not provided)
-```
-
-`--` stops option parsing; everything after it becomes positional. Unknown flags error.
-
-#### `print(msg)`
-
-Print to stdout.
-
-### `ws::` — workspace operations
-
-#### `ws_changes(workspace) -> Array`
-
-Get the list of commits/changes in a workspace (relative to its base branch).
-
-Returns an array of `{ id, summary }` maps.
-
-```rhai
-let changes = ws_changes("one");
-for c in changes {
-    print(`${c.id}: ${c.summary}`);
-}
-```
-
-## Community plugins
-
-Example plugins for common workflows live in `contrib/plugins/` in the
-[toren repo](https://github.com/anowell/toren). Install them with:
+Which delivery resolver to use is chosen by `[delivery] source` in config, or a per-workspace
+`delivery` annotation; with exactly one installed, breq uses it. See
+[configuration.md](configuration.md).
+
+## Managing plugins
 
 ```sh
-breq plugin list                    # see what's available
-breq plugin install commands/abort  # fetch from the repo
-breq plugin install tasks/linear    # ...or any other plugin
+breq plugin list                    # installed + available across all three families
+breq plugin install tasks/linear    # fetch a resolver from the contrib repo
+breq plugin install agents/codex    # ...or an agent, or delivery/<forge>
+breq plugin install ./my/tasks/custom.rhai   # ...or from a local path
 ```
 
-You can also install from a local file (e.g. during plugin development):
+`breq plugin install` resolves a local path first, otherwise fetches from `contrib/plugins/` in the
+[toren repo](https://github.com/anowell/toren). For a local file, the **parent directory name**
+(`tasks`, `agents`, or `delivery`) determines the family it installs into.
 
-```sh
-breq plugin install ./my-plugin/tasks/custom.rhai
-```
+## Workflow verbs are shell scripts, not plugins
 
-`breq plugin install` resolves a local path first, falling back to the remote
-contrib directory. The parent directory name (`commands/` or `tasks/`)
-determines the installed category.
+Multi-step workflows — "ship this", "hand it back", "open a PR" — are **not** Rhai plugins. They are
+ordinary shell scripts dispatched git-style: `breq <name>` with an unknown verb runs a `breq-<name>`
+script found on your `PATH` or in `~/.toren/bin`.
 
-### `assign`
+`breq init` installs the shipped defaults, which are *task verbs* — they update your tracker over the
+place/task surface (`breq get`, `breq set task.*`) and never tear the workspace down:
 
-Claims a task and starts a coding agent session. Source-agnostic — delegates to task resolver plugins for status updates.
+| Script | What it does |
+|--------|--------------|
+| `breq-complete` | Marks each linked task done (per-tracker status strings). No teardown, no push. |
+| `breq-abort` | Reopens each linked task and drops its assignee. |
+| `breq-submit` | Pushes, opens a PR, marks tasks in-review. Installed when `breq init` detects github + `gh`. |
 
-```
-breq assign <task-id> [--intent <name>]
-```
+These are yours to edit — the per-tracker status values in them are defaults, not a vocabulary breq
+imposes. Because completing a task and tearing down its place are separate axes, none of these delete
+the workspace; when you're done with the place, `breq teardown <ws>`.
 
-Options: `--intent` / `-i` — intent template to use as system prompt (e.g., "act", "plan")
-
-1. Resolves task fields via `task::info(id)`
-2. Claims the task via `task::claim(source, id, assignee)`
-3. Returns a deferred action to start a coding agent session
-
-### `complete`
-
-Cleans workspace, pushes changes, and closes the task.
-
-```
-breq complete <workspace>
-```
-
-1. Resolves workspace to its active assignment
-2. Cleans workspace (auto-commit, push, kill processes)
-3. Closes the task via `task::complete(source, id)`
-
-### `abort`
-
-Cleans workspace and reopens the task.
-
-```
-breq abort <workspace>
-```
-
-1. Resolves workspace to its active assignment
-2. Cleans workspace (kill processes, no push)
-3. Reopens the task via `task::abort(source, id)`
-
-## Daemon API
-
-The daemon exposes a plugin action endpoint:
-
-```
-POST /api/assignments/:id/action/:plugin_name
-Body: { "args": ["arg1", "arg2"] }
-```
-
-Returns `{ success: true }` or `{ success: true, action: { type: "do", ... } }` for deferred actions. The daemon can't exec into Claude, so callers handle deferred actions themselves.
+> The old model had `commands/` Rhai plugins (`assign`, `complete`, `abort`) and a `DeferredAction`
+> protocol for scripts that needed to start an agent. Those are gone. `assign` is now `breq do <task>`
+> directly; `complete`/`abort` are the shell scripts above.

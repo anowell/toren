@@ -93,40 +93,28 @@ pub struct ResolvedTask {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
 }
 
-/// Generate a prompt from a task using the provided template.
-/// Supports minijinja variables: task.id, task.title, plus any ws/repo context if provided.
-/// Falls back to simple string replacement for backwards compatibility with {{task_id}}.
-pub fn generate_prompt(task: &ResolvedTask, template: &str) -> String {
-    let ctx = crate::workspace_setup::WorkspaceContext {
-        ws: crate::workspace_setup::WorkspaceInfo {
-            name: String::new(),
-            num: 0,
-            path: String::new(),
-        },
-        repo: crate::workspace_setup::RepoInfo {
-            root: String::new(),
-            name: String::new(),
-        },
-        vars: std::collections::HashMap::new(),
-        task: Some(crate::workspace_setup::TaskInfo {
-            id: task.id.clone(),
-            title: task.title.clone(),
-            description: task.description.clone(),
-            url: None,
-            source: Some(task.source.clone()),
-        }),
-    };
-    crate::workspace_setup::render_template(template, &ctx).unwrap_or_else(|_| {
-        // Fallback to simple replacement for backwards compatibility
-        template
-            .replace("{{task_id}}", &task.id)
-            .replace("{{task_provider}}", &task.source)
-    })
+/// Split a `source:id` task link into its parts.
+///
+/// Task links are annotations, so they must round-trip through a text file and a shell
+/// script unchanged — hence the flat `source:id` form rather than a nested object.
+pub fn split_link(link: &str) -> Option<(String, String)> {
+    let (source, id) = link.split_once(':')?;
+    if source.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some((source.to_string(), id.to_string()))
+}
+
+/// Join a source and id into a task link.
+pub fn format_link(source: &str, id: &str) -> String {
+    format!("{}:{}", source, id)
 }
 
 #[cfg(test)]
@@ -207,6 +195,17 @@ mod tests {
         let result = infer_task_fields(None, None, None, None);
         assert!(result.task_id.is_none());
         assert!(result.task_source.is_none());
+    }
+
+    #[test]
+    fn test_links_round_trip() {
+        assert_eq!(
+            split_link("runes:tor-bau"),
+            Some(("runes".to_string(), "tor-bau".to_string()))
+        );
+        assert_eq!(format_link("runes", "tor-bau"), "runes:tor-bau");
+        assert!(split_link("no-source").is_none());
+        assert!(split_link("runes:").is_none());
     }
 
     #[test]

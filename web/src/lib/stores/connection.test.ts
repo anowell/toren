@@ -24,15 +24,13 @@ vi.mock('./toren', async () => {
 		error: null,
 		sessionToken: null,
 		shipUrl: 'http://localhost:8787',
-		ancillaries: [],
-		assignments: [],
+		workspaces: [],
 		messages: [],
 		segments: [],
 		segmentRoots: [],
 		selectedSegment: null,
-		selectedAncillary: null,
 		loadingSegments: false,
-		loadingAssignments: false,
+		loadingWorkspaces: false,
 	};
 
 	const { subscribe, set, update } = svelteStore.writable(initialState);
@@ -44,8 +42,7 @@ vi.mock('./toren', async () => {
 		get: () => svelteStore.get({ subscribe }),
 		reset: () => set({ ...initialState }),
 		loadSegments: vi.fn().mockResolvedValue(undefined),
-		loadAssignments: vi.fn().mockResolvedValue(undefined),
-		loadAncillaries: vi.fn().mockResolvedValue(undefined),
+		loadWorkspaces: vi.fn().mockResolvedValue(undefined),
 		selectSegment: vi.fn(),
 	};
 

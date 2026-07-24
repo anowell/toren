@@ -17,69 +17,112 @@ export interface VcsStatus {
 	deleted: string[];
 }
 
-export type AncillaryStatus = 'idle' | 'connected' | 'executing';
+// ── Workspace ("place") model ──────────────────────────────────────────────
 
-export type AncillaryDisplayStatus = 'busy' | 'ready';
+/** Session pane status reported by rmux. */
+export type SessionStatus = 'idle' | 'running' | 'exited';
 
-export type BeadDisplayStatus = 'open' | 'in_progress' | 'closed';
+/** How we summarize a workspace for list/dot rendering. */
+export type WorkspaceDisplayStatus = 'busy' | 'ready';
 
-export type BeadStatus = 'open' | 'in_progress' | 'closed';
+/** Normalized task status used to pick an icon. Native provider status is pass-through. */
+export type TaskDisplayStatus = 'open' | 'in_progress' | 'closed';
 
-export type AgentActivity = 'busy' | 'idle';
+export interface SessionInfo {
+	window: string;
+	status: SessionStatus;
+	command: string;
+	/** Optional agent-provided activity string (e.g. "thinking"). */
+	agent_activity?: string | null;
+}
 
-export interface Ancillary {
+export interface CommitInfo {
 	id: string;
-	segment: string;
-	status: AncillaryStatus;
-	last_active: string;
+	summary: string;
 }
 
-export type AssignmentStatus = 'active';
-
-export interface AssignmentSource {
-	type: 'Reference' | 'Bead' | 'Prompt';
-	original_prompt?: string;
-}
-
-export interface Assignment {
+export interface PrInfo {
+	branch: string;
 	id: string;
-	ancillary_id: string;
-	/** Task identifier (e.g., bead ID). Canonical field. */
-	task_id?: string;
-	/** @deprecated Use task_id */
-	external_id?: string;
-	/** @deprecated Use task_id */
-	bead_id?: string;
-	segment: string;
-	workspace_path: string;
-	source: AssignmentSource;
-	status: AssignmentStatus;
-	created_at: string;
-	updated_at: string;
-	/** Task display title. Canonical field. */
-	task_title?: string;
-	/** @deprecated Use task_title */
-	title?: string;
-	/** @deprecated Use task_title */
-	bead_title?: string;
-	/** Task URL */
-	task_url?: string;
-	/** Task source (e.g., "beads") */
-	task_source?: string;
-	session_id?: string;
-	ancillary_num?: number;
-	// Composite status signals (from API enrichment)
-	agent_activity?: AgentActivity;
-	has_changes?: boolean;
-	/** Task status from provider */
-	task_status?: BeadStatus;
-	/** @deprecated Use task_status */
-	bead_status?: BeadStatus;
-	/** Task assignee from provider */
-	task_assignee?: string;
-	/** @deprecated Use task_assignee */
-	bead_assignee?: string;
+	url: string;
+	state: string;
+	ci: string;
 }
+
+export interface TaskView {
+	/** "source:id" link. */
+	link: string;
+	source: string;
+	id: string;
+	/** Task-source-owned, pass-through fields. */
+	title?: string | null;
+	status?: string | null;
+	assignee?: string | null;
+	url?: string | null;
+	error?: string | null;
+}
+
+/** Serialized `Sets` — the collected state around a workspace. */
+export interface Sets {
+	sessions: SessionInfo[];
+	changes: CommitInfo[];
+	branches: string[];
+	prs: PrInfo[];
+	prs_age?: string | null;
+	tasks: TaskView[];
+}
+
+/** A workspace/place as emitted by the daemon (mirrors `breq get <ws> --json`). */
+export interface WorkspaceView {
+	name: string;
+	segment: string;
+	uid?: string | null;
+	path: string;
+	title?: string | null;
+	base?: string | null;
+	parent?: string | null;
+	decorated: boolean;
+	vcs_tracked: boolean;
+	annotations: Record<string, unknown>;
+	sets: Sets;
+}
+
+export interface WorkspacesResponse {
+	workspaces: WorkspaceView[];
+	count: number;
+	segment?: string;
+}
+
+export interface WorkspaceResponse {
+	workspace: WorkspaceView;
+}
+
+export interface StartWorkspaceRequest {
+	agent?: string;
+	prompt?: string;
+	model?: string;
+	resume?: boolean;
+}
+
+export interface StartWorkspaceResponse {
+	success: boolean;
+	session: string;
+	/** The window that was started (e.g. "agent"). */
+	window?: string;
+}
+
+export interface StopWorkspaceResponse {
+	success: boolean;
+}
+
+export interface ShellWorkspaceResponse {
+	success: boolean;
+	session: string;
+	/** The name of the newly opened shell window (e.g. "shell-2"). */
+	window: string;
+}
+
+// ── Segments ───────────────────────────────────────────────────────────────
 
 export interface Segment {
 	name: string;
@@ -93,14 +136,14 @@ export interface SegmentsResponse {
 	count: number;
 }
 
-// WebSocket Request Types
+// ── Control-channel WebSocket ──────────────────────────────────────────────
+
 export type WsRequest =
-	| { type: 'Auth'; token: string; ancillary_id?: string; segment?: string }
+	| { type: 'Auth'; token: string; segment?: string }
 	| { type: 'Command'; request: { command: string; args: string[]; cwd?: string } }
 	| { type: 'FileRead'; path: string }
 	| { type: 'VcsStatus'; path: string };
 
-// WebSocket Response Types
 export type WsResponse =
 	| { type: 'AuthSuccess'; session_id: string }
 	| { type: 'AuthFailure'; reason: string }
@@ -109,17 +152,19 @@ export type WsResponse =
 	| { type: 'VcsStatus'; status: VcsStatus }
 	| { type: 'Error'; message: string };
 
-// Ancillary Terminal WebSocket (raw pane bytes both ways; JSON only for control)
-export type AncillaryWsRequest =
+// ── Terminal WebSocket (raw pane bytes both ways; JSON only for control) ─────
+
+export type TerminalWsRequest =
 	| { type: 'data'; data: string }
 	| { type: 'resize'; cols: number; rows: number }
 	| { type: 'interrupt' };
 
-export type AncillaryWsResponse =
+export type TerminalWsResponse =
 	| { type: 'status'; status: string; session: string }
 	| { type: 'error'; message: string };
 
-// REST API Types
+// ── REST auth ──────────────────────────────────────────────────────────────
+
 export interface PairRequest {
 	pairing_token: string;
 }
@@ -132,23 +177,4 @@ export interface PairResponse {
 export interface HealthResponse {
 	status: string;
 	version: string;
-}
-
-export interface CreateAssignmentRequest {
-	prompt?: string;
-	task_id?: string;
-	/** @deprecated Use task_id */
-	bead_id?: string;
-	task_title?: string;
-	task_url?: string;
-	task_source?: string;
-	segment: string;
-}
-
-export interface AssignmentResponse {
-	assignment: Assignment;
-}
-
-export interface StartWorkRequest {
-	assignment_id: string;
 }

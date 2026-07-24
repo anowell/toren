@@ -1,0 +1,241 @@
+//! Choosing and launching a coding agent.
+//!
+//! Everything agent-specific lives in an agent resolver plugin: how to build argv, and how to
+//! read the agent's own session state. This module is the thin Rust side — which agent, which
+//! model, and handing the resulting argv to rmux (or exec).
+//!
+//! Adding an agent is one `.rhai` file, no release.
+
+use anyhow::{Context, Result};
+use std::fmt;
+use std::path::Path;
+
+use crate::plugins::PluginManager;
+
+/// An agent plus an optional model override, e.g. `claude:opus` or `codex:o3`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSpec {
+    pub name: String,
+    pub model: Option<String>,
+}
+
+impl AgentSpec {
+    /// Parse `"claude"` or `"claude:opus"`.
+    pub fn parse(s: &str) -> Self {
+        match s.split_once(':') {
+            Some((name, model)) if !model.is_empty() => Self {
+                name: name.to_string(),
+                model: Some(model.to_string()),
+            },
+            _ => Self {
+                name: s.trim_end_matches(':').to_string(),
+                model: None,
+            },
+        }
+    }
+
+    /// Resolve which agent to use.
+    ///
+    /// Priority: explicit request > the workspace's own last agent > config > first installed
+    /// agent whose binary is on PATH. The workspace annotation sits high on purpose — coming
+    /// back to a workspace should reach the agent that has the session history there.
+    ///
+    /// An explicit request for an unknown agent is an error the user should see. A *stored*
+    /// choice that no longer resolves (a stale annotation, a removed plugin) is not — it falls
+    /// through to the next source rather than wedging the workspace.
+    pub fn resolve(
+        plugins: &PluginManager,
+        requested: Option<&str>,
+        workspace_agent: Option<&str>,
+        configured: Option<&str>,
+    ) -> Result<Self> {
+        if let Some(requested) = requested {
+            let spec = Self::parse(requested);
+            if !plugins.has_agent(&spec.name) {
+                anyhow::bail!(
+                    "Unknown agent '{}'. Installed: {}. Add one at \
+                     ~/.toren/plugins/agents/{}.rhai",
+                    spec.name,
+                    plugins.list_agents().join(", "),
+                    spec.name
+                );
+            }
+            return Ok(spec);
+        }
+
+        for stored in [workspace_agent, configured].into_iter().flatten() {
+            let spec = Self::parse(stored);
+            if plugins.has_agent(&spec.name) {
+                return Ok(spec);
+            }
+            tracing::warn!(
+                "Stored agent '{}' is not installed; falling back",
+                spec.name
+            );
+        }
+
+        Self::detect(plugins)
+    }
+
+    /// First installed agent whose binary is on PATH.
+    pub fn detect(plugins: &PluginManager) -> Result<Self> {
+        for name in plugins.list_agents() {
+            let spec = Self::parse(name);
+            if let Ok(binary) = spec.binary(plugins) {
+                if which::which(&binary).is_ok() {
+                    return Ok(spec);
+                }
+            }
+        }
+        anyhow::bail!(
+            "No coding agent found on PATH. Installed agent plugins: {}",
+            plugins.list_agents().join(", ")
+        )
+    }
+
+    /// The program an agent launches, taken from its own argv contract.
+    pub fn binary(&self, plugins: &PluginManager) -> Result<String> {
+        let argv = plugins
+            .agent_argv(&self.name, self.ctx_map(None, false, None))
+            .with_context(|| format!("Agent '{}' failed to build argv", self.name))?;
+        Ok(argv[0].clone())
+    }
+
+    /// Full argv for a fresh run.
+    pub fn argv(
+        &self,
+        plugins: &PluginManager,
+        prompt: Option<&str>,
+        auto_approve: bool,
+    ) -> Result<Vec<String>> {
+        plugins.agent_argv(&self.name, self.ctx_map(prompt, auto_approve, None))
+    }
+
+    /// Full argv for resuming the workspace's previous session, when the agent can find one.
+    pub fn resume_argv(
+        &self,
+        plugins: &PluginManager,
+        ws_path: &Path,
+        prompt: Option<&str>,
+        auto_approve: bool,
+    ) -> Result<Vec<String>> {
+        let session_id = plugins.agent_session_id(&self.name, ws_path);
+        plugins.agent_resume_argv(
+            &self.name,
+            self.ctx_map(prompt, auto_approve, session_id.as_deref()),
+        )
+    }
+
+    fn ctx_map(
+        &self,
+        prompt: Option<&str>,
+        auto_approve: bool,
+        session_id: Option<&str>,
+    ) -> rhai::Map {
+        let mut map = rhai::Map::new();
+        map.insert(
+            "prompt".into(),
+            match prompt {
+                Some(p) => rhai::Dynamic::from(p.to_string()),
+                None => rhai::Dynamic::UNIT,
+            },
+        );
+        map.insert(
+            "model".into(),
+            match &self.model {
+                Some(m) => rhai::Dynamic::from(m.clone()),
+                None => rhai::Dynamic::UNIT,
+            },
+        );
+        map.insert("auto_approve".into(), rhai::Dynamic::from(auto_approve));
+        map.insert(
+            "session_id".into(),
+            match session_id {
+                Some(s) => rhai::Dynamic::from(s.to_string()),
+                None => rhai::Dynamic::UNIT,
+            },
+        );
+        map
+    }
+
+    /// How this agent is written back into the workspace's annotations.
+    pub fn annotation(&self) -> String {
+        match &self.model {
+            Some(model) => format!("{}:{}", self.name, model),
+            None => self.name.clone(),
+        }
+    }
+}
+
+impl fmt::Display for AgentSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name)?;
+        if let Some(model) = &self.model {
+            write!(f, " ({})", model)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plugins() -> PluginManager {
+        PluginManager::new(Path::new("/nonexistent")).unwrap()
+    }
+
+    #[test]
+    fn parses_model_suffix() {
+        assert_eq!(
+            AgentSpec::parse("claude:opus"),
+            AgentSpec {
+                name: "claude".into(),
+                model: Some("opus".into())
+            }
+        );
+        assert_eq!(
+            AgentSpec::parse("codex"),
+            AgentSpec {
+                name: "codex".into(),
+                model: None
+            }
+        );
+    }
+
+    #[test]
+    fn resolution_prefers_the_explicit_request() {
+        let plugins = plugins();
+        let spec = AgentSpec::resolve(&plugins, Some("codex"), Some("claude"), Some("pi")).unwrap();
+        assert_eq!(spec.name, "codex");
+    }
+
+    #[test]
+    fn resolution_falls_back_to_the_workspace_agent() {
+        let plugins = plugins();
+        let spec = AgentSpec::resolve(&plugins, None, Some("claude:opus"), Some("pi")).unwrap();
+        assert_eq!(spec.name, "claude");
+        assert_eq!(spec.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn unknown_agents_name_where_to_add_one() {
+        let plugins = plugins();
+        let err = AgentSpec::resolve(&plugins, Some("nope"), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plugins/agents/nope.rhai"), "{}", err);
+    }
+
+    #[test]
+    fn argv_comes_from_the_plugin() {
+        let plugins = plugins();
+        let spec = AgentSpec::parse("claude:opus");
+        assert_eq!(
+            spec.argv(&plugins, Some("go"), false).unwrap(),
+            vec!["claude", "--model", "opus", "go"]
+        );
+        assert_eq!(spec.binary(&plugins).unwrap(), "claude");
+        assert_eq!(spec.annotation(), "claude:opus");
+    }
+}

@@ -45,8 +45,8 @@ async function handlePair() {
 			connecting: false,
 		}));
 
-		// Load segments and assignments
-		await Promise.all([torenStore.loadSegments(shipUrl), torenStore.loadAssignments(shipUrl)]);
+		// Load segments and workspaces
+		await Promise.all([torenStore.loadSegments(shipUrl), torenStore.loadWorkspaces(shipUrl)]);
 
 		// Restore selected segment from localStorage
 		const savedSegment = localStorage.getItem('toren_selected_segment');

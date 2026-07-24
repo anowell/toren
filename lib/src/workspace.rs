@@ -74,7 +74,7 @@ pub fn detect_repo_type(path: &Path) -> Option<RepoType> {
 }
 
 /// A commit in a workspace
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommitInfo {
     /// Commit/change identifier (commit_id for git, change_id for jj)
     pub id: String,
@@ -89,6 +89,21 @@ pub enum CleanupMode {
     Abort,
 }
 
+/// What a new workspace forks from.
+#[derive(Debug, Clone, Default)]
+pub enum WorkspaceOrigin {
+    /// The segment's current tip — the ordinary case.
+    #[default]
+    Tip,
+    /// Another workspace, for stacked work: `breq setup --from one`.
+    Stacked {
+        /// Parent workspace name (also the git branch name).
+        parent: String,
+        /// Parent's working-copy revision, resolved at fork time.
+        revision: String,
+    },
+}
+
 /// VCS-specific workspace operations.
 ///
 /// Implemented by JjBackend and GitWorktreeBackend.
@@ -97,12 +112,16 @@ pub trait VcsBackend: Send + Sync {
     /// Repository type this backend handles
     fn repo_type(&self) -> RepoType;
 
-    /// Create a VCS workspace at the given path
+    /// Create a VCS workspace at the given path.
+    ///
+    /// `origin` decides what it forks from: the segment's current tip, or another workspace
+    /// (stacking — the child's work sits on top of the parent's, still in flight).
     fn create_workspace(
         &self,
         segment_path: &Path,
         workspace_path: &Path,
         workspace_name: &str,
+        origin: &WorkspaceOrigin,
     ) -> Result<()>;
 
     /// Remove VCS tracking for a workspace.
@@ -131,6 +150,21 @@ pub trait VcsBackend: Send + Sync {
         workspace_path: &Path,
         base_ref: Option<&str>,
     ) -> Result<Vec<CommitInfo>>;
+
+    /// The commit this workspace was forked from, captured at setup.
+    ///
+    /// Annotated once and never recomputed: for a stacked workspace the fork point is at the
+    /// parent, which scopes the child's change set correctly for free — the parent's own work
+    /// sits behind the base.
+    fn base_revision(&self, workspace_path: &Path) -> Option<String>;
+
+    /// Non-empty commits between `base` and the working copy. An empty result means pristine.
+    fn changes_since(&self, workspace_path: &Path, base: &str) -> Vec<CommitInfo>;
+
+    /// Remote branches/bookmarks that contain this workspace's work.
+    ///
+    /// Derived from the VCS only — no forge API, so this stays fast and offline.
+    fn remote_branches(&self, workspace_path: &Path) -> Vec<String>;
 
     /// Push workspace changes to remote
     fn push(&self, workspace_path: &Path) -> Result<()>;
@@ -163,6 +197,7 @@ impl VcsBackend for JjBackend {
         segment_path: &Path,
         workspace_path: &Path,
         workspace_name: &str,
+        origin: &WorkspaceOrigin,
     ) -> Result<()> {
         info!(
             "Creating jj workspace '{}' at {} (from {})",
@@ -171,8 +206,14 @@ impl VcsBackend for JjBackend {
             segment_path.display()
         );
 
+        let mut args = vec!["workspace", "add", "--name", workspace_name];
+        if let WorkspaceOrigin::Stacked { revision, .. } = origin {
+            args.push("--revision");
+            args.push(revision);
+        }
+
         let output = Command::new("jj")
-            .args(["workspace", "add", "--name", workspace_name])
+            .args(&args)
             .arg(workspace_path)
             .current_dir(segment_path)
             .output()
@@ -286,6 +327,97 @@ impl VcsBackend for JjBackend {
             .collect();
 
         Ok(commits)
+    }
+
+    fn base_revision(&self, workspace_path: &Path) -> Option<String> {
+        // `jj workspace add` leaves an empty working-copy commit; its parent is the fork point.
+        let output = Command::new("jj")
+            .args([
+                "log",
+                "-r",
+                "@-",
+                "--no-graph",
+                "-T",
+                r#"commit_id ++ "\n""#,
+            ])
+            .current_dir(workspace_path)
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn changes_since(&self, workspace_path: &Path, base: &str) -> Vec<CommitInfo> {
+        let revset = format!("{}..@ ~ empty()", base);
+        let output = Command::new("jj")
+            .args([
+                "log",
+                "-r",
+                &revset,
+                "--no-graph",
+                "-T",
+                r#"change_id.short() ++ " " ++ description.first_line() ++ "\n""#,
+            ])
+            .current_dir(workspace_path)
+            .output()
+            .ok();
+
+        let Some(output) = output else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let (id, summary) = line.split_once(' ').unwrap_or((line, ""));
+                CommitInfo {
+                    id: id.to_string(),
+                    summary: summary.trim().to_string(),
+                }
+            })
+            .collect()
+    }
+
+    fn remote_branches(&self, workspace_path: &Path) -> Vec<String> {
+        let output = Command::new("jj")
+            .args([
+                "log",
+                "-r",
+                "::@ & remote_bookmarks()",
+                "--no-graph",
+                "-T",
+                r#"remote_bookmarks ++ "\n""#,
+            ])
+            .current_dir(workspace_path)
+            .output()
+            .ok();
+
+        let Some(output) = output else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+
+        let mut branches: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        branches.sort();
+        branches.dedup();
+        branches
     }
 
     fn push(&self, workspace_path: &Path) -> Result<()> {
@@ -502,6 +634,7 @@ impl VcsBackend for GitWorktreeBackend {
         segment_path: &Path,
         workspace_path: &Path,
         workspace_name: &str,
+        origin: &WorkspaceOrigin,
     ) -> Result<()> {
         info!(
             "Creating git worktree '{}' at {} (from {})",
@@ -509,6 +642,29 @@ impl VcsBackend for GitWorktreeBackend {
             workspace_path.display(),
             segment_path.display()
         );
+
+        if let WorkspaceOrigin::Stacked { parent, .. } = origin {
+            if !self.branch_exists(segment_path, workspace_name) {
+                // Branch off the parent's branch, so the child stacks on in-flight work.
+                let output = Command::new("git")
+                    .args(["worktree", "add", "-b", workspace_name])
+                    .arg(workspace_path)
+                    .arg(parent)
+                    .current_dir(segment_path)
+                    .output()
+                    .with_context(|| "Failed to execute git worktree add")?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    anyhow::bail!(
+                        "git worktree add (stacked on '{}') failed: {}",
+                        parent,
+                        stderr
+                    );
+                }
+                return Ok(());
+            }
+        }
 
         if self.branch_exists(segment_path, workspace_name) {
             // Attach to existing branch
@@ -699,6 +855,66 @@ impl VcsBackend for GitWorktreeBackend {
             .collect();
 
         Ok(commits)
+    }
+
+    fn base_revision(&self, workspace_path: &Path) -> Option<String> {
+        // A fresh worktree sits exactly on its fork point.
+        self.capture_revision(workspace_path)
+    }
+
+    fn changes_since(&self, workspace_path: &Path, base: &str) -> Vec<CommitInfo> {
+        let range = format!("{}..HEAD", base);
+        let output = Command::new("git")
+            .args(["log", &range, "--format=%H %s"])
+            .current_dir(workspace_path)
+            .output()
+            .ok();
+
+        let Some(output) = output else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let (id, summary) = line.split_once(' ').unwrap_or((line, ""));
+                CommitInfo {
+                    id: id.chars().take(12).collect(),
+                    summary: summary.trim().to_string(),
+                }
+            })
+            .collect()
+    }
+
+    fn remote_branches(&self, workspace_path: &Path) -> Vec<String> {
+        let output = Command::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "--contains",
+                "HEAD",
+                "refs/remotes",
+            ])
+            .current_dir(workspace_path)
+            .output()
+            .ok();
+
+        let Some(output) = output else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
+            .collect()
     }
 
     fn push(&self, workspace_path: &Path) -> Result<()> {
@@ -943,6 +1159,7 @@ impl WorkspaceManager {
         segment_path: &Path,
         segment_name: &str,
         workspace_name: &str,
+        origin: &WorkspaceOrigin,
     ) -> Result<PathBuf> {
         let ws_path = self.workspace_path(segment_name, workspace_name);
         let backend = self.backend_for(segment_path);
@@ -987,10 +1204,37 @@ impl WorkspaceManager {
         }
 
         // Create VCS workspace
-        backend.create_workspace(segment_path, &ws_path, workspace_name)?;
+        backend.create_workspace(segment_path, &ws_path, workspace_name, origin)?;
 
         info!("Created workspace at {}", ws_path.display());
         Ok(ws_path)
+    }
+
+    /// The commit a workspace was forked from, as seen right now.
+    pub fn base_revision(&self, segment_path: &Path, workspace_path: &Path) -> Option<String> {
+        self.backend_for(segment_path).base_revision(workspace_path)
+    }
+
+    /// Non-empty commits in a workspace since its annotated base.
+    pub fn changes_since(
+        &self,
+        segment_path: &Path,
+        workspace_path: &Path,
+        base: &str,
+    ) -> Vec<CommitInfo> {
+        self.backend_for(segment_path)
+            .changes_since(workspace_path, base)
+    }
+
+    /// Remote branches carrying this workspace's work.
+    pub fn remote_branches(&self, segment_path: &Path, workspace_path: &Path) -> Vec<String> {
+        self.backend_for(segment_path)
+            .remote_branches(workspace_path)
+    }
+
+    /// Resolve the revision a stacked child should fork from: the parent's working copy.
+    pub fn fork_point(&self, segment_path: &Path, parent_path: &Path) -> Option<String> {
+        self.backend_for(segment_path).capture_revision(parent_path)
     }
 
     /// Delete a workspace directory (after VCS tracking is removed).
@@ -1035,6 +1279,21 @@ impl WorkspaceManager {
         workspace_name: &str,
         mode: CleanupMode,
     ) -> Result<SetupResult> {
+        self.teardown_workspace(segment_path, segment_name, workspace_name, mode, true)
+    }
+
+    /// Tear a workspace down: destroy hooks, then optionally VCS deregistration + deletion.
+    ///
+    /// `delete = false` runs the hooks and leaves the working copy and its VCS registration in
+    /// place — the exact inverse of adopting a working copy with an in-place `breq setup`.
+    pub fn teardown_workspace(
+        &self,
+        segment_path: &Path,
+        segment_name: &str,
+        workspace_name: &str,
+        mode: CleanupMode,
+        delete: bool,
+    ) -> Result<SetupResult> {
         let ws_path = self.workspace_path(segment_name, workspace_name);
 
         // Run destroy hooks. toren.kdl lives at the segment root, so destroy
@@ -1047,6 +1306,14 @@ impl WorkspaceManager {
             // + the source error), instead of just the outermost message.
             warn!("Workspace destroy hooks failed: {:#}", e);
             // Continue with cleanup even if destroy fails
+        }
+
+        if !delete {
+            debug!(
+                "Keeping working copy and VCS registration for '{}'",
+                workspace_name
+            );
+            return Ok(SetupResult);
         }
 
         // Remove VCS tracking (backend-specific behavior based on mode)
@@ -1070,26 +1337,34 @@ impl WorkspaceManager {
         ws_path.exists() && (ws_path.join(".jj").exists() || ws_path.join(".git").exists())
     }
 
-    /// Run workspace setup hooks if toren.kdl exists
+    /// Run workspace setup hooks if toren.kdl exists.
+    ///
+    /// `parent` is set for a stacked child, which selects the config's `fork` block (falling
+    /// back to `setup`) and exposes `{{ parent.path }}` so runtime state can be forked from
+    /// the parent workspace rather than rebuilt from the repo.
     pub fn run_setup(
         &self,
         segment_path: &Path,
         workspace_path: &Path,
         workspace_name: &str,
         ancillary_num: u32,
+        parent: Option<(&str, &Path)>,
     ) -> Result<SetupResult> {
         if !BreqConfig::exists(segment_path) {
             debug!("No toren.kdl found, skipping setup");
             return Ok(SetupResult);
         }
 
-        let setup = WorkspaceSetup::new(
+        let mut setup = WorkspaceSetup::new(
             segment_path.to_path_buf(),
             workspace_path.to_path_buf(),
             workspace_name.to_string(),
             ancillary_num,
             self.local_domain.clone(),
         );
+        if let Some((name, path)) = parent {
+            setup = setup.with_parent(name, path);
+        }
 
         setup.run_setup()
     }
@@ -1125,11 +1400,27 @@ impl WorkspaceManager {
         segment_name: &str,
         workspace_name: &str,
         ancillary_num: u32,
+        origin: &WorkspaceOrigin,
     ) -> Result<(PathBuf, SetupResult)> {
-        let ws_path = self.create_workspace(segment_path, segment_name, workspace_name)?;
+        let ws_path = self.create_workspace(segment_path, segment_name, workspace_name, origin)?;
+
+        let parent_path;
+        let parent = match origin {
+            WorkspaceOrigin::Stacked { parent, .. } => {
+                parent_path = self.workspace_path(segment_name, parent);
+                Some((parent.as_str(), parent_path.as_path()))
+            }
+            WorkspaceOrigin::Tip => None,
+        };
 
         // Run setup hooks if toren.kdl exists - fail if setup fails
-        match self.run_setup(segment_path, &ws_path, workspace_name, ancillary_num) {
+        match self.run_setup(
+            segment_path,
+            &ws_path,
+            workspace_name,
+            ancillary_num,
+            parent,
+        ) {
             Ok(setup_result) => Ok((ws_path, setup_result)),
             Err(e) => {
                 // Rollback: remove VCS tracking + delete the partially-created workspace
@@ -1257,7 +1548,7 @@ mod tests {
         // Create a worktree
         let ws_path = tmp.path().join("ws-one");
         backend
-            .create_workspace(&repo_path, &ws_path, "one")
+            .create_workspace(&repo_path, &ws_path, "one", &WorkspaceOrigin::Tip)
             .expect("Should create worktree");
 
         // Verify worktree exists and is valid
@@ -1307,7 +1598,7 @@ mod tests {
         // Create again and cleanup with complete+pushed (branch deleted)
         let ws_path2 = tmp.path().join("ws-two");
         backend
-            .create_workspace(&repo_path, &ws_path2, "two")
+            .create_workspace(&repo_path, &ws_path2, "two", &WorkspaceOrigin::Tip)
             .expect("Should create worktree");
         backend
             .remove_vcs_tracking(
@@ -1354,7 +1645,7 @@ mod tests {
 
         // Create workspace
         let ws_path = mgr
-            .create_workspace(&repo_path, "repo", "one")
+            .create_workspace(&repo_path, "repo", "one", &WorkspaceOrigin::Tip)
             .expect("Should create workspace");
         assert!(ws_path.exists());
 

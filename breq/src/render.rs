@@ -1,0 +1,281 @@
+//! Rendering the workspace join, at two zoom levels.
+//!
+//! `list` is a compact slice across every workspace; `get` is the same data in full for one.
+//! Both are views over [`Sets`] — there is no second read model, and no derived judgment about
+//! whether a workspace is "done". The drift you care about (task closed but workspace alive,
+//! changes never pushed, agent long since idle) is meant to be *readable* here, not computed.
+
+use anyhow::Result;
+use colored::Colorize;
+use serde_json::json;
+use toren_lib::{Place, PluginManager, Sets};
+
+/// One row per workspace.
+pub fn list(rows: &[(Place, Sets)], plugins: &PluginManager, show_segment: bool) {
+    let term_width = terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(100);
+
+    let cells: Vec<Row> = rows
+        .iter()
+        .map(|(place, sets)| Row {
+            name: if show_segment {
+                format!("{}/{}", place.segment, place.name)
+            } else {
+                place.name.clone()
+            },
+            dirty: sets.has_changes(),
+            adoptable: !place.is_decorated(),
+            age: place.age_label(),
+            sessions: sets.session_summary(),
+            changes: if sets.changes.is_empty() {
+                "-".to_string()
+            } else {
+                sets.changes.len().to_string()
+            },
+            delivery: sets.delivery_summary(),
+            tasks: sets.task_summary(),
+            title: sets.title(place, plugins).unwrap_or_else(|| {
+                if !place.is_decorated() {
+                    "(undecorated — `breq setup <name>` adopts it)".to_string()
+                } else {
+                    String::new()
+                }
+            }),
+        })
+        .collect();
+
+    let w_name = width(cells.iter().map(|c| c.name.len() + 2), 9);
+    let w_age = width(cells.iter().map(|c| c.age.len()), 3);
+    let w_sessions = width(cells.iter().map(|c| c.sessions.len()), 8);
+    let w_changes = width(cells.iter().map(|c| c.changes.len()), 3);
+    let w_delivery = width(cells.iter().map(|c| c.delivery.len()), 8);
+    let w_tasks = width(cells.iter().map(|c| c.tasks.len()), 5);
+
+    let fixed = w_name + w_age + w_sessions + w_changes + w_delivery + w_tasks + 6;
+    let w_title = term_width.saturating_sub(fixed).max(10);
+
+    println!(
+        "{}",
+        format!(
+            "{:<w_name$} {:<w_age$} {:<w_sessions$} {:<w_changes$} {:<w_delivery$} {:<w_tasks$} {}",
+            "WORKSPACE",
+            "AGE",
+            "SESSIONS",
+            "CHG",
+            "DELIVERY",
+            "TASKS",
+            "TITLE",
+            w_name = w_name,
+            w_age = w_age,
+            w_sessions = w_sessions,
+            w_changes = w_changes,
+            w_delivery = w_delivery,
+            w_tasks = w_tasks,
+        )
+        .dimmed()
+    );
+
+    for cell in &cells {
+        let name = if cell.dirty {
+            format!("{} *", cell.name)
+        } else {
+            cell.name.clone()
+        };
+        let name = format!("{:<w_name$}", name, w_name = w_name);
+        let name = if cell.adoptable {
+            name.dimmed()
+        } else if cell.dirty {
+            name.yellow()
+        } else {
+            name.normal()
+        };
+
+        println!(
+            "{} {:<w_age$} {:<w_sessions$} {:<w_changes$} {:<w_delivery$} {:<w_tasks$} {}",
+            name,
+            cell.age,
+            cell.sessions,
+            cell.changes,
+            cell.delivery,
+            cell.tasks,
+            truncate(&cell.title, w_title),
+            w_age = w_age,
+            w_sessions = w_sessions,
+            w_changes = w_changes,
+            w_delivery = w_delivery,
+            w_tasks = w_tasks,
+        );
+    }
+}
+
+struct Row {
+    name: String,
+    dirty: bool,
+    adoptable: bool,
+    age: String,
+    sessions: String,
+    changes: String,
+    delivery: String,
+    tasks: String,
+    title: String,
+}
+
+fn width(lens: impl Iterator<Item = usize>, min: usize) -> usize {
+    lens.max().unwrap_or(min).max(min)
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    if max <= 3 {
+        return text.chars().take(max).collect();
+    }
+    let head: String = text.chars().take(max - 1).collect();
+    format!("{}…", head)
+}
+
+/// Every set, in full, for one workspace.
+pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
+    let header = match place.uid() {
+        Some(uid) => format!("{}  {}  {}", place.name, place.segment, uid),
+        None => format!("{}  {}  (undecorated)", place.name, place.segment),
+    };
+    println!("{}", header.bold());
+
+    field("path", &place.path.display().to_string());
+    if let Some(title) = sets.title(place, plugins) {
+        field("title", &title);
+    }
+    if let Some(base) = place.base() {
+        field("base", &base);
+    }
+    if let Some(parent) = place.parent() {
+        field("parent", &parent);
+    }
+    if let Some(agent) = place.annotations.get_str("agent") {
+        field("agent", &agent);
+    }
+    field("age", &place.age_label());
+    field("session", &place.session_name());
+    if !place.vcs_tracked {
+        field("vcs", "untracked (prunable with `breq cleanup`)");
+    }
+
+    section("sessions", sets.sessions.len());
+    for session in &sets.sessions {
+        let activity = match &session.agent_activity {
+            Some(activity) => format!("  agent:{}", activity),
+            None => String::new(),
+        };
+        println!(
+            "  {:<8} {:<8} {}{}",
+            session.window, session.status, session.command, activity
+        );
+    }
+
+    section("changes", sets.changes.len());
+    for commit in &sets.changes {
+        println!("  {} {}", commit.id, commit.summary);
+    }
+
+    section("remote branches", sets.branches.len());
+    for branch in &sets.branches {
+        println!("  {}", branch);
+    }
+
+    let pr_label = match &sets.prs_age {
+        Some(age) => format!("pull requests (cached {})", age),
+        None => "pull requests".to_string(),
+    };
+    section(&pr_label, sets.prs.len());
+    for pr in &sets.prs {
+        let ci = if pr.ci.is_empty() {
+            String::new()
+        } else {
+            format!("  ci:{}", pr.ci)
+        };
+        println!("  {:<6} {:<8}{}  {}", pr.id, pr.state, ci, pr.url);
+    }
+
+    section("tasks", sets.tasks.len());
+    for task in &sets.tasks {
+        match &task.error {
+            Some(error) => println!(
+                "  {}  {}",
+                task.link,
+                format!("unreadable: {}", error).red()
+            ),
+            None => println!(
+                "  {}  {:<12} {}",
+                task.link,
+                task.status.as_deref().unwrap_or("-"),
+                task.title.as_deref().unwrap_or("")
+            ),
+        }
+    }
+
+    let plugin_keys = place.annotations.plugin_keys();
+    if !plugin_keys.is_empty() {
+        section("annotations", plugin_keys.len());
+        for key in plugin_keys {
+            let value = place
+                .annotations
+                .get(key)
+                .and_then(toren_lib::annotations::value_to_string)
+                .unwrap_or_default();
+            println!("  {:<20} {}", key, value);
+        }
+    }
+}
+
+/// The same detail as JSON, for scripts that want the whole join at once.
+pub fn detail_json(place: &Place, sets: &Sets, plugins: &PluginManager) -> Result<String> {
+    let value = json!({
+        "name": place.name,
+        "segment": place.segment,
+        "uid": place.uid(),
+        "path": place.path,
+        "title": sets.title(place, plugins),
+        "base": place.base(),
+        "parent": place.parent(),
+        "decorated": place.is_decorated(),
+        "vcs_tracked": place.vcs_tracked,
+        "annotations": place.annotations.as_map(),
+        "sets": sets,
+    });
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
+fn field(name: &str, value: &str) {
+    println!("  {:<10} {}", name.dimmed(), value);
+}
+
+fn section(name: &str, count: usize) {
+    println!();
+    if count == 0 {
+        println!("{}", format!("{} (none)", name).dimmed());
+    } else {
+        println!("{}", format!("{} ({})", name, count).dimmed());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_marks_elision() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("a much longer title", 8), "a much …");
+        assert_eq!(truncate("abcdef", 2), "ab");
+    }
+
+    #[test]
+    fn width_respects_a_minimum() {
+        assert_eq!(width([1, 2, 3].into_iter(), 5), 5);
+        assert_eq!(width([9, 2].into_iter(), 5), 9);
+        assert_eq!(width(std::iter::empty(), 4), 4);
+    }
+}

@@ -1,22 +1,22 @@
 <script lang="ts">
 import { goto } from '$app/navigation';
 import { page } from '$app/stores';
-import BeadStatusIcon from '$lib/components/BeadStatusIcon.svelte';
+import TaskStatusIcon from '$lib/components/TaskStatusIcon.svelte';
 import {
-	getAncillaryDisplayStatus,
-	getBeadDisplayStatus,
-	getTaskId,
-	getTaskTitle,
-	segmentAssignments,
-	stripBeadPrefix,
+	getTaskDisplayStatus,
+	getWorkspaceDisplayStatus,
+	primaryTask,
+	segmentWorkspaces,
+	stripTaskPrefix,
 	torenStore,
 } from '$lib/stores/toren';
+import type { WorkspaceView } from '$lib/types/toren';
 
-// Load assignments when authenticated
-let assignmentsLoaded = false;
-$: if ($torenStore.authenticated && $torenStore.shipUrl && !assignmentsLoaded) {
-	assignmentsLoaded = true;
-	torenStore.loadAssignments($torenStore.shipUrl);
+// Load workspaces when authenticated
+let workspacesLoaded = false;
+$: if ($torenStore.authenticated && $torenStore.shipUrl && !workspacesLoaded) {
+	workspacesLoaded = true;
+	torenStore.loadWorkspaces($torenStore.shipUrl);
 }
 
 // Sync segment from URL to store
@@ -32,91 +32,49 @@ $: {
 	}
 }
 
-// Get current unit from URL (if any)
-$: currentUnit = $page.params.unit || null;
+// Current workspace name from URL (if any)
+$: currentName = $page.params.name || null;
 
-// Check if this is the "new ancillary" view
-$: isNewAncillary = !currentUnit;
-
-function navigateToAncillary(ancillaryId: string) {
-	// Extract unit number from ancillary ID (e.g., "Toren One" -> "one")
-	const parts = ancillaryId.split(' ');
-	const unit = parts[parts.length - 1].toLowerCase();
-	goto(`/a/${$page.params.segment}/${unit}`);
-}
-
-function navigateToNewAncillary() {
-	goto(`/a/${$page.params.segment}`);
-}
-
-function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment): 'busy' | 'ready' {
-	// Prefer composite signal from API
-	if (assignment.agent_activity === 'busy') return 'busy';
-	if (assignment.agent_activity === 'idle') return 'ready';
-	// Fallback to ancillary status
-	const ancillary = $torenStore.ancillaries.find((a) => a.id === assignment.ancillary_id);
-	if (!ancillary) return 'ready';
-	return getAncillaryDisplayStatus(ancillary.status);
+function navigateToWorkspace(ws: WorkspaceView) {
+	goto(`/a/${$page.params.segment}/${encodeURIComponent(ws.name)}`);
 }
 </script>
 
-<div class="ancillary-layout">
+<div class="workspace-layout">
 	<!-- Desktop sidebar -->
 	<aside class="desktop-sidebar">
 		<div class="panel-header">
-			<h3>Ancillaries</h3>
-			<span class="count">{$segmentAssignments.length}</span>
+			<h3>Workspaces</h3>
+			<span class="count">{$segmentWorkspaces.length}</span>
 		</div>
 
-		<div class="ancillary-list">
-			<!-- New Ancillary option -->
-			<button
-				class="ancillary-card new-ancillary"
-				class:selected={isNewAncillary}
-				on:click={navigateToNewAncillary}
-			>
-				<div class="card-header">
-					<span class="ancillary-name">
-						<svg
-							xmlns="http://www.w3.org/2000/svg"
-							width="16"
-							height="16"
-							viewBox="0 0 24 24"
-							fill="none"
-							stroke="currentColor"
-							stroke-width="2"
-							stroke-linecap="round"
-							stroke-linejoin="round"
-						>
-							<line x1="12" y1="5" x2="12" y2="19"></line>
-							<line x1="5" y1="12" x2="19" y2="12"></line>
-						</svg>
-						New Ancillary
-					</span>
-				</div>
-			</button>
-
-			{#each $segmentAssignments as assignment (assignment.id)}
-				{@const unitName = assignment.ancillary_id.split(' ').pop()?.toLowerCase()}
-				{@const agentStatus = lookupAgentActivity(assignment)}
-				{@const beadStatus = getBeadDisplayStatus(assignment)}
+		<div class="workspace-list">
+			{#each $segmentWorkspaces as ws (ws.name)}
+				{@const agentStatus = getWorkspaceDisplayStatus(ws)}
+				{@const task = primaryTask(ws)}
 				<button
-					class="ancillary-card"
-					class:selected={currentUnit === unitName}
-					on:click={() => navigateToAncillary(assignment.ancillary_id)}
+					class="workspace-card"
+					class:selected={currentName === ws.name}
+					on:click={() => navigateToWorkspace(ws)}
 				>
 					<div class="card-header">
-						<span class="ancillary-status-dot" class:busy={agentStatus === 'busy'} class:ready={agentStatus === 'ready'}></span>
-						<span class="ancillary-name">{assignment.ancillary_id}</span>
-						{#if assignment.has_changes}<span class="changes-indicator" title="Has uncommitted changes">*</span>{/if}
+						<span class="workspace-status-dot" class:busy={agentStatus === 'busy'} class:ready={agentStatus === 'ready'}></span>
+						<span class="workspace-name">{ws.name}</span>
+						{#if ws.sets.changes.length > 0}<span class="changes-indicator" title="Has uncommitted changes">*</span>{/if}
 					</div>
-					<div class="card-body">
-						<BeadStatusIcon status={beadStatus} />
-						<span class="bead-label">{stripBeadPrefix(getTaskId(assignment))}{#if getTaskTitle(assignment)}: {getTaskTitle(assignment)}{/if}</span>
-					</div>
-					{#if (assignment.task_assignee ?? assignment.bead_assignee)}
+					{#if task}
+						<div class="card-body">
+							<TaskStatusIcon status={getTaskDisplayStatus(task)} />
+							<span class="task-label">{stripTaskPrefix(task.id)}{#if task.title}: {task.title}{/if}</span>
+						</div>
+					{:else if ws.title}
+						<div class="card-body">
+							<span class="task-label">{ws.title}</span>
+						</div>
+					{/if}
+					{#if task?.assignee}
 						<div class="card-footer">
-							<span class="assignee-badge">@{assignment.task_assignee ?? assignment.bead_assignee}</span>
+							<span class="assignee-badge">@{task.assignee}</span>
 						</div>
 					{/if}
 				</button>
@@ -131,7 +89,7 @@ function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment):
 </div>
 
 <style>
-	.ancillary-layout {
+	.workspace-layout {
 		display: flex;
 		height: 100vh;
 		width: 100%;
@@ -180,7 +138,7 @@ function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment):
 		color: var(--color-text-secondary);
 	}
 
-	.ancillary-list {
+	.workspace-list {
 		flex: 1;
 		overflow-y: auto;
 		padding: var(--spacing-sm);
@@ -189,7 +147,7 @@ function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment):
 		gap: var(--spacing-xs);
 	}
 
-	.ancillary-card {
+	.workspace-card {
 		display: flex;
 		flex-direction: column;
 		gap: var(--spacing-xs);
@@ -202,25 +160,14 @@ function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment):
 		transition: all 0.15s ease;
 	}
 
-	.ancillary-card:hover {
+	.workspace-card:hover {
 		border-color: var(--color-primary);
 		background: var(--color-bg-tertiary);
 	}
 
-	.ancillary-card.selected {
+	.workspace-card.selected {
 		border-color: var(--color-primary);
 		background: var(--color-bg-tertiary);
-	}
-
-	.ancillary-card.new-ancillary {
-		border-style: dashed;
-	}
-
-	.ancillary-card.new-ancillary .ancillary-name {
-		display: flex;
-		align-items: center;
-		gap: var(--spacing-xs);
-		color: var(--color-primary);
 	}
 
 	.card-header {
@@ -229,22 +176,22 @@ function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment):
 		gap: var(--spacing-sm);
 	}
 
-	.ancillary-status-dot {
+	.workspace-status-dot {
 		width: 8px;
 		height: 8px;
 		border-radius: 50%;
 		flex-shrink: 0;
 	}
 
-	.ancillary-status-dot.ready {
+	.workspace-status-dot.ready {
 		background: var(--color-success);
 	}
 
-	.ancillary-status-dot.busy {
+	.workspace-status-dot.busy {
 		background: var(--color-warning);
 	}
 
-	.ancillary-name {
+	.workspace-name {
 		font-weight: 500;
 		color: var(--color-text);
 		font-size: 0.9rem;
@@ -257,7 +204,7 @@ function lookupAgentActivity(assignment: import('$lib/types/toren').Assignment):
 		color: var(--color-text-secondary);
 	}
 
-	.bead-label {
+	.task-label {
 		font-size: 0.8rem;
 		color: var(--color-text-secondary);
 		overflow: hidden;

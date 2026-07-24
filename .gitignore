@@ -11,6 +11,7 @@ web/build/
 .toren/config.toml
 .env
 CLAUDE.md
+.claude/settings.local.json
 
 # Test outputs
 examples/*/

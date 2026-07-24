@@ -1,5 +1,5 @@
 import { get } from 'svelte/store';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { torenStore } from './toren';
 
 describe('Toren Store', () => {
@@ -16,7 +16,7 @@ describe('Toren Store', () => {
 		expect(state.error).toBeNull();
 		expect(state.sessionToken).toBeNull();
 		expect(state.shipUrl).toBe('http://localhost:8787');
-		expect(state.ancillaries).toEqual([]);
+		expect(state.workspaces).toEqual([]);
 		expect(state.messages).toEqual([]);
 	});
 
@@ -75,6 +75,42 @@ describe('Toren Store', () => {
 
 		const state = get(torenStore);
 		expect(state.error).toBe(errorMessage);
+	});
+
+	describe('startWorkspaceShell', () => {
+		afterEach(() => {
+			vi.unstubAllGlobals();
+		});
+
+		it('POSTs to the shell endpoint and returns the new window name', async () => {
+			const fetchMock = vi.fn().mockResolvedValue({
+				ok: true,
+				json: async () => ({ success: true, session: 'toren/one', window: 'shell-2' }),
+			});
+			vi.stubGlobal('fetch', fetchMock);
+
+			const window = await torenStore.startWorkspaceShell('http://ship.local', 'toren', 'one');
+
+			expect(window).toBe('shell-2');
+			expect(fetchMock).toHaveBeenCalledWith(
+				'http://ship.local/api/workspaces/toren/one/shell',
+				expect.objectContaining({ method: 'POST' }),
+			);
+		});
+
+		it('throws with the server error message on failure', async () => {
+			vi.stubGlobal(
+				'fetch',
+				vi.fn().mockResolvedValue({
+					ok: false,
+					json: async () => ({ error: 'no session' }),
+				}),
+			);
+
+			await expect(
+				torenStore.startWorkspaceShell('http://ship.local', 'toren', 'one'),
+			).rejects.toThrow('no session');
+		});
 	});
 
 	it('should reset to initial state', () => {

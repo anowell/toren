@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# breq complete [workspace] — mark a workspace's tasks done.
+#
+# This is a plain script on your PATH, not a breq subcommand: `breq complete` finds it by
+# name and hands it the arguments. Edit it. It is meant to be edited — the per-source status
+# values below are defaults, not a vocabulary breq imposes.
+#
+# Note what it does *not* do: tear the workspace down. Shipping and teardown are separate
+# axes, which is what lets you ship one piece and keep the warm workspace for the next.
+# When you're done with the place: breq teardown <workspace>
+
+set -euo pipefail
+
+ws="${1:-${TOREN_WORKSPACE:-}}"
+if [ -z "$ws" ]; then
+    echo "usage: breq complete <workspace>" >&2
+    exit 2
+fi
+
+links=$(breq get "$ws" task || true)
+if [ -z "$links" ]; then
+    echo "No tasks linked to '$ws'. Link one with: breq set $ws +task <source>:<id>" >&2
+    exit 1
+fi
+
+for link in $links; do
+    source="${link%%:*}"
+    case "$source" in
+        runes)  status="done" ;;
+        github) status="closed" ;;
+        linear) status="Done" ;;
+        beads)  status="closed" ;;
+        *)      status="done" ;;
+    esac
+
+    echo "$link -> $status"
+    breq set "$ws" task.status "$status" --task "$link"
+done
+
+echo
+echo "Workspace '$ws' is untouched. Tear it down when you're done with it:"
+echo "  breq teardown $ws"

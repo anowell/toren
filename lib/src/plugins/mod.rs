@@ -1,15 +1,21 @@
-//! Rhai plugin system for breq.
+//! Rhai resolver plugins for breq.
 //!
-//! Plugins are Rhai scripts that call native Rust operations via a host API.
-//! User plugins are discovered from `~/.toren/plugins/`.
-//! Community/example plugins live in `contrib/plugins/` and can be installed
-//! via `breq plugin install`.
+//! Resolvers adapt external systems to breq. They come in three families, one per external
+//! system breq needs to read or write:
 //!
-//! Plugins are either **commands** (in `commands/` subdir, invoked as `breq <name>`)
-//! or **task resolvers** (in `tasks/` subdir, provide task data for a source).
+//! - `tasks/` — issue trackers: `info`, `claim`, `set_field`, `complete`, `abort`, `create`
+//! - `agents/` — coding agents: `argv`, `resume_argv`, `activity`, `title`, `session_id`
+//! - `delivery/` — forges: `prs`
 //!
-//! Compilation is lazy: plugins are scanned for metadata on init but only
-//! compiled to AST when actually executed.
+//! The contract is structured and in-process, which is what lets `breq list` join across every
+//! workspace without a subprocess per row. Workflow *verbs* are not plugins — those are plain
+//! `breq-<name>` scripts on PATH, called by the user rather than by breq.
+//!
+//! User plugins live in `~/.toren/plugins/<family>/<name>.rhai`. Breq vendors a few agent and
+//! delivery resolvers, which a user file of the same name overrides — so the built-ins double
+//! as reference implementations you can copy and edit.
+//!
+//! Compilation is lazy: plugins are scanned for metadata on init, compiled on first use.
 
 pub mod builtin;
 pub mod runtime;
@@ -18,26 +24,81 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::tasks::ResolvedTask;
 
-/// Lightweight metadata extracted from a plugin file without compilation.
+/// Which external system a resolver adapts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Family {
+    Tasks,
+    Agents,
+    Delivery,
+}
+
+impl Family {
+    /// Subdirectory under `~/.toren/plugins/`.
+    pub fn dir(self) -> &'static str {
+        match self {
+            Family::Tasks => "tasks",
+            Family::Agents => "agents",
+            Family::Delivery => "delivery",
+        }
+    }
+
+    pub fn all() -> &'static [Family] {
+        &[Family::Tasks, Family::Agents, Family::Delivery]
+    }
+
+    pub fn parse(s: &str) -> Option<Family> {
+        Family::all().iter().copied().find(|f| f.dir() == s)
+    }
+}
+
+/// Where a plugin's source text comes from.
+#[derive(Debug, Clone)]
+pub enum PluginSource {
+    /// A file under `~/.toren/plugins/`.
+    File(PathBuf),
+    /// Vendored into the binary. Overridable by a user file of the same name.
+    Builtin(&'static str),
+}
+
+/// Lightweight metadata extracted from a plugin without compiling it.
 #[derive(Debug, Clone)]
 pub struct PluginMeta {
     pub name: String,
-    pub path: PathBuf,
-    /// First paragraph of `///` doc comments (short description).
+    pub family: Family,
+    pub source: PluginSource,
+    /// First paragraph of `///` doc comments.
     pub description: Option<String>,
-    /// Full collected `///` doc-comment text (shown by `--help`).
+    /// Full collected `///` doc-comment text.
     pub usage: Option<String>,
+}
+
+impl PluginMeta {
+    fn text(&self) -> Result<String> {
+        match &self.source {
+            PluginSource::File(path) => std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read plugin {}", path.display())),
+            PluginSource::Builtin(text) => Ok(text.to_string()),
+        }
+    }
+
+    fn cache_key(&self) -> String {
+        format!("{}/{}", self.family.dir(), self.name)
+    }
+
+    /// Whether this is a vendored default rather than something the user installed.
+    pub fn is_builtin(&self) -> bool {
+        matches!(self.source, PluginSource::Builtin(_))
+    }
 }
 
 /// Parse leading `///` doc comments from a Rhai source string.
 ///
-/// Returns `(description, usage)` where:
-/// - `description` is the first paragraph (lines before a blank `///` line)
-/// - `usage` is the full collected text
+/// Returns `(description, usage)` where `description` is the first paragraph and `usage` is
+/// the full collected text.
 fn parse_doc_comments(source: &str) -> (Option<String>, Option<String>) {
     let mut lines: Vec<String> = Vec::new();
     for raw in source.lines() {
@@ -55,7 +116,6 @@ fn parse_doc_comments(source: &str) -> (Option<String>, Option<String>) {
     }
 
     let usage = lines.join("\n").trim().to_string();
-
     let description = lines
         .iter()
         .take_while(|l| !l.trim().is_empty())
@@ -71,42 +131,13 @@ fn parse_doc_comments(source: &str) -> (Option<String>, Option<String>) {
         Some(description)
     };
     let usg = if usage.is_empty() { None } else { Some(usage) };
-
     (desc, usg)
 }
 
-/// The result of running a plugin script.
-pub enum PluginResult {
-    /// Script completed normally (no deferred action).
-    Ok,
-    /// Script returned a deferred action for the host to execute.
-    Action(DeferredAction),
-}
-
-/// A deferred action returned by a plugin script.
-///
-/// Plugins that need the host to exec into another process (e.g., `claude`)
-/// return a map like `#{ action: "do", task_id: "x" }`. The host interprets
-/// these after the script completes.
-#[derive(Debug, Clone)]
-pub enum DeferredAction {
-    /// Start a coding agent session via `breq do`.
-    Do {
-        task_id: Option<String>,
-        task_title: Option<String>,
-        task_url: Option<String>,
-        task_source: Option<String>,
-        prompt: Option<String>,
-        intent: Option<String>,
-    },
-}
-
-/// Context passed to the Rhai engine for host function closures.
+/// Context handed to resolver scripts.
 pub struct PluginContext {
     pub segment_path: Option<PathBuf>,
     pub segment_name: Option<String>,
-    /// Resolver ASTs keyed by source name, for use by `toren::task()`.
-    pub resolvers: HashMap<String, rhai::AST>,
     /// Ordered list of task sources for multi-source resolution.
     pub task_sources: Vec<String>,
 }
@@ -116,7 +147,6 @@ impl PluginContext {
         Self {
             segment_path,
             segment_name,
-            resolvers: HashMap::new(),
             task_sources: Vec::new(),
         }
     }
@@ -128,112 +158,90 @@ impl Default for PluginContext {
     }
 }
 
-/// Manages plugin discovery, loading, and execution.
-///
-/// Plugins are scanned for metadata (description, usage) on init without
-/// compilation. ASTs are compiled lazily on first use and cached.
+/// Discovers, compiles, and calls resolver plugins.
 pub struct PluginManager {
-    command_metas: HashMap<String, PluginMeta>,
-    resolver_metas: HashMap<String, PluginMeta>,
-    /// Lazily compiled ASTs, keyed by plugin path.
-    compiled: Mutex<HashMap<PathBuf, rhai::AST>>,
+    metas: HashMap<Family, HashMap<String, PluginMeta>>,
+    /// Lazily compiled ASTs, keyed by `<family>/<name>`.
+    compiled: Mutex<HashMap<String, rhai::AST>>,
 }
 
 impl PluginManager {
-    /// Create a new PluginManager: scan plugins from the given directory
-    /// without compiling them.
+    /// Scan `dir` for plugins, layering user files over the vendored defaults.
     pub fn new(dir: &Path) -> Result<Self> {
-        let mut mgr = Self {
-            command_metas: HashMap::new(),
-            resolver_metas: HashMap::new(),
-            compiled: Mutex::new(HashMap::new()),
-        };
+        let mut metas: HashMap<Family, HashMap<String, PluginMeta>> = HashMap::new();
 
-        if dir.exists() {
-            let commands_dir = dir.join("commands");
-            if commands_dir.exists() {
-                mgr.scan_dir(&commands_dir, false)?;
+        for family in Family::all() {
+            let mut family_metas: HashMap<String, PluginMeta> = HashMap::new();
+
+            for (name, text) in builtin::for_family(*family) {
+                let (description, usage) = parse_doc_comments(text);
+                family_metas.insert(
+                    name.to_string(),
+                    PluginMeta {
+                        name: name.to_string(),
+                        family: *family,
+                        source: PluginSource::Builtin(text),
+                        description,
+                        usage,
+                    },
+                );
             }
-            let tasks_dir = dir.join("tasks");
-            if tasks_dir.exists() {
-                mgr.scan_dir(&tasks_dir, true)?;
+
+            let family_dir = dir.join(family.dir());
+            if family_dir.exists() {
+                scan_dir(&family_dir, *family, &mut family_metas)?;
             }
+
+            metas.insert(*family, family_metas);
         }
 
-        Ok(mgr)
+        Ok(Self {
+            metas,
+            compiled: Mutex::new(HashMap::new()),
+        })
     }
 
-    /// Check if a command plugin exists by name.
-    pub fn has(&self, name: &str) -> bool {
-        self.command_metas.contains_key(name)
+    /// Plugin names in a family, sorted.
+    pub fn list(&self, family: Family) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .metas
+            .get(&family)
+            .map(|m| m.keys().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
     }
 
-    /// List all command plugin names.
-    pub fn list(&self) -> Vec<&str> {
-        self.command_metas.keys().map(|s| s.as_str()).collect()
+    pub fn get_meta(&self, family: Family, name: &str) -> Option<&PluginMeta> {
+        self.metas.get(&family)?.get(name)
     }
 
-    /// List command plugin names with their short descriptions, sorted by name.
-    pub fn list_with_descriptions(&self) -> Vec<(&str, Option<&str>)> {
-        let mut items: Vec<_> = self
-            .command_metas
-            .iter()
-            .map(|(name, m)| (name.as_str(), m.description.as_deref()))
-            .collect();
-        items.sort_by_key(|(name, _)| *name);
-        items
+    pub fn has(&self, family: Family, name: &str) -> bool {
+        self.get_meta(family, name).is_some()
     }
 
-    /// Get the full usage text for a command plugin (from `///` doc comments).
-    pub fn usage(&self, name: &str) -> Option<&str> {
-        self.command_metas
-            .get(name)
-            .and_then(|m| m.usage.as_deref())
-    }
-
-    /// Run a command plugin by name with the given arguments and context.
-    pub fn run(&self, name: &str, args: &[String], mut ctx: PluginContext) -> Result<PluginResult> {
-        let meta = self
-            .command_metas
-            .get(name)
-            .with_context(|| format!("Plugin '{}' not found", name))?;
-
-        let ast = self.compile(meta)?;
-
-        // Inject resolver ASTs so command plugins calling toren::task() get resolver-backed data
-        ctx.resolvers = self.resolver_asts();
-        let ctx = Arc::new(ctx);
-        let engine = runtime::create_engine(ctx);
-
-        runtime::run_ast(&engine, &ast, args)
-    }
-
-    // ── Resolver methods ─────────────────────────────────────────────
-
-    /// Check if a resolver exists for the given source name.
-    pub fn has_resolver(&self, source: &str) -> bool {
-        self.resolver_metas.contains_key(source)
-    }
-
-    /// List all resolver source names.
-    pub fn list_resolvers(&self) -> Vec<&str> {
-        self.resolver_metas.keys().map(|s| s.as_str()).collect()
-    }
-
-    /// Check if a resolver has a specific function defined.
-    pub fn resolver_has_fn(&self, source: &str, fn_name: &str) -> bool {
-        self.resolver_metas
-            .get(source)
+    /// Whether a plugin defines a given function — how optional parts of a contract are
+    /// probed, so a minimal resolver stays valid.
+    pub fn has_fn(&self, family: Family, name: &str, fn_name: &str) -> bool {
+        self.get_meta(family, name)
             .and_then(|m| self.compile(m).ok())
             .map(|ast| ast.iter_functions().any(|f| f.name == fn_name))
             .unwrap_or(false)
     }
 
-    /// Resolve task info via a resolver plugin's `info(id)` function.
-    ///
-    /// Returns a unified `ResolvedTask` with all available fields.
+    // ── Task resolvers ───────────────────────────────────────────────
+
+    pub fn has_resolver(&self, source: &str) -> bool {
+        self.has(Family::Tasks, source)
+    }
+
+    pub fn list_resolvers(&self) -> Vec<&str> {
+        self.list(Family::Tasks)
+    }
+
+    /// Resolve task info via a task resolver's `info(id)`.
     pub fn resolve_info(&self, source: &str, id: &str, ctx: PluginContext) -> Result<ResolvedTask> {
-        let map = self.call_resolver_map(source, "info", (id.to_string(),), ctx)?;
+        let map = self.call_map(Family::Tasks, source, "info", (id.to_string(),), ctx)?;
 
         Ok(ResolvedTask {
             id: get_map_string(&map, "id").unwrap_or_else(|| id.to_string()),
@@ -243,12 +251,13 @@ impl PluginManager {
             status: get_map_string(&map, "status"),
             assignee: get_map_string(&map, "assignee"),
             description: get_map_string(&map, "description"),
+            url: get_map_string(&map, "url"),
             created_at: get_map_string(&map, "created_at"),
             updated_at: get_map_string(&map, "updated_at"),
         })
     }
 
-    /// Claim a task via a resolver plugin.
+    /// Claim a task — the one tracker side effect anywhere in the place verbs.
     pub fn resolve_claim(
         &self,
         source: &str,
@@ -256,24 +265,57 @@ impl PluginManager {
         assignee: &str,
         ctx: PluginContext,
     ) -> Result<()> {
-        let _ =
-            self.call_resolver_raw(source, "claim", (id.to_string(), assignee.to_string()), ctx)?;
+        let _ = self.call(
+            Family::Tasks,
+            source,
+            "claim",
+            (id.to_string(), assignee.to_string()),
+            ctx,
+        )?;
         Ok(())
     }
 
-    /// Complete a task via a resolver plugin.
+    /// Pass-through write of a task-source-owned field (`status`, `assignee`, `title`, …).
+    ///
+    /// Breq defines no status vocabulary: whatever the tracker accepts is what works, and
+    /// whatever it reports is what `breq get` shows.
+    pub fn resolve_set_field(
+        &self,
+        source: &str,
+        id: &str,
+        field: &str,
+        value: &str,
+        ctx: PluginContext,
+    ) -> Result<()> {
+        if !self.has_fn(Family::Tasks, source, "set_field") {
+            anyhow::bail!(
+                "Task source '{}' has no set_field(id, field, value) — add one to \
+                 ~/.toren/plugins/tasks/{}.rhai to write task fields through breq",
+                source,
+                source
+            );
+        }
+        let _ = self.call(
+            Family::Tasks,
+            source,
+            "set_field",
+            (id.to_string(), field.to_string(), value.to_string()),
+            ctx,
+        )?;
+        Ok(())
+    }
+
     pub fn resolve_complete(&self, source: &str, id: &str, ctx: PluginContext) -> Result<()> {
-        let _ = self.call_resolver_raw(source, "complete", (id.to_string(),), ctx)?;
+        let _ = self.call(Family::Tasks, source, "complete", (id.to_string(),), ctx)?;
         Ok(())
     }
 
-    /// Abort a task via a resolver plugin.
     pub fn resolve_abort(&self, source: &str, id: &str, ctx: PluginContext) -> Result<()> {
-        let _ = self.call_resolver_raw(source, "abort", (id.to_string(),), ctx)?;
+        let _ = self.call(Family::Tasks, source, "abort", (id.to_string(),), ctx)?;
         Ok(())
     }
 
-    /// Create a task via a resolver plugin. Returns the created task ID.
+    /// Create a task. Returns the created task ID.
     pub fn resolve_create(
         &self,
         source: &str,
@@ -285,13 +327,17 @@ impl PluginManager {
             Some(d) => rhai::Dynamic::from(d.to_string()),
             None => rhai::Dynamic::UNIT,
         };
-        let result =
-            self.call_resolver_raw(source, "create", (title.to_string(), desc_arg), ctx)?;
+        let result = self.call(
+            Family::Tasks,
+            source,
+            "create",
+            (title.to_string(), desc_arg),
+            ctx,
+        )?;
         Ok(result.into_string().unwrap_or_default())
     }
 
-    /// Determine effective task sources: use config sources if non-empty,
-    /// otherwise all installed task plugins.
+    /// Effective task sources: config order if set, else every installed task resolver.
     pub fn effective_sources(&self, config_sources: &[String]) -> Vec<String> {
         if config_sources.is_empty() {
             self.list_resolvers()
@@ -312,162 +358,274 @@ impl PluginManager {
     ) -> Result<ResolvedTask> {
         let available: Vec<_> = sources.iter().filter(|s| self.has_resolver(s)).collect();
         if available.is_empty() {
-            anyhow::bail!("No task resolvers available (tried: {:?})", sources);
+            anyhow::bail!(
+                "No task resolvers available (tried: {:?}). Install one with \
+                 `breq plugin install tasks/<name>`.",
+                sources
+            );
         }
         let mut last_err = None;
         for source in &available {
             let ctx = PluginContext::new(ctx.segment_path.clone(), ctx.segment_name.clone());
             match self.resolve_info(source, id, ctx) {
                 Ok(info) => return Ok(info),
-                Err(e) => {
-                    last_err = Some(e);
-                }
+                Err(e) => last_err = Some(e),
             }
         }
         Err(last_err.unwrap())
     }
 
-    /// Call a resolver function, returning the raw Dynamic result.
-    fn call_resolver_raw<A: rhai::FuncArgs>(
+    // ── Agent resolvers ──────────────────────────────────────────────
+
+    pub fn list_agents(&self) -> Vec<&str> {
+        self.list(Family::Agents)
+    }
+
+    pub fn has_agent(&self, name: &str) -> bool {
+        self.has(Family::Agents, name)
+    }
+
+    /// argv for a fresh agent run (program first).
+    pub fn agent_argv(&self, name: &str, ctx_map: rhai::Map) -> Result<Vec<String>> {
+        self.agent_argv_fn(name, "argv", ctx_map)
+    }
+
+    /// argv for resuming the workspace's previous session.
+    pub fn agent_resume_argv(&self, name: &str, ctx_map: rhai::Map) -> Result<Vec<String>> {
+        let f = if self.has_fn(Family::Agents, name, "resume_argv") {
+            "resume_argv"
+        } else {
+            "argv"
+        };
+        self.agent_argv_fn(name, f, ctx_map)
+    }
+
+    fn agent_argv_fn(&self, name: &str, func: &str, ctx_map: rhai::Map) -> Result<Vec<String>> {
+        let result = self.call(
+            Family::Agents,
+            name,
+            func,
+            (ctx_map,),
+            PluginContext::default(),
+        )?;
+        let array = result
+            .try_cast::<rhai::Array>()
+            .with_context(|| format!("Agent '{}' {} did not return an array", name, func))?;
+
+        let argv: Vec<String> = array
+            .into_iter()
+            .filter_map(|v| v.into_string().ok())
+            .collect();
+        if argv.is_empty() {
+            anyhow::bail!("Agent '{}' {} returned an empty argv", name, func);
+        }
+        Ok(argv)
+    }
+
+    /// `running` / `idle` / `""` (unknown) for the agent's own view of a workspace.
+    ///
+    /// Distinct from pane liveness: an agent can hold a live pane while sitting idle at its
+    /// prompt, and only the agent's own logs can tell the difference.
+    pub fn agent_activity(&self, name: &str, ws_path: &Path) -> Option<String> {
+        self.agent_string(name, "activity", ws_path)
+    }
+
+    /// The agent's summary of the session, for the list title fallback chain.
+    pub fn agent_title(&self, name: &str, ws_path: &Path) -> Option<String> {
+        self.agent_string(name, "title", ws_path)
+    }
+
+    /// The agent's session id in a workspace, for resume.
+    pub fn agent_session_id(&self, name: &str, ws_path: &Path) -> Option<String> {
+        self.agent_string(name, "session_id", ws_path)
+    }
+
+    fn agent_string(&self, name: &str, func: &str, ws_path: &Path) -> Option<String> {
+        if !self.has_fn(Family::Agents, name, func) {
+            return None;
+        }
+        let result = self
+            .call(
+                Family::Agents,
+                name,
+                func,
+                (ws_path.display().to_string(),),
+                PluginContext::default(),
+            )
+            .map_err(|e| {
+                warn!("agent '{}' {} failed: {:#}", name, func, e);
+                e
+            })
+            .ok()?;
+        result
+            .into_string()
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    // ── Delivery resolvers ───────────────────────────────────────────
+
+    pub fn list_delivery(&self) -> Vec<&str> {
+        self.list(Family::Delivery)
+    }
+
+    /// Pull requests for a workspace's remote branches, as JSON values.
+    ///
+    /// Network-bound: callers cache the result and render from the cache.
+    pub fn delivery_prs(
         &self,
-        source: &str,
+        name: &str,
+        ws_path: &Path,
+        branches: &[String],
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut ctx_map = rhai::Map::new();
+        ctx_map.insert(
+            "path".into(),
+            rhai::Dynamic::from(ws_path.display().to_string()),
+        );
+        ctx_map.insert(
+            "branches".into(),
+            rhai::Dynamic::from(
+                branches
+                    .iter()
+                    .map(|b| rhai::Dynamic::from(b.clone()))
+                    .collect::<rhai::Array>(),
+            ),
+        );
+
+        let result = self.call(
+            Family::Delivery,
+            name,
+            "prs",
+            (ctx_map,),
+            PluginContext::default(),
+        )?;
+
+        let array = result
+            .try_cast::<rhai::Array>()
+            .with_context(|| format!("Delivery resolver '{}' prs did not return an array", name))?;
+
+        Ok(array
+            .into_iter()
+            .filter_map(|v| rhai::serde::from_dynamic::<serde_json::Value>(&v).ok())
+            .collect())
+    }
+
+    // ── Calling ──────────────────────────────────────────────────────
+
+    /// Call a plugin function, returning the raw Dynamic result.
+    pub fn call<A: rhai::FuncArgs>(
+        &self,
+        family: Family,
+        name: &str,
         fn_name: &str,
         args: A,
         ctx: PluginContext,
     ) -> Result<rhai::Dynamic> {
         let meta = self
-            .resolver_metas
-            .get(source)
-            .with_context(|| format!("No resolver found for source '{}'", source))?;
+            .get_meta(family, name)
+            .with_context(|| format!("No {} plugin found named '{}'", family.dir(), name))?;
 
         let ast = self.compile(meta)?;
-
-        let ctx = Arc::new(ctx);
-        let engine = runtime::create_resolver_engine(ctx);
+        let engine = runtime::create_engine(Arc::new(ctx));
         let mut scope = rhai::Scope::new();
 
         engine
             .call_fn::<rhai::Dynamic>(&mut scope, &ast, fn_name, args)
-            .map_err(|e| anyhow::anyhow!("Resolver '{}' {} error: {}", source, fn_name, e))
+            .map_err(|e| anyhow::anyhow!("{} '{}' {} error: {}", family.dir(), name, fn_name, e))
     }
 
-    /// Call a resolver function that is expected to return a Map.
-    fn call_resolver_map<A: rhai::FuncArgs>(
+    fn call_map<A: rhai::FuncArgs>(
         &self,
-        source: &str,
+        family: Family,
+        name: &str,
         fn_name: &str,
         args: A,
         ctx: PluginContext,
     ) -> Result<rhai::Map> {
-        let result = self.call_resolver_raw(source, fn_name, args, ctx)?;
-
+        let result = self.call(family, name, fn_name, args, ctx)?;
         result.try_cast::<rhai::Map>().ok_or_else(|| {
-            anyhow::anyhow!("Resolver '{}' {} did not return a map", source, fn_name)
+            anyhow::anyhow!(
+                "{} '{}' {} did not return a map",
+                family.dir(),
+                name,
+                fn_name
+            )
         })
     }
 
     /// Compile a plugin on demand, caching the result.
     fn compile(&self, meta: &PluginMeta) -> Result<rhai::AST> {
+        let key = meta.cache_key();
         {
             let cache = self.compiled.lock().unwrap();
-            if let Some(ast) = cache.get(&meta.path) {
+            if let Some(ast) = cache.get(&key) {
                 return Ok(ast.clone());
             }
         }
-        let source = std::fs::read_to_string(&meta.path).with_context(|| {
-            format!(
-                "Failed to read plugin '{}' ({})",
-                meta.name,
-                meta.path.display()
-            )
-        })?;
-        let engine = rhai::Engine::new();
-        let ast = engine.compile(&source).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to compile plugin '{}' ({}): {}",
-                meta.name,
-                meta.path.display(),
-                e
-            )
-        })?;
-        let mut cache = self.compiled.lock().unwrap();
-        cache.insert(meta.path.clone(), ast.clone());
+
+        let source = meta.text()?;
+        let engine = runtime::compiler();
+        let ast = engine
+            .compile(&source)
+            .map_err(|e| anyhow::anyhow!("Failed to compile plugin '{}': {}", key, e))?;
+
+        self.compiled.lock().unwrap().insert(key, ast.clone());
         Ok(ast)
-    }
-
-    /// Get a clone of all resolver ASTs (for injection into PluginContext).
-    /// Compiles any resolvers that haven't been compiled yet.
-    fn resolver_asts(&self) -> HashMap<String, rhai::AST> {
-        self.resolver_metas
-            .iter()
-            .filter_map(|(name, meta)| self.compile(meta).ok().map(|ast| (name.clone(), ast)))
-            .collect()
-    }
-
-    /// Scan a directory for `.rhai` plugin files, extracting metadata only.
-    ///
-    /// If `is_resolver` is true, metas are added to `resolver_metas`;
-    /// otherwise to `command_metas`.
-    fn scan_dir(&mut self, dir: &Path, is_resolver: bool) -> Result<()> {
-        let entries = std::fs::read_dir(dir)
-            .with_context(|| format!("Failed to read plugin directory: {}", dir.display()))?;
-
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.extension().and_then(|s| s.to_str()) != Some("rhai") {
-                continue;
-            }
-
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-
-            if name.is_empty() {
-                continue;
-            }
-
-            match std::fs::read_to_string(&path) {
-                Ok(source) => {
-                    let (description, usage) = parse_doc_comments(&source);
-                    let kind_label = if is_resolver { "resolver" } else { "command" };
-                    info!(
-                        "Scanned {} plugin '{}' from {}",
-                        kind_label,
-                        name,
-                        path.display()
-                    );
-                    let meta = PluginMeta {
-                        name: name.clone(),
-                        path,
-                        description,
-                        usage,
-                    };
-                    if is_resolver {
-                        self.resolver_metas.insert(name, meta);
-                    } else {
-                        self.command_metas.insert(name, meta);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to read plugin '{}' ({}): {}",
-                        name,
-                        path.display(),
-                        e
-                    );
-                }
-            }
-        }
-
-        Ok(())
     }
 }
 
-/// Extract a string value from a Rhai Map, returning None for unit values.
+/// Scan a directory for `.rhai` plugins, extracting metadata only.
+fn scan_dir(dir: &Path, family: Family, out: &mut HashMap<String, PluginMeta>) -> Result<()> {
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("Failed to read plugin directory: {}", dir.display()))?;
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().and_then(|s| s.to_str()) != Some("rhai") {
+            continue;
+        }
+
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+
+        match std::fs::read_to_string(&path) {
+            Ok(source) => {
+                let (description, usage) = parse_doc_comments(&source);
+                debug!(
+                    "Scanned {} plugin '{}' from {}",
+                    family.dir(),
+                    name,
+                    path.display()
+                );
+                out.insert(
+                    name.clone(),
+                    PluginMeta {
+                        name,
+                        family,
+                        source: PluginSource::File(path),
+                        description,
+                        usage,
+                    },
+                );
+            }
+            Err(e) => warn!("Failed to read plugin {}: {}", path.display(), e),
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract a string value from a Rhai Map, treating unit as absent.
 fn get_map_string(map: &rhai::Map, key: &str) -> Option<String> {
     map.get(key).and_then(|v| {
         if v.is::<()>() {
@@ -482,475 +640,285 @@ fn get_map_string(map: &rhai::Map, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn manager_with(
+        family: Family,
+        name: &str,
+        source: &str,
+    ) -> (tempfile::TempDir, PluginManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let family_dir = dir.path().join(family.dir());
+        std::fs::create_dir_all(&family_dir).unwrap();
+        std::fs::write(family_dir.join(format!("{}.rhai", name)), source).unwrap();
+        let mgr = PluginManager::new(dir.path()).unwrap();
+        (dir, mgr)
+    }
+
     #[test]
-    fn test_empty_dir_no_plugins() {
+    fn agents_ship_with_the_binary() {
         let mgr = PluginManager::new(Path::new("/nonexistent")).unwrap();
-        assert!(mgr.command_metas.is_empty());
-        assert!(mgr.resolver_metas.is_empty());
+        assert!(mgr.has_agent("claude"), "claude must work out of the box");
+        assert!(mgr.has_agent("codex"));
+        assert!(mgr.has_agent("pi"));
+        assert!(mgr.get_meta(Family::Agents, "claude").unwrap().is_builtin());
     }
 
     #[test]
-    fn test_user_plugin_loaded() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd_dir = dir.path().join("commands");
-        std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::write(cmd_dir.join("custom.rhai"), r#"let x = "hello";"#).unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-        assert!(mgr.has("custom"));
-    }
-
-    #[test]
-    fn test_invalid_plugin_detected_on_compile() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd_dir = dir.path().join("commands");
-        std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::write(cmd_dir.join("bad.rhai"), r#"this is not valid rhai {{{"#).unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-        // Meta is scanned (plugin is "known") but compilation will fail
-        assert!(mgr.has("bad"));
-        // Compilation should fail
-        let meta = mgr.command_metas.get("bad").unwrap();
-        assert!(mgr.compile(meta).is_err());
-    }
-
-    #[test]
-    fn test_non_rhai_files_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd_dir = dir.path().join("commands");
-        std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::write(cmd_dir.join("readme.md"), "# Plugins").unwrap();
-        std::fs::write(cmd_dir.join("notes.txt"), "notes").unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-        assert!(mgr.command_metas.is_empty());
-        assert!(mgr.resolver_metas.is_empty());
-    }
-
-    #[test]
-    fn test_contrib_plugins_compile() {
-        // Verify the contrib plugin scripts are valid Rhai
-        let engine = rhai::Engine::new();
-        let contrib_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("contrib/plugins");
-
-        // Commands are in commands/ subdir
-        for name in &["assign", "complete", "abort"] {
-            let path = contrib_dir.join(format!("commands/{}.rhai", name));
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|_| panic!("Failed to read {}", path.display()));
-            engine
-                .compile(&source)
-                .unwrap_or_else(|e| panic!("Failed to compile {}: {}", name, e));
-        }
-
-        // Resolvers are in tasks/ subdir
-        for name in &["beads", "github", "linear"] {
-            let path = contrib_dir.join(format!("tasks/{}.rhai", name));
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|_| panic!("Failed to read {}", path.display()));
-            engine
-                .compile(&source)
-                .unwrap_or_else(|e| panic!("Failed to compile {}: {}", name, e));
-        }
-    }
-
-    #[test]
-    fn test_doc_comments_basic() {
-        let source =
-            "/// Short description.\n///\n/// Detailed usage text\n/// spanning lines.\nlet x = 1;";
-        let (desc, usage) = parse_doc_comments(source);
-        assert_eq!(desc.as_deref(), Some("Short description."));
+    fn a_user_file_overrides_the_vendored_agent() {
+        let (_dir, mgr) = manager_with(Family::Agents, "claude", r#"fn argv(ctx) { ["mine"] }"#);
+        assert!(!mgr.get_meta(Family::Agents, "claude").unwrap().is_builtin());
         assert_eq!(
-            usage.as_deref(),
-            Some("Short description.\n\nDetailed usage text\nspanning lines.")
+            mgr.agent_argv("claude", rhai::Map::new()).unwrap(),
+            vec!["mine"]
         );
     }
 
     #[test]
-    fn test_doc_comments_missing() {
-        let source = "// regular comment\nlet x = 1;";
-        let (desc, usage) = parse_doc_comments(source);
-        assert!(desc.is_none());
-        assert!(usage.is_none());
+    fn builtin_agent_argv_carries_prompt_and_model() {
+        let mgr = PluginManager::new(Path::new("/nonexistent")).unwrap();
+        let mut ctx = rhai::Map::new();
+        ctx.insert(
+            "prompt".into(),
+            rhai::Dynamic::from("fix the bug".to_string()),
+        );
+        ctx.insert("model".into(), rhai::Dynamic::from("opus".to_string()));
+
+        assert_eq!(
+            mgr.agent_argv("claude", ctx).unwrap(),
+            vec!["claude", "--model", "opus", "fix the bug"]
+        );
     }
 
     #[test]
-    fn test_doc_comments_single_paragraph() {
-        let source = "/// Just a one-liner.\nlet x = 1;";
-        let (desc, usage) = parse_doc_comments(source);
-        assert_eq!(desc.as_deref(), Some("Just a one-liner."));
-        assert_eq!(usage.as_deref(), Some("Just a one-liner."));
+    fn builtin_agent_argv_adds_auto_approve_only_when_asked() {
+        let mgr = PluginManager::new(Path::new("/nonexistent")).unwrap();
+        let mut ctx = rhai::Map::new();
+        ctx.insert("prompt".into(), rhai::Dynamic::from("go".to_string()));
+        ctx.insert("auto_approve".into(), rhai::Dynamic::from(true));
+
+        assert_eq!(
+            mgr.agent_argv("claude", ctx).unwrap(),
+            vec!["claude", "--dangerously-skip-permissions", "go"]
+        );
     }
 
     #[test]
-    fn test_doc_comments_no_space_after_slashes() {
-        let source = "///No space here.\nlet x = 1;";
-        let (desc, _) = parse_doc_comments(source);
-        assert_eq!(desc.as_deref(), Some("No space here."));
+    fn resume_falls_back_to_argv_when_unimplemented() {
+        let (_dir, mgr) =
+            manager_with(Family::Agents, "minimal", r#"fn argv(ctx) { ["minimal"] }"#);
+        assert_eq!(
+            mgr.agent_resume_argv("minimal", rhai::Map::new()).unwrap(),
+            vec!["minimal"]
+        );
     }
 
     #[test]
-    fn test_list_with_descriptions() {
+    fn agent_introspection_is_optional() {
+        let (_dir, mgr) = manager_with(Family::Agents, "quiet", r#"fn argv(ctx) { ["quiet"] }"#);
+        assert!(mgr.agent_activity("quiet", Path::new("/tmp")).is_none());
+        assert!(mgr.agent_title("quiet", Path::new("/tmp")).is_none());
+    }
+
+    #[test]
+    fn claude_activity_reads_the_last_log_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd_dir = dir.path().join("commands");
-        std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::write(cmd_dir.join("beta.rhai"), "/// Beta plugin.\nlet x = 1;").unwrap();
-        std::fs::write(cmd_dir.join("alpha.rhai"), "/// Alpha plugin.\nlet x = 1;").unwrap();
-        std::fs::write(cmd_dir.join("gamma.rhai"), "let x = 1;").unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
 
-        let mgr = PluginManager::new(dir.path()).unwrap();
-        let list = mgr.list_with_descriptions();
-        // Should be sorted by name
-        assert_eq!(list[0].0, "alpha");
-        assert_eq!(list[0].1, Some("Alpha plugin."));
-        assert_eq!(list[1].0, "beta");
-        assert_eq!(list[1].1, Some("Beta plugin."));
-        assert_eq!(list[2].0, "gamma");
-        assert_eq!(list[2].1, None);
-    }
+        // Claude's log location is derived from the workspace path, so fake HOME.
+        let home = dir.path().join("home");
+        let mangled = ws.display().to_string().replace(['/', '.'], "-");
+        let log_dir = home.join(".claude/projects").join(&mangled);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("sess-1.jsonl"),
+            "{\"type\":\"summary\",\"summary\":\"Fix the flaky test\"}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\"}]}}\n",
+        )
+        .unwrap();
 
-    #[test]
-    fn test_deferred_action_from_script() {
-        let engine = rhai::Engine::new();
-        let ast = engine
-            .compile(r#"#{ action: "do", task_id: "test-123", task_title: "Test task" }"#)
-            .unwrap();
+        let prev = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
 
-        let result = runtime::run_ast(&engine, &ast, &[]).unwrap();
-        match result {
-            PluginResult::Action(DeferredAction::Do {
-                task_id,
-                task_title,
-                ..
-            }) => {
-                assert_eq!(task_id.as_deref(), Some("test-123"));
-                assert_eq!(task_title.as_deref(), Some("Test task"));
-            }
-            _ => panic!("Expected DeferredAction::Do"),
+        let mgr = PluginManager::new(Path::new("/nonexistent")).unwrap();
+        assert_eq!(
+            mgr.agent_activity("claude", &ws).as_deref(),
+            Some("running")
+        );
+        assert_eq!(
+            mgr.agent_title("claude", &ws).as_deref(),
+            Some("Fix the flaky test")
+        );
+        assert_eq!(
+            mgr.agent_session_id("claude", &ws).as_deref(),
+            Some("sess-1")
+        );
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
         }
     }
 
-    // ── Resolver tests ──────────────────────────────────────────────
-
     #[test]
-    fn test_semantic_dir_routing() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd_dir = dir.path().join("commands");
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-
-        std::fs::write(
-            tasks_dir.join("myresolver.rhai"),
-            "/// Test resolver.\nfn fetch(id) { #{} }",
-        )
-        .unwrap();
-        std::fs::write(cmd_dir.join("mycmd.rhai"), "/// Test command.\nlet x = 1;").unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-
-        assert!(mgr.has("mycmd"));
-        assert!(!mgr.has_resolver("mycmd"));
-
-        assert!(!mgr.has("myresolver"));
-        assert!(mgr.has_resolver("myresolver"));
-    }
-
-    #[test]
-    fn test_flat_dir_no_scan() {
-        // Without commands/ or tasks/ subdirs, nothing is scanned.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("loose.rhai"),
-            "/// Loose plugin.\nlet x = 1;",
-        )
-        .unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-        assert!(!mgr.has("loose"));
-        assert!(!mgr.has_resolver("loose"));
-    }
-
-    #[test]
-    fn test_resolver_has_fn() {
-        let dir = tempfile::tempdir().unwrap();
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        std::fs::write(
-            tasks_dir.join("test_src.rhai"),
-            "fn fetch(id) { #{} }\nfn info(id) { #{} }",
-        )
-        .unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-
-        assert!(mgr.resolver_has_fn("test_src", "fetch"));
-        assert!(mgr.resolver_has_fn("test_src", "info"));
-        assert!(!mgr.resolver_has_fn("test_src", "create"));
-        assert!(!mgr.resolver_has_fn("nonexistent", "fetch"));
-    }
-
-    #[test]
-    fn test_list_resolvers() {
-        let dir = tempfile::tempdir().unwrap();
-        let tasks_dir = dir.path().join("tasks");
-        let cmd_dir = dir.path().join("commands");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::write(tasks_dir.join("alpha.rhai"), "fn fetch(id) { #{} }").unwrap();
-        std::fs::write(tasks_dir.join("beta.rhai"), "fn fetch(id) { #{} }").unwrap();
-        std::fs::write(cmd_dir.join("cmd.rhai"), "let x = 1;").unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-
-        let mut resolvers = mgr.list_resolvers();
-        resolvers.sort();
-        assert_eq!(resolvers, vec!["alpha", "beta"]);
-        assert_eq!(mgr.list(), vec!["cmd"]);
-    }
-
-    #[test]
-    fn test_resolve_info() {
-        let dir = tempfile::tempdir().unwrap();
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        std::fs::write(
-            tasks_dir.join("mock.rhai"),
+    fn task_resolvers_load_from_disk() {
+        let (_dir, mgr) = manager_with(
+            Family::Tasks,
+            "mock",
             r#"fn info(id) {
-    #{ id: id, title: "Task " + id, description: "Desc for " + id, status: "in_progress", assignee: "claude" }
-}"#,
-        )
-        .unwrap();
+                #{ id: id, title: "Task " + id, status: "in_progress", assignee: "claude" }
+            }"#,
+        );
 
-        let mgr = PluginManager::new(dir.path()).unwrap();
-        let ctx = PluginContext::default();
-        let info = mgr.resolve_info("mock", "abc-123", ctx).unwrap();
-
-        assert_eq!(info.id, "abc-123");
-        assert_eq!(info.title, "Task abc-123");
-        assert_eq!(info.description.as_deref(), Some("Desc for abc-123"));
-        assert_eq!(info.source, "mock");
-        assert_eq!(info.status.as_deref(), Some("in_progress"));
-        assert_eq!(info.assignee.as_deref(), Some("claude"));
-    }
-
-    #[test]
-    fn test_resolve_create() {
-        let dir = tempfile::tempdir().unwrap();
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        std::fs::write(
-            tasks_dir.join("mock.rhai"),
-            r#"fn create(title, desc) {
-    "new-id-42"
-}"#,
-        )
-        .unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-        let ctx = PluginContext::default();
-        let id = mgr
-            .resolve_create("mock", "My Task", Some("desc"), ctx)
+        let info = mgr
+            .resolve_info("mock", "abc-123", PluginContext::default())
             .unwrap();
-
-        assert_eq!(id, "new-id-42");
+        assert_eq!(info.title, "Task abc-123");
+        assert_eq!(info.status.as_deref(), Some("in_progress"));
+        assert_eq!(info.source, "mock");
     }
 
     #[test]
-    fn test_resolve_claim() {
+    fn set_field_is_pass_through() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let tasks = dir.path().join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        let out = dir.path().join("out.txt");
         std::fs::write(
-            tasks_dir.join("mock.rhai"),
-            r#"fn claim(id, assignee) {
-    // claim succeeds silently
-}"#,
+            tasks.join("mock.rhai"),
+            format!(
+                r#"fn set_field(id, field, value) {{
+                    fs::write("{}", id + "/" + field + "/" + value);
+                }}"#,
+                out.display()
+            ),
         )
         .unwrap();
 
         let mgr = PluginManager::new(dir.path()).unwrap();
-        let ctx = PluginContext::default();
-        mgr.resolve_claim("mock", "abc-123", "claude", ctx).unwrap();
-    }
-
-    #[test]
-    fn test_resolve_complete_and_abort() {
-        let dir = tempfile::tempdir().unwrap();
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        std::fs::write(
-            tasks_dir.join("mock.rhai"),
-            r#"fn complete(id) { }
-fn abort(id) { }"#,
+        mgr.resolve_set_field(
+            "mock",
+            "t-1",
+            "status",
+            "in-review",
+            PluginContext::default(),
         )
         .unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-
-        let ctx = PluginContext::default();
-        mgr.resolve_complete("mock", "abc-123", ctx).unwrap();
-
-        let ctx = PluginContext::default();
-        mgr.resolve_abort("mock", "abc-123", ctx).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "t-1/status/in-review"
+        );
     }
 
     #[test]
-    fn test_resolve_missing_resolver_errors() {
-        let mgr = PluginManager::new(Path::new("/nonexistent")).unwrap();
-        let ctx = PluginContext::default();
-
-        assert!(mgr.resolve_info("nonexistent", "id", ctx).is_err());
+    fn set_field_without_support_says_where_to_add_it() {
+        let (_dir, mgr) = manager_with(Family::Tasks, "mock", r#"fn info(id) { #{ id: id } }"#);
+        let err = mgr
+            .resolve_set_field("mock", "t-1", "status", "done", PluginContext::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("set_field"), "{}", err);
+        assert!(err.contains("tasks/mock.rhai"), "{}", err);
     }
 
     #[test]
-    fn test_resolver_asts_injected_in_run() {
+    fn multi_source_falls_through_to_a_resolver_that_knows_the_id() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd_dir = dir.path().join("commands");
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        // A resolver plugin
+        let tasks = dir.path().join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(tasks.join("failing.rhai"), r#"fn other(id) { #{} }"#).unwrap();
         std::fs::write(
-            tasks_dir.join("mock_src.rhai"),
-            "fn info(id) { #{ id: id, title: \"resolved\" } }",
-        )
-        .unwrap();
-        // A command plugin that just returns ok
-        std::fs::write(cmd_dir.join("cmd.rhai"), "let x = 1;").unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-
-        // Verify resolver ASTs are generated correctly
-        let asts = mgr.resolver_asts();
-        assert!(asts.contains_key("mock_src"));
-    }
-
-    #[test]
-    fn test_scan_no_compilation() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd_dir = dir.path().join("commands");
-        std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::write(cmd_dir.join("foo.rhai"), "let x = 1;").unwrap();
-        std::fs::write(cmd_dir.join("bar.rhai"), "let x = 2;").unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-
-        // Plugins are known but no ASTs compiled yet
-        assert!(mgr.has("foo"));
-        assert!(mgr.has("bar"));
-        let cache = mgr.compiled.lock().unwrap();
-        assert!(cache.is_empty(), "No ASTs should be compiled on init");
-    }
-
-    #[test]
-    fn test_lazy_compile_on_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let cmd_dir = dir.path().join("commands");
-        std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::write(cmd_dir.join("hello.rhai"), r#"let x = "hi";"#).unwrap();
-        std::fs::write(cmd_dir.join("world.rhai"), r#"let y = "wo";"#).unwrap();
-
-        let mgr = PluginManager::new(dir.path()).unwrap();
-
-        // Nothing compiled yet
-        assert!(mgr.compiled.lock().unwrap().is_empty());
-
-        // Run one plugin
-        let ctx = PluginContext::default();
-        let _ = mgr.run("hello", &[], ctx);
-
-        // Only the executed plugin should be compiled
-        let cache = mgr.compiled.lock().unwrap();
-        assert_eq!(cache.len(), 1);
-        assert!(cache.contains_key(&cmd_dir.join("hello.rhai")));
-    }
-
-    #[test]
-    fn test_multi_source_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-
-        // First resolver fails (no info function)
-        std::fs::write(tasks_dir.join("failing.rhai"), r#"fn fetch(id) { #{} }"#).unwrap();
-
-        // Second resolver succeeds
-        std::fs::write(
-            tasks_dir.join("working.rhai"),
+            tasks.join("working.rhai"),
             r#"fn info(id) { #{ id: id, title: "Found: " + id } }"#,
         )
         .unwrap();
 
         let mgr = PluginManager::new(dir.path()).unwrap();
-
         let sources = vec!["failing".to_string(), "working".to_string()];
-        let ctx = PluginContext::default();
-        let task = mgr.resolve_info_multi(&sources, "test-1", ctx).unwrap();
-
-        assert_eq!(task.id, "test-1");
-        assert_eq!(task.title, "Found: test-1");
+        let task = mgr
+            .resolve_info_multi(&sources, "test-1", PluginContext::default())
+            .unwrap();
         assert_eq!(task.source, "working");
     }
 
     #[test]
-    fn test_effective_sources_uses_config_when_set() {
+    fn effective_sources_prefers_config_then_discovers() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        std::fs::write(tasks_dir.join("alpha.rhai"), "fn fetch(id) { #{} }").unwrap();
-        std::fs::write(tasks_dir.join("beta.rhai"), "fn fetch(id) { #{} }").unwrap();
+        let tasks = dir.path().join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(tasks.join("alpha.rhai"), "fn info(id) { #{} }").unwrap();
+        std::fs::write(tasks.join("beta.rhai"), "fn info(id) { #{} }").unwrap();
 
         let mgr = PluginManager::new(dir.path()).unwrap();
-
-        // With explicit config sources, uses those in order
-        let configured = vec!["beta".to_string()];
-        assert_eq!(mgr.effective_sources(&configured), vec!["beta"]);
+        assert_eq!(mgr.effective_sources(&["beta".to_string()]), vec!["beta"]);
+        let mut discovered = mgr.effective_sources(&[]);
+        discovered.sort();
+        assert_eq!(discovered, vec!["alpha", "beta"]);
     }
 
     #[test]
-    fn test_effective_sources_autodetects_when_empty() {
+    fn families_are_separate_namespaces() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
-        std::fs::write(tasks_dir.join("alpha.rhai"), "fn fetch(id) { #{} }").unwrap();
-        std::fs::write(tasks_dir.join("beta.rhai"), "fn fetch(id) { #{} }").unwrap();
+        for family in ["tasks", "agents", "delivery"] {
+            let d = dir.path().join(family);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("same.rhai"), "fn argv(ctx) { [\"x\"] }").unwrap();
+        }
 
         let mgr = PluginManager::new(dir.path()).unwrap();
-
-        // With empty config sources, discovers all installed resolvers
-        let empty: Vec<String> = vec![];
-        let mut sources = mgr.effective_sources(&empty);
-        sources.sort();
-        assert_eq!(sources, vec!["alpha", "beta"]);
+        assert!(mgr.has(Family::Tasks, "same"));
+        assert!(mgr.has(Family::Agents, "same"));
+        assert!(mgr.has(Family::Delivery, "same"));
     }
 
     #[test]
-    fn test_resolve_info_multi_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let tasks_dir = dir.path().join("tasks");
-        std::fs::create_dir_all(&tasks_dir).unwrap();
+    fn delivery_prs_come_back_as_json() {
+        let (_dir, mgr) = manager_with(
+            Family::Delivery,
+            "mock",
+            r##"fn prs(ctx) {
+                [#{ branch: ctx.branches[0], id: "#7", url: "u", state: "open", ci: "passing" }]
+            }"##,
+        );
 
-        // First resolver has no info function
-        std::fs::write(tasks_dir.join("no_info.rhai"), r#"fn fetch(id) { #{} }"#).unwrap();
+        let prs = mgr
+            .delivery_prs("mock", Path::new("/tmp"), &["feature".to_string()])
+            .unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0]["id"], "#7");
+        assert_eq!(prs[0]["branch"], "feature");
+    }
 
-        // Second resolver has info
-        std::fs::write(
-            tasks_dir.join("has_info.rhai"),
-            r#"fn info(id) { #{ id: id, title: "T", status: "open", assignee: "bob" } }"#,
-        )
-        .unwrap();
+    #[test]
+    fn contrib_plugins_compile() {
+        let contrib = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("contrib/plugins");
 
-        let mgr = PluginManager::new(dir.path()).unwrap();
+        let engine = runtime::compiler();
+        for family in Family::all() {
+            let dir = contrib.join(family.dir());
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("rhai") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                engine
+                    .compile(&source)
+                    .unwrap_or_else(|e| panic!("Failed to compile {}: {}", path.display(), e));
+            }
+        }
+    }
 
-        let sources = vec!["no_info".to_string(), "has_info".to_string()];
-        let ctx = PluginContext::default();
-        let info = mgr.resolve_info_multi(&sources, "x", ctx).unwrap();
-        assert_eq!(info.status.as_deref(), Some("open"));
-        assert_eq!(info.assignee.as_deref(), Some("bob"));
+    #[test]
+    fn nothing_is_compiled_until_it_is_called() {
+        let (_dir, mgr) = manager_with(Family::Tasks, "lazy", "fn info(id) { #{} }");
+        assert!(mgr.compiled.lock().unwrap().is_empty());
+        let _ = mgr.resolve_info("lazy", "x", PluginContext::default());
+        assert!(mgr.compiled.lock().unwrap().contains_key("tasks/lazy"));
     }
 }

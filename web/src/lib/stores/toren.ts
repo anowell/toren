@@ -1,13 +1,13 @@
 import { derived, get, writable } from 'svelte/store';
 import type {
-	Ancillary,
-	AncillaryDisplayStatus,
-	AncillaryStatus,
-	Assignment,
-	BeadDisplayStatus,
 	CommandOutput,
-	CreateAssignmentRequest,
 	Segment,
+	SessionInfo,
+	StartWorkspaceRequest,
+	TaskDisplayStatus,
+	TaskView,
+	WorkspaceDisplayStatus,
+	WorkspaceView,
 	WsRequest,
 	WsResponse,
 } from '$lib/types/toren';
@@ -19,15 +19,13 @@ export interface TorenState {
 	error: string | null;
 	sessionToken: string | null;
 	shipUrl: string;
-	ancillaries: Ancillary[];
-	assignments: Assignment[];
+	workspaces: WorkspaceView[];
 	messages: ChatMessage[];
 	segments: Segment[];
 	segmentRoots: string[];
 	selectedSegment: Segment | null;
-	selectedAncillary: Assignment | null;
 	loadingSegments: boolean;
-	loadingAssignments: boolean;
+	loadingWorkspaces: boolean;
 }
 
 export interface ChatMessage {
@@ -207,41 +205,50 @@ class TorenClient {
 export const client = new TorenClient();
 
 // Status mapping helpers
-const BUSY_STATUSES: Set<AncillaryStatus> = new Set(['executing']);
 
-export function getAncillaryDisplayStatus(status: AncillaryStatus): AncillaryDisplayStatus {
-	return BUSY_STATUSES.has(status) ? 'busy' : 'ready';
+/** A workspace is "busy" when any of its sessions has a running pane. */
+export function getWorkspaceDisplayStatus(ws: WorkspaceView): WorkspaceDisplayStatus {
+	return ws.sets.sessions.some((s) => s.status === 'running') ? 'busy' : 'ready';
 }
 
-export function stripBeadPrefix(beadId: string): string {
-	const idx = beadId.indexOf('-');
-	return idx >= 0 ? beadId.slice(idx + 1) : beadId;
+/** Strip a "source-" / "source:" prefix off a task id for compact display. */
+export function stripTaskPrefix(id: string): string {
+	const sep = id.search(/[-:]/);
+	return sep >= 0 ? id.slice(sep + 1) : id;
 }
 
-/** Get task ID with backward-compat fallback */
-export function getTaskId(assignment: Assignment): string {
-	return assignment.task_id ?? assignment.external_id ?? assignment.bead_id ?? '';
-}
-
-/** Get task title with backward-compat fallback */
-export function getTaskTitle(assignment: Assignment): string {
-	return assignment.task_title ?? assignment.title ?? assignment.bead_title ?? '';
-}
-
-/** Derive bead display status from the composite task_status signal (from provider) */
-export function getBeadDisplayStatus(assignment: Assignment): BeadDisplayStatus {
-	const status = assignment.task_status ?? assignment.bead_status;
-	switch (status) {
-		case 'open':
-			return 'open';
-		case 'in_progress':
-			return 'in_progress';
-		case 'closed':
-			return 'closed';
-		default:
-			// Fallback: if composite status not available, default to in_progress
-			return 'in_progress';
+/** Native provider task status is pass-through; normalize it to an icon bucket. */
+export function getTaskDisplayStatus(task: TaskView): TaskDisplayStatus {
+	const status = (task.status ?? '').toLowerCase();
+	if (status.includes('clos') || status.includes('done') || status.includes('complete')) {
+		return 'closed';
 	}
+	if (status.includes('progress') || status.includes('active')) {
+		return 'in_progress';
+	}
+	if (status.includes('open') || status.includes('todo') || status.includes('backlog')) {
+		return 'open';
+	}
+	// Unknown/absent: treat as in progress (the workspace exists, so work is underway).
+	return 'in_progress';
+}
+
+/** Primary task for a workspace, if any (first collected task). */
+export function primaryTask(ws: WorkspaceView): TaskView | null {
+	return ws.sets.tasks[0] ?? null;
+}
+
+/**
+ * Which window a bare attach lands on, mirroring the daemon's `default_window` logic:
+ * the `agent` window if present, else the birth `shell`, else the first observable window.
+ * Returns null when there are no windows.
+ */
+export function defaultWindowName(sessions: SessionInfo[]): string | null {
+	if (sessions.length === 0) return null;
+	const agent = sessions.find((s) => s.window === 'agent');
+	if (agent) return agent.window;
+	const shell = sessions.find((s) => s.window === 'shell');
+	return (shell ?? sessions[0]).window;
 }
 
 // Create the store with a custom store that includes helper methods
@@ -253,15 +260,13 @@ function createTorenStore() {
 		error: null,
 		sessionToken: null,
 		shipUrl: 'http://localhost:8787',
-		ancillaries: [],
-		assignments: [],
+		workspaces: [],
 		messages: [],
 		segments: [],
 		segmentRoots: [],
 		selectedSegment: null,
-		selectedAncillary: null,
 		loadingSegments: false,
-		loadingAssignments: false,
+		loadingWorkspaces: false,
 	};
 
 	const { subscribe, set, update } = writable(initialState);
@@ -320,141 +325,91 @@ function createTorenStore() {
 				throw error;
 			}
 		},
-		async loadAssignments(shipUrl: string) {
-			update((state) => ({ ...state, loadingAssignments: true }));
+		async loadWorkspaces(shipUrl: string) {
+			update((state) => ({ ...state, loadingWorkspaces: true }));
 			try {
-				const response = await fetch(`${shipUrl}/api/assignments`);
-				if (!response.ok) throw new Error('Failed to fetch assignments');
+				const response = await fetch(`${shipUrl}/api/workspaces`);
+				if (!response.ok) throw new Error('Failed to fetch workspaces');
 				const data = await response.json();
 				update((state) => ({
 					...state,
-					assignments: data.assignments,
-					loadingAssignments: false,
+					workspaces: data.workspaces ?? [],
+					loadingWorkspaces: false,
 				}));
 			} catch (error) {
-				console.error('Failed to load assignments:', error);
+				console.error('Failed to load workspaces:', error);
 				update((state) => ({
 					...state,
-					loadingAssignments: false,
+					loadingWorkspaces: false,
 				}));
 			}
 		},
-		async loadAncillaries(shipUrl: string) {
-			try {
-				const response = await fetch(`${shipUrl}/api/ancillaries/list`);
-				if (!response.ok) throw new Error('Failed to fetch ancillaries');
-				const data = await response.json();
-				update((state) => ({
-					...state,
-					ancillaries: data.ancillaries ?? [],
-				}));
-			} catch (error) {
-				console.error('Failed to load ancillaries:', error);
-			}
+		/** Refresh a single workspace and merge it into local state. */
+		async refreshWorkspace(
+			shipUrl: string,
+			segment: string,
+			name: string,
+		): Promise<WorkspaceView | null> {
+			const seg = encodeURIComponent(segment);
+			const ws = encodeURIComponent(name);
+			const response = await fetch(`${shipUrl}/api/workspaces/${seg}/${ws}`);
+			if (!response.ok) return null;
+			const data = await response.json();
+			const workspace: WorkspaceView = data.workspace;
+			update((state) => ({
+				...state,
+				workspaces: state.workspaces.map((w) =>
+					w.segment === workspace.segment && w.name === workspace.name ? workspace : w,
+				),
+			}));
+			return workspace;
 		},
-		selectAncillary(assignment: Assignment | null) {
-			update((state) => ({ ...state, selectedAncillary: assignment }));
-		},
-		async createAssignment(shipUrl: string, request: CreateAssignmentRequest): Promise<Assignment> {
-			const response = await fetch(`${shipUrl}/api/assignments`, {
+		async startWorkspace(
+			shipUrl: string,
+			segment: string,
+			name: string,
+			request: StartWorkspaceRequest = {},
+		): Promise<string> {
+			const seg = encodeURIComponent(segment);
+			const ws = encodeURIComponent(name);
+			const response = await fetch(`${shipUrl}/api/workspaces/${seg}/${ws}/start`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify(request),
 			});
 			if (!response.ok) {
 				const data = await response.json().catch(() => ({}));
-				throw new Error(data.error || 'Failed to create assignment');
+				throw new Error(data.error || 'Failed to start workspace');
 			}
 			const data = await response.json();
-			const assignment = data.assignment;
-			// Add to assignments list
-			update((state) => ({
-				...state,
-				assignments: [...state.assignments, assignment],
-			}));
-			return assignment;
+			return data.session;
 		},
-		async startWork(shipUrl: string, ancillaryId: string, assignmentId: string): Promise<void> {
-			const encoded = encodeURIComponent(ancillaryId);
-			const response = await fetch(`${shipUrl}/api/ancillaries/${encoded}/start`, {
+		/** Open a new shell window in the workspace's session; resolves to the new window name. */
+		async startWorkspaceShell(shipUrl: string, segment: string, name: string): Promise<string> {
+			const seg = encodeURIComponent(segment);
+			const ws = encodeURIComponent(name);
+			const response = await fetch(`${shipUrl}/api/workspaces/${seg}/${ws}/shell`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ assignment_id: assignmentId }),
 			});
 			if (!response.ok) {
 				const data = await response.json().catch(() => ({}));
-				throw new Error(data.error || 'Failed to start work');
-			}
-		},
-		async completeAssignment(
-			shipUrl: string,
-			assignmentId: string,
-			options?: { push?: boolean; keep_open?: boolean },
-		): Promise<{ revision?: string; pushed: boolean }> {
-			const response = await fetch(`${shipUrl}/api/assignments/${assignmentId}/complete`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					push: options?.push ?? false,
-					keep_open: options?.keep_open ?? false,
-				}),
-			});
-			if (!response.ok) {
-				const data = await response.json().catch(() => ({}));
-				throw new Error(data.error || 'Failed to complete assignment');
+				throw new Error(data.error || 'Failed to open shell');
 			}
 			const data = await response.json();
-			// Remove assignment from local state
-			update((state) => ({
-				...state,
-				assignments: state.assignments.filter((a) => a.id !== assignmentId),
-			}));
-			return { revision: data.revision, pushed: data.pushed };
+			return data.window;
 		},
-		async abortAssignment(
-			shipUrl: string,
-			assignmentId: string,
-			options?: { close_bead?: boolean },
-		): Promise<void> {
-			const response = await fetch(`${shipUrl}/api/assignments/${assignmentId}/abort`, {
+		async stopWorkspace(shipUrl: string, segment: string, name: string): Promise<void> {
+			const seg = encodeURIComponent(segment);
+			const ws = encodeURIComponent(name);
+			const response = await fetch(`${shipUrl}/api/workspaces/${seg}/${ws}/stop`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ close_bead: options?.close_bead ?? false }),
 			});
 			if (!response.ok) {
 				const data = await response.json().catch(() => ({}));
-				throw new Error(data.error || 'Failed to abort assignment');
+				throw new Error(data.error || 'Failed to stop workspace');
 			}
-			// Remove assignment from local state
-			update((state) => ({
-				...state,
-				assignments: state.assignments.filter((a) => a.id !== assignmentId),
-			}));
-		},
-		async resumeAssignment(
-			shipUrl: string,
-			assignmentId: string,
-			options?: { instruction?: string; start_work?: boolean },
-		): Promise<{ assignment: Assignment; work_started: boolean }> {
-			const response = await fetch(`${shipUrl}/api/assignments/${assignmentId}/resume`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					instruction: options?.instruction,
-					start_work: options?.start_work ?? true,
-				}),
-			});
-			if (!response.ok) {
-				const data = await response.json().catch(() => ({}));
-				throw new Error(data.error || 'Failed to resume assignment');
-			}
-			const data = await response.json();
-			// Update assignment in local state
-			update((state) => ({
-				...state,
-				assignments: state.assignments.map((a) => (a.id === assignmentId ? data.assignment : a)),
-			}));
-			return { assignment: data.assignment, work_started: data.work_started };
 		},
 	};
 }
@@ -465,13 +420,13 @@ export const torenStore = createTorenStore();
 export const isConnected = derived(torenStore, ($toren) => $toren.connected);
 export const isAuthenticated = derived(torenStore, ($toren) => $toren.authenticated);
 export const messages = derived(torenStore, ($toren) => $toren.messages);
-export const assignments = derived(torenStore, ($toren) => $toren.assignments);
+export const workspaces = derived(torenStore, ($toren) => $toren.workspaces);
 
-// Filter assignments for current segment and sort by ancillary number
-export const segmentAssignments = derived(torenStore, ($toren) => {
+// Filter workspaces for the current segment and sort by name
+export const segmentWorkspaces = derived(torenStore, ($toren) => {
 	if (!$toren.selectedSegment) return [];
 	const segmentName = $toren.selectedSegment.name.toLowerCase();
-	return $toren.assignments
-		.filter((a) => a.segment.toLowerCase() === segmentName)
-		.sort((a, b) => (a.ancillary_num ?? Infinity) - (b.ancillary_num ?? Infinity));
+	return $toren.workspaces
+		.filter((w) => w.segment.toLowerCase() === segmentName)
+		.sort((a, b) => a.name.localeCompare(b.name));
 });

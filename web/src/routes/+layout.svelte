@@ -14,8 +14,7 @@ onMount(() => {
 		const state = $torenStore;
 		await Promise.all([
 			torenStore.loadSegments(state.shipUrl),
-			torenStore.loadAssignments(state.shipUrl),
-			torenStore.loadAncillaries(state.shipUrl),
+			torenStore.loadWorkspaces(state.shipUrl),
 		]);
 
 		// Restore selected segment from localStorage
@@ -32,10 +31,7 @@ onMount(() => {
 
 	manager.onHeartbeat = async () => {
 		const state = $torenStore;
-		await Promise.all([
-			torenStore.loadAncillaries(state.shipUrl),
-			torenStore.loadAssignments(state.shipUrl),
-		]);
+		await torenStore.loadWorkspaces(state.shipUrl);
 	};
 
 	manager.init();

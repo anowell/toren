@@ -10,17 +10,17 @@ let error = '';
 
 $: selectedRoot = ($torenStore.segmentRoots ?? [])[0] || '';
 
-// Get set of segment names that have assignments
-$: segmentsWithAssignments = new Set(
-	($torenStore.assignments ?? []).map((a) => a.segment.toLowerCase()),
+// Get set of segment names that have workspaces
+$: segmentsWithWorkspaces = new Set(
+	($torenStore.workspaces ?? []).map((w) => w.segment.toLowerCase()),
 );
 
-// Sort segments: those with assignments first, then alphabetically within each group
+// Sort segments: those with workspaces first, then alphabetically within each group
 $: sortedSegments = [...($torenStore.segments ?? [])].sort((a, b) => {
-	const aHasAssignment = segmentsWithAssignments.has(a.name.toLowerCase());
-	const bHasAssignment = segmentsWithAssignments.has(b.name.toLowerCase());
-	if (aHasAssignment && !bHasAssignment) return -1;
-	if (!aHasAssignment && bHasAssignment) return 1;
+	const aHasWorkspace = segmentsWithWorkspaces.has(a.name.toLowerCase());
+	const bHasWorkspace = segmentsWithWorkspaces.has(b.name.toLowerCase());
+	if (aHasWorkspace && !bHasWorkspace) return -1;
+	if (!aHasWorkspace && bHasWorkspace) return 1;
 	return a.name.localeCompare(b.name);
 });
 

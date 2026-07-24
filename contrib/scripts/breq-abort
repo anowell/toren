@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# breq abort [workspace] — hand a workspace's tasks back.
+#
+# A plain PATH script, like breq-complete. Reopens each linked task and drops its assignee,
+# so the work returns to whatever "unclaimed" means in your tracker.
+#
+# It does not discard your work or delete the workspace. To do that:
+#   breq teardown <workspace> --kill
+
+set -euo pipefail
+
+ws="${1:-${TOREN_WORKSPACE:-}}"
+if [ -z "$ws" ]; then
+    echo "usage: breq abort <workspace>" >&2
+    exit 2
+fi
+
+links=$(breq get "$ws" task || true)
+if [ -z "$links" ]; then
+    echo "No tasks linked to '$ws'." >&2
+    exit 1
+fi
+
+for link in $links; do
+    source="${link%%:*}"
+    case "$source" in
+        runes)  status="todo" ;;
+        github) status="open" ;;
+        linear) status="Todo" ;;
+        beads)  status="open" ;;
+        *)      status="open" ;;
+    esac
+
+    echo "$link -> $status"
+    breq set "$ws" task.status "$status" --task "$link"
+    breq set "$ws" task.assignee "none" --task "$link" 2>/dev/null || true
+done

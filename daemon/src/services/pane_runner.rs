@@ -114,7 +114,9 @@ impl PaneMirror {
 /// Everything the daemon tracks for one ancillary's rmux session.
 struct TrackedPane {
     session: String,
-    /// A different id from the session's live agent pane means this mirror is stale.
+    /// Which window's pane this mirror follows.
+    window: String,
+    /// A different id from the window's live pane means this mirror is stale.
     pane_id: PaneId,
     mirror: Arc<PaneMirror>,
     recorder: tokio::task::JoinHandle<()>,
@@ -130,15 +132,13 @@ impl Drop for TrackedPane {
 pub struct PaneRunner {
     rmux: OnceCell<Arc<Rmux>>,
     tracked: RwLock<HashMap<String, TrackedPane>>,
-    transcript_root: PathBuf,
 }
 
 impl PaneRunner {
-    pub fn new(transcript_root: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
             rmux: OnceCell::new(),
             tracked: RwLock::new(HashMap::new()),
-            transcript_root,
         }
     }
 
@@ -158,70 +158,84 @@ impl PaneRunner {
             .cloned()
     }
 
-    /// Start (or restart) an agent for an ancillary and begin mirroring its pane.
+    /// Start (or restart) an agent in a workspace's session and begin mirroring its pane.
+    ///
+    /// The session name and transcript path come from the caller, which derives them from the
+    /// workspace's annotations — that's what keys both to the instance uid.
     pub async fn start_agent(
         &self,
-        ancillary_id: &str,
-        segment: &str,
+        key: &str,
+        session: &str,
         workspace_path: &Path,
+        env: &[(String, String)],
         argv: &[String],
-        transcript_name: &str,
+        transcript: &Path,
     ) -> Result<String> {
-        let ws_name = workspace_name(workspace_path)?;
-        let session = rmux_conv::session_name(segment, &ws_name);
-
         // Same helpers `breq` uses, so both interfaces produce identical sessions.
-        rmux_conv::ensure_session(&session, workspace_path)?;
-        rmux_conv::spawn_agent(&session, workspace_path, argv)?;
+        rmux_conv::ensure_session(session, workspace_path, env)?;
+        rmux_conv::spawn_agent(session, workspace_path, argv)?;
 
-        info!(
-            "{}: spawned {} in rmux session {}",
-            ancillary_id, argv[0], session
-        );
+        info!("{}: spawned {} in rmux session {}", key, argv[0], session);
 
-        self.track(ancillary_id, &session, transcript_name).await?;
-        Ok(session)
+        self.track(key, session, rmux_conv::AGENT_WINDOW, transcript)
+            .await?;
+        Ok(session.to_string())
     }
 
-    /// Point the ancillary's mirror at the pane running right now.
+    /// Open a fresh shell window in the workspace's session, returning its window name.
+    ///
+    /// The browser can hold several shells at once (a dev server, a log tail, a scratch prompt),
+    /// so each gets a unique name; the caller then mirrors it like any other window.
+    pub async fn open_shell(
+        &self,
+        session: &str,
+        workspace_path: &Path,
+        env: &[(String, String)],
+    ) -> Result<String> {
+        rmux_conv::ensure_session(session, workspace_path, env)?;
+        let window = rmux_conv::open_shell(session, workspace_path)?;
+        info!("opened shell window '{}' in {}", window, session);
+        Ok(window)
+    }
+
+    /// Point a mirror at the pane running right now in `window`.
     ///
     /// Adopts a session this process never started, and replaces a mirror left following a pane
-    /// that `breq do` or a resume has since swapped out.
+    /// that `breq do` or a resume has since swapped out. `key` scopes the mirror to one window,
+    /// so a workspace can have its agent and several shells mirrored at once.
     pub async fn ensure_current(
         &self,
-        ancillary_id: &str,
-        segment: &str,
-        workspace_path: &Path,
-        transcript_name: &str,
+        key: &str,
+        session: &str,
+        window: &str,
+        transcript: &Path,
     ) -> Result<String> {
-        let ws_name = workspace_name(workspace_path)?;
-        let session = rmux_conv::session_name(segment, &ws_name);
-        if !rmux_conv::session_exists(&session) {
+        if !rmux_conv::session_exists(session) {
             return Err(anyhow!("No rmux session '{}'", session));
         }
 
-        let live_pane_id = self.find_agent(&session).await?.pane_id;
+        let live_pane_id = self.find_window(session, window).await?.pane_id;
 
         let is_current = self
             .tracked
             .read()
             .await
-            .get(ancillary_id)
+            .get(key)
             .is_some_and(|t| t.pane_id == live_pane_id && !t.recorder.is_finished());
         if is_current {
-            return Ok(session);
+            return Ok(session.to_string());
         }
 
-        self.track(ancillary_id, &session, transcript_name).await?;
-        Ok(session)
+        self.track(key, session, window, transcript).await?;
+        Ok(session.to_string())
     }
 
-    /// Attach a recorder to the session's agent pane, replacing any previous one.
-    async fn track(&self, ancillary_id: &str, session: &str, transcript_name: &str) -> Result<()> {
-        let discovered = self.find_agent(session).await?;
+    /// Attach a recorder to `window`'s pane, replacing any previous one under `key`.
+    async fn track(&self, key: &str, session: &str, window: &str, transcript: &Path) -> Result<()> {
+        let discovered = self.find_window(session, window).await?;
         let (pane, pane_id) = (discovered.pane, discovered.pane_id);
 
-        let transcript = self.transcript_path(ancillary_id, transcript_name);
+        let transcript = transcript.to_path_buf();
         if let Some(parent) = transcript.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -242,9 +256,10 @@ impl PaneRunner {
 
         // Clients on the outgoing mirror would otherwise hang on a subscription nothing feeds.
         let previous = self.tracked.write().await.insert(
-            ancillary_id.to_string(),
+            key.to_string(),
             TrackedPane {
                 session: session.to_string(),
+                window: window.to_string(),
                 pane_id,
                 mirror,
                 recorder,
@@ -272,42 +287,49 @@ impl PaneRunner {
             .map(|t| t.session.clone())
     }
 
-    /// Forward browser keystrokes to the agent pane, verbatim.
-    pub async fn send_input(&self, ancillary_id: &str, text: &str) -> Result<()> {
-        let session = self
-            .session_of(ancillary_id)
+    /// The (session, window) a mirror is following.
+    async fn tracked_target(&self, key: &str) -> Option<(String, String)> {
+        self.tracked
+            .read()
             .await
-            .ok_or_else(|| anyhow!("No tracked pane for {}", ancillary_id))?;
-        self.agent_pane(&session).await?.send_text(text).await?;
+            .get(key)
+            .map(|t| (t.session.clone(), t.window.clone()))
+    }
+
+    /// Forward browser keystrokes to the mirrored pane, verbatim.
+    pub async fn send_input(&self, key: &str, text: &str) -> Result<()> {
+        let (session, window) = self
+            .tracked_target(key)
+            .await
+            .ok_or_else(|| anyhow!("No tracked pane for {}", key))?;
+        self.window_pane(&session, &window)
+            .await?
+            .send_text(text)
+            .await?;
         Ok(())
     }
 
-    /// Match the agent's geometry to the browser terminal's.
+    /// Match the mirrored window's geometry to the browser terminal's.
     ///
     /// Resizes the window, not the pane: a pane can't exceed its window, and a detached window
     /// sits at rmux's 80x24 default, so resizing the pane alone is a silent no-op. `window-size`
     /// is left at its default so an attached human isn't fighting a browser tab for geometry.
-    pub async fn resize(&self, ancillary_id: &str, cols: u16, rows: u16) -> Result<()> {
-        let session = self
-            .session_of(ancillary_id)
+    pub async fn resize(&self, key: &str, cols: u16, rows: u16) -> Result<()> {
+        let (session, window) = self
+            .tracked_target(key)
             .await
-            .ok_or_else(|| anyhow!("No tracked pane for {}", ancillary_id))?;
+            .ok_or_else(|| anyhow!("No tracked pane for {}", key))?;
 
-        self.agent_window(&session)
+        self.window_handle(&session, &window)
             .await?
             .resize(Some(cols), Some(rows))
             .await?;
         Ok(())
     }
 
-    /// Liveness of an ancillary's agent, derived from rmux rather than tracked separately.
-    pub async fn status(&self, segment: &str, workspace_path: &Path) -> PaneStatus {
-        let Ok(ws_name) = workspace_name(workspace_path) else {
-            return PaneStatus::Idle;
-        };
-        let session = rmux_conv::session_name(segment, &ws_name);
-
-        let Ok(pane) = self.agent_pane(&session).await else {
+    /// Liveness of a specific window's pane, derived from rmux rather than tracked separately.
+    pub async fn status(&self, session: &str, window: &str) -> PaneStatus {
+        let Ok(pane) = self.window_pane(session, window).await else {
             return PaneStatus::Idle;
         };
         let Ok(info) = pane.info().await else {
@@ -326,52 +348,52 @@ impl PaneRunner {
         }
     }
 
-    /// Kill the agent window and stop mirroring, leaving the session's shell alive.
+    /// Kill the agent window and stop mirroring, leaving the session's shells alive.
     ///
     /// Works off the workspace rather than what this process tracks, so a `breq do` agent is
     /// equally stoppable. Returns whether an agent was actually running.
-    pub async fn stop_agent(
-        &self,
-        ancillary_id: &str,
-        segment: &str,
-        workspace_path: &Path,
-    ) -> Result<bool> {
-        let ws_name = workspace_name(workspace_path)?;
-        let session = rmux_conv::session_name(segment, &ws_name);
+    pub async fn stop_agent(&self, key: &str, session: &str) -> Result<bool> {
+        self.close_window(key, session, rmux_conv::AGENT_WINDOW)
+            .await
+    }
 
-        if let Some(tracked) = self.tracked.write().await.remove(ancillary_id) {
+    /// Kill one window and stop mirroring it, leaving the rest of the session alive.
+    ///
+    /// A workspace's session is a set of windows; closing one (an agent, a finished dev-server
+    /// shell) is not the same as tearing the whole session down.
+    pub async fn close_window(&self, key: &str, session: &str, window: &str) -> Result<bool> {
+        if let Some(tracked) = self.tracked.write().await.remove(key) {
             // Attached browsers are following a pane that is about to die.
             tracked.mirror.mark_ended();
         }
 
-        if !rmux_conv::agent_is_running(&session) {
-            // Still clear out a dead agent window so the next spawn starts from a clean session.
-            let _ = rmux_conv::kill_agent(&session);
-            return Ok(false);
+        let was_live = rmux_conv::window_exists(session, window);
+        // Kill even a dead window so the next spawn of that name starts clean.
+        rmux_conv::kill_window(session, window)?;
+        if was_live {
+            info!("{}: killed window '{}' in {}", key, window, session);
         }
-
-        rmux_conv::kill_agent(&session)?;
-        info!("{}: killed agent window in {}", ancillary_id, session);
-        Ok(true)
+        Ok(was_live)
     }
 
-    /// Resolve the session's `agent` window to a pane handle.
+    /// Resolve a session window to a pane handle.
     ///
     /// Matched by window name: indices shift as windows come and go, and pane titles are
     /// unreliable because agents set them via OSC escapes.
-    async fn agent_pane(&self, session: &str) -> Result<rmux_sdk::Pane> {
-        Ok(self.find_agent(session).await?.pane)
+    async fn window_pane(&self, session: &str, window: &str) -> Result<rmux_sdk::Pane> {
+        Ok(self.find_window(session, window).await?.pane)
     }
 
-    /// The window containing the session's agent pane.
-    async fn agent_window(&self, session: &str) -> Result<rmux_sdk::Window> {
-        let window_index = self.find_agent(session).await?.window_index;
+    /// The window handle for a named window.
+    async fn window_handle(&self, session: &str, window: &str) -> Result<rmux_sdk::Window> {
+        let window_index = self.find_window(session, window).await?.window_index;
         let rmux = self.rmux().await?;
         let name = SessionName::new(session).map_err(|e| anyhow!("{}", e))?;
         Ok(rmux.session(name).await?.window(window_index))
     }
 
-    async fn find_agent(&self, session: &str) -> Result<rmux_sdk::DiscoveredPane> {
+    /// Find the live pane of a named window in a session.
+    async fn find_window(&self, session: &str, window: &str) -> Result<rmux_sdk::DiscoveredPane> {
         let rmux = self.rmux().await?;
         let panes = rmux
             .find_panes()
@@ -382,11 +404,11 @@ impl PaneRunner {
 
         for discovered in panes {
             let info = discovered.pane.info().await?;
-            let is_agent = info.windows.iter().any(|w| {
-                w.index == discovered.window_index
-                    && w.name.as_deref() == Some(rmux_conv::AGENT_WINDOW)
-            });
-            if is_agent {
+            let matches = info
+                .windows
+                .iter()
+                .any(|w| w.index == discovered.window_index && w.name.as_deref() == Some(window));
+            if matches {
                 return Ok(discovered);
             }
         }
@@ -394,14 +416,8 @@ impl PaneRunner {
         Err(anyhow!(
             "rmux session '{}' has no '{}' window",
             session,
-            rmux_conv::AGENT_WINDOW
+            window
         ))
-    }
-
-    fn transcript_path(&self, ancillary_id: &str, transcript_name: &str) -> PathBuf {
-        self.transcript_root
-            .join(sanitize_component(ancillary_id))
-            .join(format!("{}.raw", sanitize_component(transcript_name)))
     }
 }
 
@@ -543,6 +559,7 @@ async fn record_pane(
 }
 
 /// The workspace directory name, which is the ancillary's word-name (`one`, `two`, ...).
+#[allow(dead_code)]
 fn workspace_name(workspace_path: &Path) -> Result<String> {
     workspace_path
         .file_name()
@@ -557,6 +574,7 @@ fn workspace_name(workspace_path: &Path) -> Result<String> {
 }
 
 /// Make a string safe to use as a single path component.
+#[allow(dead_code)]
 fn sanitize_component(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -599,8 +617,9 @@ mod tests {
         std::fs::create_dir(&workspace).unwrap();
 
         let segment = format!("panerunner{}", std::process::id());
-        let session = rmux_conv::session_name(&segment, "one");
-        rmux_conv::ensure_session(&session, &workspace).unwrap();
+        let session = rmux_conv::session_name(&segment, "one", None);
+        let transcript = dir.path().join("transcripts").join("one.raw");
+        rmux_conv::ensure_session(&session, &workspace, &[]).unwrap();
         rmux_conv::spawn_agent(
             &session,
             &workspace,
@@ -612,26 +631,24 @@ mod tests {
         )
         .unwrap();
 
-        let runner = PaneRunner::new(dir.path().join("transcripts"));
+        // The tracking key is the place's session name (uid-embedded).
+        let runner = PaneRunner::new();
         wait_for(|| async {
             runner
-                .ensure_current("Test One", &segment, &workspace, "assignment")
+                .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW, &transcript)
                 .await
                 .is_ok()
         })
         .await;
 
-        let mirror = runner.mirror("Test One").await.expect("pane is tracked");
+        let mirror = runner.mirror(&session).await.expect("pane is tracked");
 
         // Backfill: output produced before we attached.
         wait_for(|| async { contains(&mirror.attach().await.0, "BEFORE-ATTACH") }).await;
 
         // Live: output produced after, delivered on the subscription taken with the backfill.
         let (_, mut live) = mirror.attach().await;
-        runner
-            .send_input("Test One", "AFTER-ATTACH\n")
-            .await
-            .unwrap();
+        runner.send_input(&session, "AFTER-ATTACH\n").await.unwrap();
 
         let mut seen = Vec::new();
         while !contains(&seen, "AFTER-ATTACH") {
@@ -643,14 +660,14 @@ mod tests {
         }
 
         assert_eq!(
-            runner.status(&segment, &workspace).await,
+            runner.status(&session, rmux_conv::AGENT_WINDOW).await,
             PaneStatus::Working
         );
 
         // A detached window sits at 80x24, so this guards the window-vs-pane distinction.
-        runner.resize("Test One", 100, 30).await.unwrap();
+        runner.resize(&session, 100, 30).await.unwrap();
         let snapshot = runner
-            .agent_pane(&session)
+            .window_pane(&session, rmux_conv::AGENT_WINDOW)
             .await
             .unwrap()
             .snapshot()
@@ -658,15 +675,9 @@ mod tests {
             .unwrap();
         assert_eq!((snapshot.cols, snapshot.rows), (100, 30));
 
-        assert!(runner
-            .stop_agent("Test One", &segment, &workspace)
-            .await
-            .unwrap());
+        assert!(runner.stop_agent(&session, &session).await.unwrap());
         // Nothing left to stop, and it must say so rather than report success.
-        assert!(!runner
-            .stop_agent("Test One", &segment, &workspace)
-            .await
-            .unwrap());
+        assert!(!runner.stop_agent(&session, &session).await.unwrap());
         rmux_conv::kill_session(&session).unwrap();
     }
 
@@ -684,9 +695,9 @@ mod tests {
         std::fs::create_dir(&workspace).unwrap();
 
         let segment = format!("readopt{}", std::process::id());
-        let session = rmux_conv::session_name(&segment, "one");
-        let transcripts = dir.path().join("transcripts");
-        let runner = PaneRunner::new(transcripts.clone());
+        let session = rmux_conv::session_name(&segment, "one", None);
+        let transcript = dir.path().join("transcripts").join("one.raw");
+        let runner = PaneRunner::new();
 
         let first_agent = vec![
             "/bin/sh".to_string(),
@@ -694,26 +705,32 @@ mod tests {
             "echo FIRST-AGENT; sleep 30".to_string(),
         ];
         runner
-            .start_agent("Test One", &segment, &workspace, &first_agent, "a-1")
+            .start_agent(
+                &session,
+                &session,
+                &workspace,
+                &[],
+                &first_agent,
+                &transcript,
+            )
             .await
             .unwrap();
 
-        let first_mirror = runner.mirror("Test One").await.unwrap();
+        let first_mirror = runner.mirror(&session).await.unwrap();
         wait_for(|| async { contains(&first_mirror.attach().await.0, "FIRST-AGENT") }).await;
 
         runner
-            .ensure_current("Test One", &segment, &workspace, "a-1")
+            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW, &transcript)
             .await
             .unwrap();
         assert!(
-            Arc::ptr_eq(&first_mirror, &runner.mirror("Test One").await.unwrap()),
+            Arc::ptr_eq(&first_mirror, &runner.mirror(&session).await.unwrap()),
             "re-adopting an unchanged pane should not rebuild the mirror"
         );
 
-        let transcript = transcripts.join("Test-One").join("a-1.raw");
         wait_for(|| async { occurrences(&transcript, "FIRST-AGENT").await == 1 }).await;
         runner
-            .ensure_current("Test One", &segment, &workspace, "a-1")
+            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW, &transcript)
             .await
             .unwrap();
         assert_eq!(
@@ -736,11 +753,11 @@ mod tests {
         .unwrap();
 
         runner
-            .ensure_current("Test One", &segment, &workspace, "a-1")
+            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW, &transcript)
             .await
             .unwrap();
 
-        let second_mirror = runner.mirror("Test One").await.unwrap();
+        let second_mirror = runner.mirror(&session).await.unwrap();
         assert!(
             !Arc::ptr_eq(&first_mirror, &second_mirror),
             "a replaced pane must get a fresh mirror"
@@ -751,10 +768,7 @@ mod tests {
         );
         wait_for(|| async { contains(&second_mirror.attach().await.0, "SECOND-AGENT") }).await;
 
-        runner
-            .stop_agent("Test One", &segment, &workspace)
-            .await
-            .unwrap();
+        runner.stop_agent(&session, &session).await.unwrap();
         rmux_conv::kill_session(&session).unwrap();
     }
 
@@ -771,38 +785,39 @@ mod tests {
         std::fs::create_dir(&workspace).unwrap();
 
         let segment = format!("history{}", std::process::id());
-        let session = rmux_conv::session_name(&segment, "one");
-        let transcripts = dir.path().join("transcripts");
+        let session = rmux_conv::session_name(&segment, "one", None);
+        let transcript = dir.path().join("transcripts").join("one.raw");
 
         {
-            let runner = PaneRunner::new(transcripts.clone());
+            let runner = PaneRunner::new();
             runner
                 .start_agent(
-                    "Test One",
-                    &segment,
+                    &session,
+                    &session,
                     &workspace,
+                    &[],
                     &[
                         "/bin/sh".to_string(),
                         "-c".to_string(),
                         "echo WORK-THAT-HAPPENED; sleep 30".to_string(),
                     ],
-                    "a-1",
+                    &transcript,
                 )
                 .await
                 .unwrap();
 
-            let mirror = runner.mirror("Test One").await.unwrap();
+            let mirror = runner.mirror(&session).await.unwrap();
             wait_for(|| async { contains(&mirror.attach().await.0, "WORK-THAT-HAPPENED") }).await;
         }
 
         // A fresh PaneRunner stands in for a daemon restart: no in-memory replay buffer left.
-        let restarted = PaneRunner::new(transcripts);
+        let restarted = PaneRunner::new();
         restarted
-            .ensure_current("Test One", &segment, &workspace, "a-1")
+            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW, &transcript)
             .await
             .unwrap();
 
-        let mirror = restarted.mirror("Test One").await.unwrap();
+        let mirror = restarted.mirror(&session).await.unwrap();
         let (backfill, _) = mirror.attach().await;
         assert!(
             contains(&backfill, "WORK-THAT-HAPPENED"),

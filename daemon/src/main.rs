@@ -9,7 +9,7 @@ mod security;
 mod services;
 
 // Re-export from toren-lib for internal use
-use toren_lib::{AssignmentManager, Config, SegmentManager, WorkspaceManager};
+use toren_lib::{Config, SegmentManager, WorkspaceManager};
 
 #[derive(Parser)]
 #[command(name = "toren-daemon")]
@@ -51,7 +51,10 @@ async fn main() -> Result<()> {
 
     // Initialize Rhai plugin manager (shared with breq CLI)
     let rhai_plugins = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))?;
-    info!("Rhai plugins loaded: {:?}", rhai_plugins.list());
+    info!(
+        "Rhai agent plugins loaded: {:?}",
+        rhai_plugins.list_agents()
+    );
     info!("Ancillary systems initialized");
 
     // Start services
@@ -61,10 +64,6 @@ async fn main() -> Result<()> {
     // Initialize ancillary manager
     let ancillary_manager = ancillary::AncillaryManager::new();
     info!("Ancillary manager initialized");
-
-    // Initialize assignment manager
-    let assignment_manager = AssignmentManager::new()?;
-    info!("Assignment manager initialized");
 
     // Initialize segment manager
     let segment_manager = SegmentManager::new(&config)?;
@@ -79,14 +78,9 @@ async fn main() -> Result<()> {
     );
     let workspace_manager = Some(WorkspaceManager::new(workspace_root, local_domain));
 
-    // Agents run in rmux panes; transcripts of those panes live under the toren root.
-    let pane_runner =
-        services::pane_runner::PaneRunner::new(toren_lib::toren_root().join("transcripts"));
+    // Agents run in rmux panes; transcript paths come from toren_lib::transcripts.
+    let pane_runner = services::pane_runner::PaneRunner::new();
     info!("Pane runner initialized");
-
-    // Resolve coding agent
-    let agent = config.resolve_agent(None)?;
-    info!("Coding agent: {}", agent);
 
     // Start API server
     let addr = format!("{}:{}", config.host(), config.port());
@@ -99,11 +93,9 @@ async fn main() -> Result<()> {
         security_ctx,
         rhai_plugins,
         ancillary_manager,
-        assignment_manager,
         segment_manager,
         workspace_manager,
         pane_runner,
-        agent,
     )
     .await?;
 

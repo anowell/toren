@@ -7,26 +7,19 @@ use tracing::{error, info, warn};
 use super::AppState;
 use crate::ancillary::AncillaryStatus;
 use crate::services::command::CommandRequest;
-use toren_lib::tasks;
+use toren_lib::PlaceRegistry;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum WsRequest {
     Auth {
         token: String,
-        /// Ancillary ID to connect as (e.g., "Toren One")
-        /// If provided, looks up assignment for this ancillary
-        #[serde(default)]
-        ancillary_id: Option<String>,
-        /// Segment - only used if no assignment found (legacy mode)
+        /// Segment to work in. When set with `workspace`, the connection resolves that place.
         #[serde(default)]
         segment: Option<String>,
-        /// Workspace name - only used if no assignment found (legacy mode)
+        /// Workspace name within the segment.
         #[serde(default)]
         workspace: Option<String>,
-        /// Task ID - only used if no assignment found (legacy mode)
-        #[serde(default)]
-        task_id: Option<String>,
     },
     Command {
         request: CommandRequest,
@@ -45,15 +38,11 @@ enum WsResponse {
     AuthSuccess {
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        ancillary_id: Option<String>,
+        segment: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        assignment_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        task_id: Option<String>,
+        workspace: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         working_dir: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        instruction: Option<String>,
     },
     AuthFailure {
         reason: String,
@@ -75,8 +64,8 @@ enum WsResponse {
 pub async fn handle_websocket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let mut authenticated = false;
+    // Connection-tracking key, `segment/workspace`, registered for the life of the socket.
     let mut ancillary_id: Option<String> = None;
-    let mut _assignment_id: Option<String> = None;
 
     info!("New WebSocket connection");
 
@@ -95,10 +84,8 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
             match request {
                 Ok(WsRequest::Auth {
                     token,
-                    ancillary_id: aid,
                     segment,
                     workspace,
-                    task_id,
                 }) => {
                     if !state.security.validate_session(&token) {
                         let response = WsResponse::AuthFailure {
@@ -113,171 +100,47 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
 
                     authenticated = true;
 
-                    // Try to connect via assignment first
-                    if let Some(ref id) = aid {
-                        match connect_via_assignment(&state, id, &token).await {
-                            Ok((response, aid_clone, assign_id)) => {
-                                ancillary_id = Some(aid_clone);
-                                _assignment_id = Some(assign_id);
-                                if let Ok(json) = serde_json::to_string(&response) {
-                                    let _ = sender.send(Message::Text(json)).await;
-                                }
-                                info!("WebSocket authenticated via assignment for {}", id);
-                                continue;
+                    // A terminal/agent connection names a place by segment (+ workspace); the
+                    // working directory is that place's path, or the segment root without one.
+                    let mut working_dir: Option<String> = None;
+                    if let Some(ref seg_name) = segment {
+                        match resolve_working_dir(&state, seg_name, workspace.as_deref()) {
+                            Ok(dir) => {
+                                let key = match &workspace {
+                                    Some(ws) => format!("{}/{}", seg_name, ws),
+                                    None => seg_name.clone(),
+                                };
+                                state.ancillaries.register(
+                                    key.clone(),
+                                    seg_name.clone(),
+                                    token.clone(),
+                                    workspace.clone(),
+                                    dir.clone(),
+                                );
+                                ancillary_id = Some(key);
+                                working_dir = Some(dir.display().to_string());
                             }
-                            Err(Some(reason)) => {
-                                // Assignment lookup failed with specific error
+                            Err(reason) => {
                                 let response = WsResponse::AuthFailure { reason };
                                 if let Ok(json) = serde_json::to_string(&response) {
                                     let _ = sender.send(Message::Text(json)).await;
                                 }
                                 break;
                             }
-                            Err(None) => {
-                                // No assignment found, fall through to legacy mode
-                                info!("No assignment found for {}, trying legacy mode", id);
-                            }
                         }
                     }
-
-                    // Legacy mode: create workspace on-the-fly (for backwards compatibility)
-                    let mut working_dir_response: Option<String> = None;
-
-                    if let (Some(id), Some(seg)) = (aid.clone(), segment.clone()) {
-                        let segment_path = {
-                            let segments = state.segments.read().unwrap();
-                            segments.find_by_name(&seg).map(|s| s.path.clone())
-                        };
-
-                        let (ws_name, working_dir) = match (&workspace, &segment_path) {
-                            (Some(ws), Some(seg_path)) => {
-                                if let Some(ref ws_mgr) = state.workspaces {
-                                    match ws_mgr.create_workspace(seg_path, &seg, ws) {
-                                        Ok(ws_path) => {
-                                            if let Some(other_id) =
-                                                state.ancillaries.is_workspace_in_use(&ws_path)
-                                            {
-                                                let response = WsResponse::AuthFailure {
-                                                    reason: format!("Workspace {} is already in use by ancillary {}", ws, other_id),
-                                                };
-                                                if let Ok(json) = serde_json::to_string(&response) {
-                                                    let _ = sender.send(Message::Text(json)).await;
-                                                }
-                                                break;
-                                            }
-                                            working_dir_response =
-                                                Some(ws_path.display().to_string());
-                                            (Some(ws.clone()), ws_path)
-                                        }
-                                        Err(e) => {
-                                            let response = WsResponse::AuthFailure {
-                                                reason: format!(
-                                                    "Failed to create workspace: {}",
-                                                    e
-                                                ),
-                                            };
-                                            if let Ok(json) = serde_json::to_string(&response) {
-                                                let _ = sender.send(Message::Text(json)).await;
-                                            }
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    let response = WsResponse::AuthFailure {
-                                        reason:
-                                            "Workspace requested but workspace_root not configured"
-                                                .to_string(),
-                                    };
-                                    if let Ok(json) = serde_json::to_string(&response) {
-                                        let _ = sender.send(Message::Text(json)).await;
-                                    }
-                                    break;
-                                }
-                            }
-                            (None, Some(seg_path)) => {
-                                if let Some(other_id) =
-                                    state.ancillaries.is_workspace_in_use(seg_path)
-                                {
-                                    let response = WsResponse::AuthFailure {
-                                        reason: format!(
-                                            "Segment {} is already in use by ancillary {}",
-                                            seg, other_id
-                                        ),
-                                    };
-                                    if let Ok(json) = serde_json::to_string(&response) {
-                                        let _ = sender.send(Message::Text(json)).await;
-                                    }
-                                    break;
-                                }
-                                working_dir_response = Some(seg_path.display().to_string());
-                                (None, seg_path.clone())
-                            }
-                            (_, None) => {
-                                let response = WsResponse::AuthFailure {
-                                    reason: format!("Segment not found: {}", seg),
-                                };
-                                if let Ok(json) = serde_json::to_string(&response) {
-                                    let _ = sender.send(Message::Text(json)).await;
-                                }
-                                break;
-                            }
-                        };
-
-                        state.ancillaries.register(
-                            id.clone(),
-                            seg.clone(),
-                            token.clone(),
-                            ws_name.map(|s| s.to_string()),
-                            working_dir.clone(),
-                        );
-                        ancillary_id = Some(id.clone());
-                        info!("Ancillary {} registered (legacy mode)", id);
-
-                        // If task_id provided, fetch task and set instruction
-                        if let Some(ref tid) = task_id {
-                            let sources = state
-                                .rhai_plugins
-                                .effective_sources(&state.config.tasks.sources);
-                            let ctx = toren_lib::PluginContext::new(
-                                Some(working_dir.clone()),
-                                Some(seg.clone()),
-                            );
-                            match state.rhai_plugins.resolve_info_multi(&sources, tid, ctx) {
-                                Ok(task) => {
-                                    let prompt =
-                                        tasks::generate_prompt(&task, "implement bead {{task_id}}");
-                                    state.ancillaries.set_instruction(&id, Some(prompt.clone()));
-                                    info!("Ancillary {} instruction set from task {}", id, tid);
-                                }
-                                Err(e) => {
-                                    warn!("Failed to fetch task {}: {}", tid, e);
-                                }
-                            }
-                        }
-                    }
-
-                    // Get the instruction if it was set
-                    let instruction = ancillary_id.as_ref().and_then(|id| {
-                        state
-                            .ancillaries
-                            .get(id)
-                            .and_then(|a| a.current_instruction.clone())
-                    });
 
                     let response = WsResponse::AuthSuccess {
                         session_id: token.clone(),
-                        ancillary_id: ancillary_id.clone(),
-                        assignment_id: None,
-                        task_id: None,
-                        working_dir: working_dir_response,
-                        instruction,
+                        segment,
+                        workspace,
+                        working_dir,
                     };
-
                     if let Ok(json) = serde_json::to_string(&response) {
                         let _ = sender.send(Message::Text(json)).await;
                     }
 
-                    info!("WebSocket authenticated (legacy mode)");
+                    info!("WebSocket authenticated");
                 }
                 Ok(req) if authenticated => {
                     handle_authenticated_request(req, &state, &mut sender, ancillary_id.as_deref())
@@ -309,111 +172,28 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
         state.ancillaries.unregister(id);
     }
 
-    // Assignment stays active on disconnect (status is always Active while assignment exists)
-
     info!("WebSocket connection closed");
 }
 
-/// Connect using an existing assignment
-async fn connect_via_assignment(
+/// The working directory a `segment` (+ optional `workspace`) resolves to, or a reason it can't.
+fn resolve_working_dir(
     state: &AppState,
-    ancillary_id: &str,
-    session_token: &str,
-) -> Result<(WsResponse, String, String), Option<String>> {
-    let mut assignments = state.assignments.write().await;
+    segment: &str,
+    workspace: Option<&str>,
+) -> Result<PathBuf, String> {
+    let registry = PlaceRegistry::new(&state.config)
+        .map_err(|e| format!("Failed to build place registry: {:#}", e))?;
+    let seg = registry
+        .segment(Some(segment))
+        .map_err(|_| format!("Segment not found: {}", segment))?;
 
-    // Look up active assignment for this ancillary
-    let assignment = assignments
-        .get_active_for_ancillary(ancillary_id)
-        .cloned()
-        .ok_or(None)?; // None = no assignment found, fall through to legacy
-
-    let working_dir = &assignment.workspace_path;
-
-    // Check if workspace exists, recreate if needed
-    if !working_dir.exists() {
-        if let Some(ref ws_mgr) = state.workspaces {
-            let segment_path = {
-                let segments = state.segments.read().unwrap();
-                segments.find_by_name(&assignment.segment).map(|s| s.path)
-            };
-
-            if let Some(seg_path) = segment_path {
-                let ws_name = working_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(assignment.task_id.as_deref().unwrap_or("unknown"));
-
-                if let Err(e) = ws_mgr.create_workspace(&seg_path, &assignment.segment, ws_name) {
-                    return Err(Some(format!("Failed to recreate workspace: {}", e)));
-                }
-                info!("Recreated workspace for assignment {}", assignment.id);
-            }
+    match workspace {
+        Some(ws) => {
+            let place = registry.get(&seg, ws);
+            Ok(place.path)
         }
+        None => Ok(seg.path),
     }
-
-    // Check for workspace collision with other connected ancillaries
-    if let Some(other_id) = state.ancillaries.is_workspace_in_use(working_dir) {
-        if other_id != ancillary_id {
-            return Err(Some(format!(
-                "Workspace is already in use by ancillary {}",
-                other_id
-            )));
-        }
-    }
-
-    // Register the ancillary for connection tracking
-    state.ancillaries.register(
-        ancillary_id.to_string(),
-        assignment.segment.clone(),
-        session_token.to_string(),
-        assignment.task_id.clone(),
-        working_dir.clone(),
-    );
-
-    // Generate instruction from task ID
-    let instruction = if let Some(ref task_id) = assignment.task_id {
-        let ctx = toren_lib::PluginContext::new(Some(working_dir.clone()), None);
-        let result = if let Some(source) = assignment.task_source.as_deref() {
-            state.rhai_plugins.resolve_info(source, task_id, ctx)
-        } else {
-            let sources = state
-                .rhai_plugins
-                .effective_sources(&state.config.tasks.sources);
-            state
-                .rhai_plugins
-                .resolve_info_multi(&sources, task_id, ctx)
-        };
-        match result {
-            Ok(task) => {
-                let prompt = tasks::generate_prompt(&task, "implement bead {{task_id}}");
-                state
-                    .ancillaries
-                    .set_instruction(ancillary_id, Some(prompt.clone()));
-                Some(prompt)
-            }
-            Err(e) => {
-                warn!("Failed to fetch task {}: {}", task_id, e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Touch assignment timestamp on connect
-    let _ = assignments.touch(&assignment.id);
-
-    let response = WsResponse::AuthSuccess {
-        session_id: session_token.to_string(),
-        ancillary_id: Some(ancillary_id.to_string()),
-        assignment_id: Some(assignment.id.clone()),
-        task_id: assignment.task_id.clone(),
-        working_dir: Some(working_dir.display().to_string()),
-        instruction,
-    };
-
-    Ok((response, ancillary_id.to_string(), assignment.id.clone()))
 }
 
 async fn handle_authenticated_request(

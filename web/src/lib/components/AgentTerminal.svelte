@@ -4,7 +4,7 @@ import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import { createEventDispatcher, onDestroy, onMount } from 'svelte';
 
-/** Full websocket URL for the ancillary's pane bridge, or null to stay disconnected. */
+/** Full websocket URL for the workspace's pane bridge, or null to stay disconnected. */
 export let url: string | null;
 
 const dispatch = createEventDispatcher<{
