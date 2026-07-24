@@ -14,8 +14,8 @@ use minijinja::{context, Environment};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::{debug, info, trace, warn};
 
@@ -116,11 +116,14 @@ pub struct VarDef {
 /// `[A-Za-z_][A-Za-z0-9_]*`. Used for both `var` and `env` keys.
 fn validate_identifier(name: &str, kind: &str) -> Result<()> {
     let mut chars = name.chars();
-    let first = chars.next().ok_or_else(|| anyhow::anyhow!("{} name is empty", kind))?;
+    let first = chars
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("{} name is empty", kind))?;
     if !(first.is_ascii_alphabetic() || first == '_') {
         anyhow::bail!(
             "{} name '{}' must start with a letter or underscore",
-            kind, name
+            kind,
+            name
         );
     }
     for c in chars {
@@ -212,9 +215,8 @@ fn parse_env_file(path: &Path) -> Result<Vec<(String, String)>> {
             )
         })?;
         let key = key.trim_end();
-        validate_identifier(key, "env").with_context(|| {
-            format!("{}:{}: invalid env key", path.display(), lineno + 1)
-        })?;
+        validate_identifier(key, "env")
+            .with_context(|| format!("{}:{}: invalid env key", path.display(), lineno + 1))?;
         pairs.push((key.to_string(), value.to_string()));
     }
     Ok(pairs)
@@ -325,11 +327,7 @@ impl BreqConfig {
         let config_path = match Self::config_path(repo_root) {
             Some(p) => p,
             None => {
-                trace!(
-                    "No {} found at {}",
-                    TOREN_CONFIG_FILE,
-                    repo_root.display()
-                );
+                trace!("No {} found at {}", TOREN_CONFIG_FILE, repo_root.display());
                 return Ok(Self::default());
             }
         };
@@ -377,9 +375,7 @@ impl BreqConfig {
         let has_args = entries.iter().any(|e| e.name().is_none());
         let has_props = entries.iter().any(|e| e.name().is_some());
         if has_args {
-            anyhow::bail!(
-                "var: positional arguments are not supported; use `var NAME=VALUE`"
-            );
+            anyhow::bail!("var: positional arguments are not supported; use `var NAME=VALUE`");
         }
         if !has_props {
             anyhow::bail!("var: requires at least one NAME=VALUE pair");
@@ -551,7 +547,11 @@ impl BreqConfig {
                         }
                     }
                 }
-                Ok(Action::Run { command, cwd, child_env })
+                Ok(Action::Run {
+                    command,
+                    cwd,
+                    child_env,
+                })
             }
             "env" => Ok(Action::Env(Self::parse_env_node(node)?)),
             "proxy" => {
@@ -563,9 +563,7 @@ impl BreqConfig {
                     .context("proxy requires a port or protocol argument")?;
 
                 let port = if let Some(n) = kdl_value_as_i64(first.value()) {
-                    PortSpec::Numeric(
-                        u16::try_from(n).context("proxy port must be a valid u16")?,
-                    )
+                    PortSpec::Numeric(u16::try_from(n).context("proxy port must be a valid u16")?)
                 } else if let Some(s) = first.value().as_string() {
                     PortSpec::Named(s.to_string())
                 } else {
@@ -573,9 +571,7 @@ impl BreqConfig {
                 };
 
                 // upstream=: string or integer (supports {{...}} templates)
-                let upstream = if let Some(s) =
-                    node.get("upstream").and_then(|v| v.as_string())
-                {
+                let upstream = if let Some(s) = node.get("upstream").and_then(|v| v.as_string()) {
                     s.to_string()
                 } else if let Some(n) = node.get("upstream").and_then(kdl_value_as_i64) {
                     n.to_string()
@@ -980,7 +976,11 @@ impl WorkspaceSetup {
             Action::Template { src, dest } => self.execute_template(src, dest, ctx),
             Action::Copy { src, dest, from } => self.execute_copy(src, dest, from.as_deref(), ctx),
             Action::Share { src, from } => self.execute_share(src, from.as_deref(), ctx),
-            Action::Run { command, cwd, child_env } => {
+            Action::Run {
+                command,
+                cwd,
+                child_env,
+            } => {
                 // Build a per-command env scope: clone surrounding state and overlay child_env.
                 // Mutations here do not leak back to env_state.
                 let mut run_env = env_state.clone();
@@ -995,9 +995,7 @@ impl WorkspaceSetup {
                 tls,
                 name,
             } => self.execute_proxy(port, upstream, *tls, name.as_deref(), ctx),
-            Action::Env(directive) => {
-                self.apply_env_directive(directive, env_state, ctx)
-            }
+            Action::Env(directive) => self.apply_env_directive(directive, env_state, ctx),
         }
     }
 
@@ -1132,11 +1130,13 @@ impl WorkspaceSetup {
                 }
             }
             // Stale or wrong symlink (or regular file/dir) - remove it
-            debug!(
-                "  share: removing stale entry at {}",
-                dest_path.display()
-            );
-            if dest_path.is_dir() && !dest_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            debug!("  share: removing stale entry at {}", dest_path.display());
+            if dest_path.is_dir()
+                && !dest_path
+                    .symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+            {
                 fs::remove_dir_all(&dest_path)?;
             } else {
                 fs::remove_file(&dest_path)?;
@@ -1186,9 +1186,7 @@ impl WorkspaceSetup {
         env_overrides: &HashMap<String, String>,
     ) -> Result<()> {
         let command = self.render_string(command, ctx)?;
-        let cwd_rendered = cwd
-            .map(|c| self.render_string(c, ctx))
-            .transpose()?;
+        let cwd_rendered = cwd.map(|c| self.render_string(c, ctx)).transpose()?;
 
         // Resolve cwd: if provided, relative to workspace; otherwise workspace root.
         // `destroy_fallback_workdir` is set only when the workspace dir is gone
@@ -1273,7 +1271,9 @@ impl WorkspaceSetup {
             eprint!("\r\x1b[2K");
         }
 
-        let status = child.wait().with_context(|| format!("Failed to wait for: {}", command))?;
+        let status = child
+            .wait()
+            .with_context(|| format!("Failed to wait for: {}", command))?;
         let code = status.code().unwrap_or(-1);
         eprintln!("[exit {}]", code);
 
@@ -1298,9 +1298,7 @@ impl WorkspaceSetup {
         ctx: &WorkspaceContext,
     ) -> Result<()> {
         let upstream_val = self.render_string(upstream, ctx)?;
-        let rendered_name = name
-            .map(|n| self.render_string(n, ctx))
-            .transpose()?;
+        let rendered_name = name.map(|n| self.render_string(n, ctx)).transpose()?;
         let station_name = self.station_name(rendered_name.as_deref());
 
         // Resolve port: Numeric uses directly, Named renders template then resolves
@@ -1312,12 +1310,12 @@ impl WorkspaceSetup {
                     "http" => (80, false),
                     "https" => (443, true),
                     other => {
-                        let p: u16 = other
-                            .parse()
-                            .with_context(|| format!(
+                        let p: u16 = other.parse().with_context(|| {
+                            format!(
                                 "proxy port must be \"http\", \"https\", or a u16, got \"{}\"",
                                 other
-                            ))?;
+                            )
+                        })?;
                         (p, false)
                     }
                 }
@@ -1350,14 +1348,17 @@ impl WorkspaceSetup {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Build manual command hint
-            let mut hint_args = format!("station proxy {} -u {} -p {}",
-                station_name, upstream_val, resolved_port);
+            let mut hint_args = format!(
+                "station proxy {} -u {} -p {}",
+                station_name, upstream_val, resolved_port
+            );
             if use_tls {
                 hint_args.push_str(" --tls");
             }
             anyhow::bail!(
                 "[setup:proxy] {} (run `breq sh <ws> -- {}` to manually setup proxy)",
-                stderr.trim(), hint_args
+                stderr.trim(),
+                hint_args
             );
         }
 
@@ -1368,12 +1369,14 @@ impl WorkspaceSetup {
                 (false, 80) | (true, 443) => String::new(),
                 _ => format!(":{}", resolved_port),
             };
-            format!("{}.{}{}",
-                station_name, domain, port_suffix)
+            format!("{}.{}{}", station_name, domain, port_suffix)
         } else {
             format!("{}:{}", station_name, resolved_port)
         };
-        eprintln!("[setup:proxy] {}://{} => {}", scheme, listen_display, upstream_val);
+        eprintln!(
+            "[setup:proxy] {}://{} => {}",
+            scheme, listen_display, upstream_val
+        );
 
         Ok(())
     }
@@ -1394,7 +1397,11 @@ impl WorkspaceSetup {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("station forget failed for '{}': {}", station_name, stderr.trim());
+            anyhow::bail!(
+                "station forget failed for '{}': {}",
+                station_name,
+                stderr.trim()
+            );
         }
 
         Ok(())
@@ -1432,7 +1439,11 @@ destroy {
         }
 
         match &config.setup[1].action {
-            Action::Run { command, cwd, child_env } => {
+            Action::Run {
+                command,
+                cwd,
+                child_env,
+            } => {
                 assert_eq!(command, "pnpm install");
                 assert!(cwd.is_none());
                 assert!(child_env.is_empty());
@@ -1572,7 +1583,11 @@ setup {
 
         assert_eq!(config.setup.len(), 2);
         match &config.setup[0].action {
-            Action::Run { command, cwd, child_env } => {
+            Action::Run {
+                command,
+                cwd,
+                child_env,
+            } => {
                 assert_eq!(command, "pnpm install");
                 assert_eq!(cwd.as_deref(), Some("web"));
                 assert!(child_env.is_empty());
@@ -1580,7 +1595,11 @@ setup {
             _ => panic!("Expected Run action"),
         }
         match &config.setup[1].action {
-            Action::Run { command, cwd, child_env } => {
+            Action::Run {
+                command,
+                cwd,
+                child_env,
+            } => {
                 assert_eq!(command, "cargo build");
                 assert!(cwd.is_none());
                 assert!(child_env.is_empty());
@@ -1594,9 +1613,14 @@ setup {
         // Matches the exact template `breq init` emits. Regression guard:
         // if the parser changes around commented-out entries or empty setup
         // blocks, init-generated files must still round-trip.
-        let content = "// var subdomain=\"{{ ws.name }}.{{ repo.name }}\"\n\nsetup {\n}\n\ndestroy { }\n";
+        let content =
+            "// var subdomain=\"{{ ws.name }}.{{ repo.name }}\"\n\nsetup {\n}\n\ndestroy { }\n";
         let config = BreqConfig::parse_kdl(content).expect("init template must parse");
-        assert_eq!(config.vars.len(), 0, "comment-only init template yields no vars");
+        assert_eq!(
+            config.vars.len(),
+            0,
+            "comment-only init template yields no vars"
+        );
         assert_eq!(config.setup.len(), 0);
         assert_eq!(config.destroy.len(), 0);
     }
@@ -1729,7 +1753,10 @@ setup { }
             task: None,
             vars: {
                 let mut m = HashMap::new();
-                m.insert("upstream_url".to_string(), serde_json::json!("http://localhost:5173"));
+                m.insert(
+                    "upstream_url".to_string(),
+                    serde_json::json!("http://localhost:5173"),
+                );
                 m.insert("port".to_string(), serde_json::json!(5173));
                 m
             },
@@ -1892,7 +1919,12 @@ setup {
         let config = BreqConfig::parse_kdl(content).unwrap();
         assert_eq!(config.setup.len(), 1);
         match &config.setup[0].action {
-            Action::Proxy { port, upstream, tls, name } => {
+            Action::Proxy {
+                port,
+                upstream,
+                tls,
+                name,
+            } => {
                 assert!(matches!(port, PortSpec::Numeric(80)));
                 assert_eq!(upstream, "3000");
                 assert_eq!(*tls, None);
@@ -1977,7 +2009,12 @@ setup {
 "#;
         let config = BreqConfig::parse_kdl(content).unwrap();
         match &config.setup[0].action {
-            Action::Proxy { port, upstream, tls, name } => {
+            Action::Proxy {
+                port,
+                upstream,
+                tls,
+                name,
+            } => {
                 assert!(matches!(port, PortSpec::Numeric(443)));
                 assert_eq!(upstream, "8443");
                 assert_eq!(*tls, Some(true));
@@ -2012,7 +2049,11 @@ setup {
 }
 "#;
         let err = BreqConfig::parse_kdl(content).unwrap_err();
-        assert!(err.to_string().contains("upstream"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("upstream"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -2206,7 +2247,9 @@ setup {
         let config = BreqConfig::parse_kdl(content).unwrap();
         assert_eq!(config.setup.len(), 1);
         match &config.setup[0].action {
-            Action::Run { command, child_env, .. } => {
+            Action::Run {
+                command, child_env, ..
+            } => {
                 assert_eq!(command, "pnpm build");
                 assert_eq!(child_env.len(), 2);
                 assert!(matches!(&child_env[0], EnvDirective::Pairs(_)));
@@ -2345,8 +2388,7 @@ setup {
     fn test_apply_env_directive_templates_values() {
         let setup = test_setup();
         let mut ctx = ctx_for_test();
-        ctx.vars
-            .insert("port".to_string(), serde_json::json!(5173));
+        ctx.vars.insert("port".to_string(), serde_json::json!(5173));
         let mut state = HashMap::new();
         setup
             .apply_env_directive(

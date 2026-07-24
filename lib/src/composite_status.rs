@@ -78,9 +78,7 @@ pub fn detect_agent_activity(workspace_path: &Path) -> String {
 /// is the absolute workspace path with `/` and `.` replaced by `-`.
 fn claude_project_dir(workspace_path: &Path) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    let dir_name = workspace_path
-        .to_str()?
-        .replace(['/', '.'], "-");
+    let dir_name = workspace_path.to_str()?.replace(['/', '.'], "-");
     let project_dir = home.join(".claude").join("projects").join(&dir_name);
     if project_dir.is_dir() {
         Some(project_dir)

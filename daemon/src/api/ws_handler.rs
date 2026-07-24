@@ -235,14 +235,17 @@ pub async fn handle_websocket(socket: WebSocket, state: AppState) {
 
                         // If task_id provided, fetch task and set instruction
                         if let Some(ref tid) = task_id {
-                            let sources = state.rhai_plugins.effective_sources(&state.config.tasks.sources);
-                            let ctx = toren_lib::PluginContext::new(Some(working_dir.clone()), Some(seg.clone()));
+                            let sources = state
+                                .rhai_plugins
+                                .effective_sources(&state.config.tasks.sources);
+                            let ctx = toren_lib::PluginContext::new(
+                                Some(working_dir.clone()),
+                                Some(seg.clone()),
+                            );
                             match state.rhai_plugins.resolve_info_multi(&sources, tid, ctx) {
                                 Ok(task) => {
-                                    let prompt = tasks::generate_prompt(
-                                        &task,
-                                        "implement bead {{task_id}}",
-                                    );
+                                    let prompt =
+                                        tasks::generate_prompt(&task, "implement bead {{task_id}}");
                                     state.ancillaries.set_instruction(&id, Some(prompt.clone()));
                                     info!("Ancillary {} instruction set from task {}", id, tid);
                                 }
@@ -374,13 +377,16 @@ async fn connect_via_assignment(
         let result = if let Some(source) = assignment.task_source.as_deref() {
             state.rhai_plugins.resolve_info(source, task_id, ctx)
         } else {
-            let sources = state.rhai_plugins.effective_sources(&state.config.tasks.sources);
-            state.rhai_plugins.resolve_info_multi(&sources, task_id, ctx)
+            let sources = state
+                .rhai_plugins
+                .effective_sources(&state.config.tasks.sources);
+            state
+                .rhai_plugins
+                .resolve_info_multi(&sources, task_id, ctx)
         };
         match result {
             Ok(task) => {
-                let prompt =
-                    tasks::generate_prompt(&task, "implement bead {{task_id}}");
+                let prompt = tasks::generate_prompt(&task, "implement bead {{task_id}}");
                 state
                     .ancillaries
                     .set_instruction(ancillary_id, Some(prompt.clone()));

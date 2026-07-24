@@ -123,8 +123,7 @@ pub fn interpret_result(value: Dynamic) -> Result<PluginResult> {
             let action_str = action.clone().into_string().ok();
             if action_str.as_deref() == Some("do") || action_str.as_deref() == Some("cmd") {
                 let get_str = |key: &str| -> Option<String> {
-                    map.get(key)
-                        .and_then(|v| v.clone().into_string().ok())
+                    map.get(key).and_then(|v| v.clone().into_string().ok())
                 };
 
                 return Ok(PluginResult::Action(DeferredAction::Do {
@@ -145,27 +144,30 @@ pub fn interpret_result(value: Dynamic) -> Result<PluginResult> {
 
 /// `shell(program, args) -> String` — run command, return stdout, error on non-zero exit.
 fn register_shell(engine: &mut Engine) {
-    engine.register_fn("shell", |program: &str, args: rhai::Array| -> Result<String, Box<rhai::EvalAltResult>> {
-        let str_args: Vec<String> = args
-            .into_iter()
-            .map(|a| a.into_string().unwrap_or_default())
-            .collect();
-        let output = std::process::Command::new(program)
-            .args(&str_args)
-            .output()
-            .map_err(|e| format!("Failed to run '{}': {}", program, e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "'{}' exited with {}: {}",
-                program,
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
-            )
-            .into());
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    });
+    engine.register_fn(
+        "shell",
+        |program: &str, args: rhai::Array| -> Result<String, Box<rhai::EvalAltResult>> {
+            let str_args: Vec<String> = args
+                .into_iter()
+                .map(|a| a.into_string().unwrap_or_default())
+                .collect();
+            let output = std::process::Command::new(program)
+                .args(&str_args)
+                .output()
+                .map_err(|e| format!("Failed to run '{}': {}", program, e))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "'{}' exited with {}: {}",
+                    program,
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                )
+                .into());
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        },
+    );
 }
 
 /// `shell(program, args, opts) -> Map` — extended shell with options.
@@ -173,67 +175,74 @@ fn register_shell(engine: &mut Engine) {
 /// opts keys: `dir`, `env`, `stdin`, `timeout`
 /// Returns `#{ stdout, stderr, status }`
 fn register_shell_extended(engine: &mut Engine) {
-    engine.register_fn("shell", |program: &str, args: rhai::Array, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
-        let str_args: Vec<String> = args
-            .into_iter()
-            .map(|a| a.into_string().unwrap_or_default())
-            .collect();
+    engine.register_fn(
+        "shell",
+        |program: &str, args: rhai::Array, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
+            let str_args: Vec<String> = args
+                .into_iter()
+                .map(|a| a.into_string().unwrap_or_default())
+                .collect();
 
-        let mut cmd = std::process::Command::new(program);
-        cmd.args(&str_args);
+            let mut cmd = std::process::Command::new(program);
+            cmd.args(&str_args);
 
-        // dir option
-        if let Some(dir) = opts.get("dir") {
-            if let Ok(d) = dir.clone().into_string() {
-                cmd.current_dir(&d);
-            }
-        }
-
-        // env option (map of overrides)
-        if let Some(env_val) = opts.get("env") {
-            if let Some(env_map) = env_val.clone().try_cast::<Map>() {
-                for (k, v) in env_map.iter() {
-                    cmd.env(k.as_str(), v.clone().into_string().unwrap_or_default());
+            // dir option
+            if let Some(dir) = opts.get("dir") {
+                if let Ok(d) = dir.clone().into_string() {
+                    cmd.current_dir(&d);
                 }
             }
-        }
 
-        // stdin option
-        let stdin_data = opts.get("stdin").and_then(|v| v.clone().into_string().ok());
-        if stdin_data.is_some() {
-            cmd.stdin(std::process::Stdio::piped());
-        }
-
-        let mut child = cmd
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to run '{}': {}", program, e))?;
-
-        if let Some(ref data) = stdin_data {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(data.as_bytes());
+            // env option (map of overrides)
+            if let Some(env_val) = opts.get("env") {
+                if let Some(env_map) = env_val.clone().try_cast::<Map>() {
+                    for (k, v) in env_map.iter() {
+                        cmd.env(k.as_str(), v.clone().into_string().unwrap_or_default());
+                    }
+                }
             }
-            // Drop stdin to signal EOF
-            child.stdin.take();
-        }
 
-        let output = child.wait_with_output()
-            .map_err(|e| format!("Failed to wait for '{}': {}", program, e))?;
+            // stdin option
+            let stdin_data = opts.get("stdin").and_then(|v| v.clone().into_string().ok());
+            if stdin_data.is_some() {
+                cmd.stdin(std::process::Stdio::piped());
+            }
 
-        let mut result = Map::new();
-        result.insert("stdout".into(), Dynamic::from(
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        ));
-        result.insert("stderr".into(), Dynamic::from(
-            String::from_utf8_lossy(&output.stderr).trim().to_string()
-        ));
-        result.insert("status".into(), Dynamic::from(
-            output.status.code().unwrap_or(-1) as i64
-        ));
-        Ok(result)
-    });
+            let mut child = cmd
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("Failed to run '{}': {}", program, e))?;
+
+            if let Some(ref data) = stdin_data {
+                use std::io::Write;
+                if let Some(ref mut stdin) = child.stdin {
+                    let _ = stdin.write_all(data.as_bytes());
+                }
+                // Drop stdin to signal EOF
+                child.stdin.take();
+            }
+
+            let output = child
+                .wait_with_output()
+                .map_err(|e| format!("Failed to wait for '{}': {}", program, e))?;
+
+            let mut result = Map::new();
+            result.insert(
+                "stdout".into(),
+                Dynamic::from(String::from_utf8_lossy(&output.stdout).trim().to_string()),
+            );
+            result.insert(
+                "stderr".into(),
+                Dynamic::from(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+            );
+            result.insert(
+                "status".into(),
+                Dynamic::from(output.status.code().unwrap_or(-1) as i64),
+            );
+            Ok(result)
+        },
+    );
 }
 
 // ── Flat registrations ──────────────────────────────────────────────────────
@@ -316,9 +325,7 @@ fn register_parse_args(engine: &mut Engine) {
                 match opt_type.as_str() {
                     "bool" | "string" | "int" => {}
                     other => {
-                        return Err(
-                            format!("spec for '{}': unknown type '{}'", long, other).into()
-                        )
+                        return Err(format!("spec for '{}': unknown type '{}'", long, other).into())
                     }
                 }
 
@@ -339,13 +346,7 @@ fn register_parse_args(engine: &mut Engine) {
                     short_to_long.insert(short, long.clone());
                 }
 
-                specs_by_long.insert(
-                    long.clone(),
-                    OptSpec {
-                        opt_type,
-                        default,
-                    },
-                );
+                specs_by_long.insert(long.clone(), OptSpec { opt_type, default });
             }
 
             // Parse the args
@@ -382,25 +383,25 @@ fn register_parse_args(engine: &mut Engine) {
 
                 if let Some(long_name) = arg.strip_prefix("--") {
                     // Long option
-                    let spec = specs_by_long.get(long_name).ok_or_else(|| {
-                        format!("unknown option: --{}", long_name)
-                    })?;
+                    let spec = specs_by_long
+                        .get(long_name)
+                        .ok_or_else(|| format!("unknown option: --{}", long_name))?;
                     match spec.opt_type.as_str() {
                         "bool" => {
                             opts.insert(long_name.into(), Dynamic::from(true));
                         }
                         "string" => {
                             i += 1;
-                            let val = str_args.get(i).ok_or_else(|| {
-                                format!("--{} requires a value", long_name)
-                            })?;
+                            let val = str_args
+                                .get(i)
+                                .ok_or_else(|| format!("--{} requires a value", long_name))?;
                             opts.insert(long_name.into(), Dynamic::from(val.clone()));
                         }
                         "int" => {
                             i += 1;
-                            let val_str = str_args.get(i).ok_or_else(|| {
-                                format!("--{} requires a value", long_name)
-                            })?;
+                            let val_str = str_args
+                                .get(i)
+                                .ok_or_else(|| format!("--{} requires a value", long_name))?;
                             let val: i64 = val_str.parse().map_err(|_| {
                                 format!("--{}: '{}' is not a valid integer", long_name, val_str)
                             })?;
@@ -416,9 +417,9 @@ fn register_parse_args(engine: &mut Engine) {
                         continue;
                     }
                     // Short option
-                    let long_name = short_to_long.get(short_chars).ok_or_else(|| {
-                        format!("unknown option: -{}", short_chars)
-                    })?;
+                    let long_name = short_to_long
+                        .get(short_chars)
+                        .ok_or_else(|| format!("unknown option: -{}", short_chars))?;
                     let spec = &specs_by_long[long_name];
                     match spec.opt_type.as_str() {
                         "bool" => {
@@ -426,21 +427,18 @@ fn register_parse_args(engine: &mut Engine) {
                         }
                         "string" => {
                             i += 1;
-                            let val = str_args.get(i).ok_or_else(|| {
-                                format!("-{} requires a value", short_chars)
-                            })?;
+                            let val = str_args
+                                .get(i)
+                                .ok_or_else(|| format!("-{} requires a value", short_chars))?;
                             opts.insert(long_name.as_str().into(), Dynamic::from(val.clone()));
                         }
                         "int" => {
                             i += 1;
-                            let val_str = str_args.get(i).ok_or_else(|| {
-                                format!("-{} requires a value", short_chars)
-                            })?;
+                            let val_str = str_args
+                                .get(i)
+                                .ok_or_else(|| format!("-{} requires a value", short_chars))?;
                             let val: i64 = val_str.parse().map_err(|_| {
-                                format!(
-                                    "-{}: '{}' is not a valid integer",
-                                    short_chars, val_str
-                                )
+                                format!("-{}: '{}' is not a valid integer", short_chars, val_str)
                             })?;
                             opts.insert(long_name.as_str().into(), Dynamic::from(val));
                         }
@@ -468,19 +466,25 @@ fn register_parse_args(engine: &mut Engine) {
 fn build_json_module() -> Module {
     let mut module = Module::new();
 
-    module.set_native_fn("parse", |text: &str| -> Result<Dynamic, Box<rhai::EvalAltResult>> {
-        let value: serde_json::Value = serde_json::from_str(text)
-            .map_err(|e| format!("JSON parse error: {}", e))?;
-        rhai::serde::to_dynamic(&value)
-            .map_err(|e| format!("JSON to Rhai conversion error: {}", e).into())
-    });
+    module.set_native_fn(
+        "parse",
+        |text: &str| -> Result<Dynamic, Box<rhai::EvalAltResult>> {
+            let value: serde_json::Value =
+                serde_json::from_str(text).map_err(|e| format!("JSON parse error: {}", e))?;
+            rhai::serde::to_dynamic(&value)
+                .map_err(|e| format!("JSON to Rhai conversion error: {}", e).into())
+        },
+    );
 
-    module.set_native_fn("stringify", |value: Dynamic| -> Result<String, Box<rhai::EvalAltResult>> {
-        let json_value: serde_json::Value = rhai::serde::from_dynamic(&value)
-            .map_err(|e| format!("Rhai to JSON conversion error: {}", e))?;
-        serde_json::to_string(&json_value)
-            .map_err(|e| format!("JSON stringify error: {}", e).into())
-    });
+    module.set_native_fn(
+        "stringify",
+        |value: Dynamic| -> Result<String, Box<rhai::EvalAltResult>> {
+            let json_value: serde_json::Value = rhai::serde::from_dynamic(&value)
+                .map_err(|e| format!("Rhai to JSON conversion error: {}", e))?;
+            serde_json::to_string(&json_value)
+                .map_err(|e| format!("JSON stringify error: {}", e).into())
+        },
+    );
 
     module
 }
@@ -489,39 +493,51 @@ fn build_json_module() -> Module {
 fn build_fs_module() -> Module {
     let mut module = Module::new();
 
-    module.set_native_fn("read", |path: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-        std::fs::read_to_string(path)
-            .map_err(|e| format!("fs::read error: {}", e).into())
-    });
+    module.set_native_fn(
+        "read",
+        |path: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            std::fs::read_to_string(path).map_err(|e| format!("fs::read error: {}", e).into())
+        },
+    );
 
-    module.set_native_fn("write", |path: &str, content: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-        std::fs::write(path, content)
-            .map_err(|e| format!("fs::write error: {}", e).into())
-    });
+    module.set_native_fn(
+        "write",
+        |path: &str, content: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+            std::fs::write(path, content).map_err(|e| format!("fs::write error: {}", e).into())
+        },
+    );
 
-    module.set_native_fn("exists", |path: &str| -> Result<bool, Box<rhai::EvalAltResult>> {
-        Ok(std::path::Path::new(path).exists())
-    });
+    module.set_native_fn(
+        "exists",
+        |path: &str| -> Result<bool, Box<rhai::EvalAltResult>> {
+            Ok(std::path::Path::new(path).exists())
+        },
+    );
 
-    module.set_native_fn("glob", |pattern: &str| -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
-        let paths = glob::glob(pattern)
-            .map_err(|e| format!("fs::glob pattern error: {}", e))?;
-        let result: rhai::Array = paths
-            .filter_map(|r| r.ok())
-            .map(|p| Dynamic::from(p.display().to_string()))
-            .collect();
-        Ok(result)
-    });
+    module.set_native_fn(
+        "glob",
+        |pattern: &str| -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
+            let paths =
+                glob::glob(pattern).map_err(|e| format!("fs::glob pattern error: {}", e))?;
+            let result: rhai::Array = paths
+                .filter_map(|r| r.ok())
+                .map(|p| Dynamic::from(p.display().to_string()))
+                .collect();
+            Ok(result)
+        },
+    );
 
-    module.set_native_fn("ls", |path: &str| -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
-        let entries = std::fs::read_dir(path)
-            .map_err(|e| format!("fs::ls error: {}", e))?;
-        let result: rhai::Array = entries
-            .filter_map(|e| e.ok())
-            .map(|e| Dynamic::from(e.file_name().to_string_lossy().to_string()))
-            .collect();
-        Ok(result)
-    });
+    module.set_native_fn(
+        "ls",
+        |path: &str| -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
+            let entries = std::fs::read_dir(path).map_err(|e| format!("fs::ls error: {}", e))?;
+            let result: rhai::Array = entries
+                .filter_map(|e| e.ok())
+                .map(|e| Dynamic::from(e.file_name().to_string_lossy().to_string()))
+                .collect();
+            Ok(result)
+        },
+    );
 
     module
 }
@@ -530,32 +546,44 @@ fn build_fs_module() -> Module {
 fn build_path_module() -> Module {
     let mut module = Module::new();
 
-    module.set_native_fn("join", |a: &str, b: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-        Ok(std::path::Path::new(a).join(b).display().to_string())
-    });
+    module.set_native_fn(
+        "join",
+        |a: &str, b: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            Ok(std::path::Path::new(a).join(b).display().to_string())
+        },
+    );
 
-    module.set_native_fn("parent", |p: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-        Ok(std::path::Path::new(p)
-            .parent()
-            .map(|pp| pp.display().to_string())
-            .unwrap_or_default())
-    });
+    module.set_native_fn(
+        "parent",
+        |p: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            Ok(std::path::Path::new(p)
+                .parent()
+                .map(|pp| pp.display().to_string())
+                .unwrap_or_default())
+        },
+    );
 
-    module.set_native_fn("filename", |p: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-        Ok(std::path::Path::new(p)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string())
-    });
+    module.set_native_fn(
+        "filename",
+        |p: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            Ok(std::path::Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string())
+        },
+    );
 
-    module.set_native_fn("ext", |p: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-        Ok(std::path::Path::new(p)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_string())
-    });
+    module.set_native_fn(
+        "ext",
+        |p: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            Ok(std::path::Path::new(p)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_string())
+        },
+    );
 
     module
 }
@@ -564,15 +592,18 @@ fn build_path_module() -> Module {
 fn build_toml_module() -> Module {
     let mut module = Module::new();
 
-    module.set_native_fn("parse", |text: &str| -> Result<Dynamic, Box<rhai::EvalAltResult>> {
-        let value: toml::Value = toml::from_str(text)
-            .map_err(|e| format!("TOML parse error: {}", e))?;
-        // Convert toml::Value -> serde_json::Value -> Dynamic
-        let json_value = serde_json::to_value(&value)
-            .map_err(|e| format!("TOML to JSON conversion error: {}", e))?;
-        rhai::serde::to_dynamic(&json_value)
-            .map_err(|e| format!("JSON to Rhai conversion error: {}", e).into())
-    });
+    module.set_native_fn(
+        "parse",
+        |text: &str| -> Result<Dynamic, Box<rhai::EvalAltResult>> {
+            let value: toml::Value =
+                toml::from_str(text).map_err(|e| format!("TOML parse error: {}", e))?;
+            // Convert toml::Value -> serde_json::Value -> Dynamic
+            let json_value = serde_json::to_value(&value)
+                .map_err(|e| format!("TOML to JSON conversion error: {}", e))?;
+            rhai::serde::to_dynamic(&json_value)
+                .map_err(|e| format!("JSON to Rhai conversion error: {}", e).into())
+        },
+    );
 
     module
 }
@@ -584,39 +615,60 @@ fn build_http_module() -> Module {
     let mut module = Module::new();
 
     // GET with no opts
-    module.set_native_fn("get", |url: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
-        http_no_body("GET", url, &Map::new())
-    });
+    module.set_native_fn(
+        "get",
+        |url: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
+            http_no_body("GET", url, &Map::new())
+        },
+    );
 
     // GET with opts (headers only, no body)
-    module.set_native_fn("get", |url: &str, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
-        http_no_body("GET", url, &opts)
-    });
+    module.set_native_fn(
+        "get",
+        |url: &str, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
+            http_no_body("GET", url, &opts)
+        },
+    );
 
     // POST
-    module.set_native_fn("post", |url: &str, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
-        http_with_body("POST", url, &opts)
-    });
+    module.set_native_fn(
+        "post",
+        |url: &str, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
+            http_with_body("POST", url, &opts)
+        },
+    );
 
     // PUT
-    module.set_native_fn("put", |url: &str, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
-        http_with_body("PUT", url, &opts)
-    });
+    module.set_native_fn(
+        "put",
+        |url: &str, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
+            http_with_body("PUT", url, &opts)
+        },
+    );
 
     // PATCH
-    module.set_native_fn("patch", |url: &str, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
-        http_with_body("PATCH", url, &opts)
-    });
+    module.set_native_fn(
+        "patch",
+        |url: &str, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
+            http_with_body("PATCH", url, &opts)
+        },
+    );
 
     // DELETE with no opts
-    module.set_native_fn("delete", |url: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
-        http_no_body("DELETE", url, &Map::new())
-    });
+    module.set_native_fn(
+        "delete",
+        |url: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
+            http_no_body("DELETE", url, &Map::new())
+        },
+    );
 
     // DELETE with opts
-    module.set_native_fn("delete", |url: &str, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
-        http_no_body("DELETE", url, &opts)
-    });
+    module.set_native_fn(
+        "delete",
+        |url: &str, opts: Map| -> Result<Map, Box<rhai::EvalAltResult>> {
+            http_no_body("DELETE", url, &opts)
+        },
+    );
 
     module
 }
@@ -626,7 +678,7 @@ fn make_http_agent() -> ureq::Agent {
         ureq::config::Config::builder()
             .timeout_global(Some(std::time::Duration::from_secs(30)))
             .http_status_as_error(false)
-            .build()
+            .build(),
     )
 }
 
@@ -682,7 +734,9 @@ fn http_with_body(method: &str, url: &str, opts: &Map) -> Result<Map, Box<rhai::
         "POST" => agent.post(url),
         "PUT" => agent.put(url),
         "PATCH" => agent.patch(url),
-        _ => return Err(format!("http_with_body called with unsupported method: {}", method).into()),
+        _ => {
+            return Err(format!("http_with_body called with unsupported method: {}", method).into())
+        }
     };
 
     for (k, v) in apply_headers(opts) {
@@ -694,8 +748,7 @@ fn http_with_body(method: &str, url: &str, opts: &Map) -> Result<Map, Box<rhai::
         let json_value: serde_json::Value = rhai::serde::from_dynamic(json_val)
             .map_err(|e| format!("json serialization error: {}", e))?;
         request = request.header("Content-Type", "application/json");
-        serde_json::to_string(&json_value)
-            .map_err(|e| format!("json stringify error: {}", e))?
+        serde_json::to_string(&json_value).map_err(|e| format!("json stringify error: {}", e))?
     } else if let Some(body_val) = opts.get("body") {
         body_val.clone().into_string().unwrap_or_default()
     } else {
@@ -721,14 +774,18 @@ fn http_with_body(method: &str, url: &str, opts: &Map) -> Result<Map, Box<rhai::
 fn build_toren_module(ctx: Arc<PluginContext>) -> rhai::Shared<Module> {
     let mut module = Module::new();
 
-    module.set_native_fn("config", |key: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-        config_impl(key)
-    });
+    module.set_native_fn(
+        "config",
+        |key: &str| -> Result<String, Box<rhai::EvalAltResult>> { config_impl(key) },
+    );
 
     let assign_ctx = ctx.clone();
-    module.set_native_fn("assignment", move |workspace: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
-        assignment_impl(workspace, &assign_ctx)
-    });
+    module.set_native_fn(
+        "assignment",
+        move |workspace: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
+            assignment_impl(workspace, &assign_ctx)
+        },
+    );
 
     module.into()
 }
@@ -737,34 +794,50 @@ fn build_task_module(ctx: Arc<PluginContext>) -> rhai::Shared<Module> {
     let mut module = Module::new();
 
     let info_ctx = ctx.clone();
-    module.set_native_fn("info", move |id: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
-        task_impl(id, &info_ctx)
-    });
+    module.set_native_fn(
+        "info",
+        move |id: &str| -> Result<Map, Box<rhai::EvalAltResult>> { task_impl(id, &info_ctx) },
+    );
 
     let claim_ctx = ctx.clone();
-    module.set_native_fn("claim", move |source: &str, id: &str, assignee: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-        claim_task_impl(source, id, assignee, &claim_ctx)
-    });
+    module.set_native_fn(
+        "claim",
+        move |source: &str, id: &str, assignee: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+            claim_task_impl(source, id, assignee, &claim_ctx)
+        },
+    );
 
     let complete_ctx = ctx.clone();
-    module.set_native_fn("complete", move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-        complete_task_impl(source, id, &complete_ctx)
-    });
+    module.set_native_fn(
+        "complete",
+        move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+            complete_task_impl(source, id, &complete_ctx)
+        },
+    );
 
     let abort_ctx = ctx.clone();
-    module.set_native_fn("abort", move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-        abort_task_impl(source, id, &abort_ctx)
-    });
+    module.set_native_fn(
+        "abort",
+        move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+            abort_task_impl(source, id, &abort_ctx)
+        },
+    );
 
     let create_ctx = ctx.clone();
-    module.set_native_fn("create", move |source: &str, title: &str, desc: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-        create_task_impl(source, title, Some(desc), &create_ctx)
-    });
+    module.set_native_fn(
+        "create",
+        move |source: &str, title: &str, desc: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            create_task_impl(source, title, Some(desc), &create_ctx)
+        },
+    );
 
     let create_no_desc_ctx = ctx;
-    module.set_native_fn("create", move |source: &str, title: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-        create_task_impl(source, title, None, &create_no_desc_ctx)
-    });
+    module.set_native_fn(
+        "create",
+        move |source: &str, title: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            create_task_impl(source, title, None, &create_no_desc_ctx)
+        },
+    );
 
     module.into()
 }
@@ -772,33 +845,49 @@ fn build_task_module(ctx: Arc<PluginContext>) -> rhai::Shared<Module> {
 /// Register context-dependent flat aliases (DEPRECATED — use task:: and toren:: modules).
 fn register_ctx_flat_aliases(engine: &mut Engine, ctx: Arc<PluginContext>) {
     let task_ctx = ctx.clone();
-    engine.register_fn("task", move |id: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
-        task_impl(id, &task_ctx)
-    });
+    engine.register_fn(
+        "task",
+        move |id: &str| -> Result<Map, Box<rhai::EvalAltResult>> { task_impl(id, &task_ctx) },
+    );
 
     let assign_ctx = ctx.clone();
-    engine.register_fn("ancillary", move |workspace: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
-        assignment_impl(workspace, &assign_ctx)
-    });
+    engine.register_fn(
+        "ancillary",
+        move |workspace: &str| -> Result<Map, Box<rhai::EvalAltResult>> {
+            assignment_impl(workspace, &assign_ctx)
+        },
+    );
 
     let ws_ctx = ctx.clone();
-    engine.register_fn("ws_changes", move |workspace: &str| -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
-        ws_changes_impl(workspace, &ws_ctx)
-    });
+    engine.register_fn(
+        "ws_changes",
+        move |workspace: &str| -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
+            ws_changes_impl(workspace, &ws_ctx)
+        },
+    );
 
     let claim_ctx = ctx.clone();
-    engine.register_fn("claim_task", move |source: &str, id: &str, assignee: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-        claim_task_impl(source, id, assignee, &claim_ctx)
-    });
+    engine.register_fn(
+        "claim_task",
+        move |source: &str, id: &str, assignee: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+            claim_task_impl(source, id, assignee, &claim_ctx)
+        },
+    );
 
     let complete_ctx = ctx.clone();
-    engine.register_fn("complete_task", move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-        complete_task_impl(source, id, &complete_ctx)
-    });
+    engine.register_fn(
+        "complete_task",
+        move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+            complete_task_impl(source, id, &complete_ctx)
+        },
+    );
 
-    engine.register_fn("abort_task", move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
-        abort_task_impl(source, id, &ctx)
-    });
+    engine.register_fn(
+        "abort_task",
+        move |source: &str, id: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+            abort_task_impl(source, id, &ctx)
+        },
+    );
 }
 
 /// Build the `ws` module — currently empty since ws::changes needs context.
@@ -811,23 +900,27 @@ fn build_ws_module() -> rhai::Shared<Module> {
 // ── Shared implementations ──────────────────────────────────────────────────
 
 fn config_impl(key: &str) -> Result<String, Box<rhai::EvalAltResult>> {
-    let config = crate::Config::load()
-        .map_err(|e| format!("Failed to load config: {}", e))?;
+    let config = crate::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
 
     // Virtual key for backwards compat: tasks.default_source -> first element of sources
     if key == "tasks.default_source" {
-        return Ok(config.tasks.default_source().unwrap_or_default().to_string());
+        return Ok(config
+            .tasks
+            .default_source()
+            .unwrap_or_default()
+            .to_string());
     }
 
-    let json_value = serde_json::to_value(&config)
-        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+    let json_value =
+        serde_json::to_value(&config).map_err(|e| format!("Failed to serialize config: {}", e))?;
 
     // Traverse dot-path segments
     let mut current = &json_value;
     for segment in key.split('.') {
         match current {
             serde_json::Value::Object(map) => {
-                current = map.get(segment)
+                current = map
+                    .get(segment)
                     .ok_or_else(|| format!("Config key not found: {}", key))?;
             }
             _ => return Err(format!("Config key not found: {}", key).into()),
@@ -846,15 +939,9 @@ fn config_impl(key: &str) -> Result<String, Box<rhai::EvalAltResult>> {
 }
 
 fn task_impl(id: &str, ctx: &PluginContext) -> Result<Map, Box<rhai::EvalAltResult>> {
-    let config = crate::Config::load()
-        .map_err(|e| format!("Failed to load config: {}", e))?;
+    let config = crate::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
 
-    let inferred = crate::infer_task_fields(
-        Some(id),
-        None,
-        None,
-        None,
-    );
+    let inferred = crate::infer_task_fields(Some(id), None, None, None);
 
     // Try to fetch task via resolver
     let fetched = if let Some(ref task_id) = inferred.task_id {
@@ -884,7 +971,11 @@ fn task_impl(id: &str, ctx: &PluginContext) -> Result<Map, Box<rhai::EvalAltResu
                     .map(|m| {
                         let get_opt = |key: &str| -> Option<String> {
                             m.get(key).and_then(|v| {
-                                if v.is::<()>() { None } else { v.clone().into_string().ok() }
+                                if v.is::<()>() {
+                                    None
+                                } else {
+                                    v.clone().into_string().ok()
+                                }
                             })
                         };
                         crate::tasks::ResolvedTask {
@@ -914,7 +1005,10 @@ fn task_impl(id: &str, ctx: &PluginContext) -> Result<Map, Box<rhai::EvalAltResu
     if let Some(id) = inferred.task_id {
         map.insert("id".into(), Dynamic::from(id));
     }
-    let title = fetched.as_ref().map(|t| t.title.clone()).or(inferred.task_title);
+    let title = fetched
+        .as_ref()
+        .map(|t| t.title.clone())
+        .or(inferred.task_title);
     if let Some(t) = title {
         map.insert("title".into(), Dynamic::from(t));
     }
@@ -925,7 +1019,10 @@ fn task_impl(id: &str, ctx: &PluginContext) -> Result<Map, Box<rhai::EvalAltResu
         map.insert("url".into(), Dynamic::from(url));
     }
     // Use source from fetched task (which was resolved) or inferred
-    let source = fetched.as_ref().map(|t| t.source.clone()).or(inferred.task_source);
+    let source = fetched
+        .as_ref()
+        .map(|t| t.source.clone())
+        .or(inferred.task_source);
     if let Some(source) = source {
         map.insert("source".into(), Dynamic::from(source));
     }
@@ -1006,7 +1103,12 @@ fn create_task_impl(
         None => Dynamic::UNIT,
     };
     let result = engine
-        .call_fn::<Dynamic>(&mut scope, resolver_ast, "create", (title.to_string(), desc_arg))
+        .call_fn::<Dynamic>(
+            &mut scope,
+            resolver_ast,
+            "create",
+            (title.to_string(), desc_arg),
+        )
         .map_err(|e| format!("Resolver '{}' create() failed: {}", source, e))?;
     Ok(result.into_string().unwrap_or_default())
 }
@@ -1028,28 +1130,62 @@ fn assignment_impl(workspace: &str, ctx: &PluginContext) -> Result<Map, Box<rhai
 
     let mut map = Map::new();
     map.insert("id".into(), Dynamic::from(assignment.id.clone()));
-    map.insert("ancillary_id".into(), Dynamic::from(assignment.ancillary_id.clone()));
+    map.insert(
+        "ancillary_id".into(),
+        Dynamic::from(assignment.ancillary_id.clone()),
+    );
     map.insert("segment".into(), Dynamic::from(assignment.segment.clone()));
-    map.insert("workspace_path".into(), Dynamic::from(assignment.workspace_path.display().to_string()));
-    map.insert("status".into(), Dynamic::from(format!("{:?}", assignment.status)));
-    map.insert("task_id".into(), Dynamic::from(assignment.task_id.clone().unwrap_or_default()));
-    map.insert("task_title".into(), Dynamic::from(assignment.task_title.clone().unwrap_or_default()));
-    map.insert("task_url".into(), Dynamic::from(assignment.task_url.clone().unwrap_or_default()));
-    map.insert("task_source".into(), Dynamic::from(assignment.task_source.clone().unwrap_or_default()));
-    map.insert("session_id".into(), Dynamic::from(assignment.session_id.clone().unwrap_or_default()));
-    map.insert("ancillary_num".into(), Dynamic::from(assignment.ancillary_num.unwrap_or(0) as i64));
-    map.insert("base_branch".into(), Dynamic::from(assignment.base_branch.clone().unwrap_or_default()));
+    map.insert(
+        "workspace_path".into(),
+        Dynamic::from(assignment.workspace_path.display().to_string()),
+    );
+    map.insert(
+        "status".into(),
+        Dynamic::from(format!("{:?}", assignment.status)),
+    );
+    map.insert(
+        "task_id".into(),
+        Dynamic::from(assignment.task_id.clone().unwrap_or_default()),
+    );
+    map.insert(
+        "task_title".into(),
+        Dynamic::from(assignment.task_title.clone().unwrap_or_default()),
+    );
+    map.insert(
+        "task_url".into(),
+        Dynamic::from(assignment.task_url.clone().unwrap_or_default()),
+    );
+    map.insert(
+        "task_source".into(),
+        Dynamic::from(assignment.task_source.clone().unwrap_or_default()),
+    );
+    map.insert(
+        "session_id".into(),
+        Dynamic::from(assignment.session_id.clone().unwrap_or_default()),
+    );
+    map.insert(
+        "ancillary_num".into(),
+        Dynamic::from(assignment.ancillary_num.unwrap_or(0) as i64),
+    );
+    map.insert(
+        "base_branch".into(),
+        Dynamic::from(assignment.base_branch.clone().unwrap_or_default()),
+    );
     Ok(map)
 }
 
-fn ws_changes_impl(workspace: &str, ctx: &PluginContext) -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
-    let config = crate::Config::load()
-        .map_err(|e| format!("Failed to load config: {}", e))?;
+fn ws_changes_impl(
+    workspace: &str,
+    ctx: &PluginContext,
+) -> Result<rhai::Array, Box<rhai::EvalAltResult>> {
+    let config = crate::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
     let mut assignment_mgr = crate::AssignmentManager::new()
         .map_err(|e| format!("Failed to load assignments: {}", e))?;
 
     let segment_name = ctx.segment_name.as_deref().unwrap_or("");
-    let segment_path = ctx.segment_path.as_ref()
+    let segment_path = ctx
+        .segment_path
+        .as_ref()
         .ok_or_else(|| "No segment path available".to_string())?;
 
     // Resolve workspace to assignment
@@ -1065,7 +1201,11 @@ fn ws_changes_impl(workspace: &str, ctx: &PluginContext) -> Result<rhai::Array, 
     let ws_mgr = crate::WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
 
     let commits = ws_mgr
-        .workspace_info(segment_path, &assignment.workspace_path, assignment.base_branch.as_deref())
+        .workspace_info(
+            segment_path,
+            &assignment.workspace_path,
+            assignment.base_branch.as_deref(),
+        )
         .map_err(|e| format!("Failed to get workspace info: {}", e))?;
 
     let result: rhai::Array = commits
@@ -1088,32 +1228,39 @@ fn register_flat_aliases(engine: &mut Engine) {
     register_shell_status_alias(engine);
 
     // config(key) -> toren::config(key)
-    engine.register_fn("config", |key: &str| -> Result<String, Box<rhai::EvalAltResult>> {
-        config_impl(key)
-    });
+    engine.register_fn(
+        "config",
+        |key: &str| -> Result<String, Box<rhai::EvalAltResult>> { config_impl(key) },
+    );
 }
 
 fn register_json_parse_alias(engine: &mut Engine) {
-    engine.register_fn("json_parse", |text: &str| -> Result<Dynamic, Box<rhai::EvalAltResult>> {
-        let value: serde_json::Value = serde_json::from_str(text)
-            .map_err(|e| format!("JSON parse error: {}", e))?;
-        rhai::serde::to_dynamic(&value)
-            .map_err(|e| format!("JSON to Rhai conversion error: {}", e).into())
-    });
+    engine.register_fn(
+        "json_parse",
+        |text: &str| -> Result<Dynamic, Box<rhai::EvalAltResult>> {
+            let value: serde_json::Value =
+                serde_json::from_str(text).map_err(|e| format!("JSON parse error: {}", e))?;
+            rhai::serde::to_dynamic(&value)
+                .map_err(|e| format!("JSON to Rhai conversion error: {}", e).into())
+        },
+    );
 }
 
 fn register_shell_status_alias(engine: &mut Engine) {
-    engine.register_fn("shell_status", |program: &str, args: rhai::Array| -> Result<i64, Box<rhai::EvalAltResult>> {
-        let str_args: Vec<String> = args
-            .into_iter()
-            .map(|a| a.into_string().unwrap_or_default())
-            .collect();
-        let status = std::process::Command::new(program)
-            .args(&str_args)
-            .status()
-            .map_err(|e| format!("Failed to run '{}': {}", program, e))?;
-        Ok(status.code().unwrap_or(-1) as i64)
-    });
+    engine.register_fn(
+        "shell_status",
+        |program: &str, args: rhai::Array| -> Result<i64, Box<rhai::EvalAltResult>> {
+            let str_args: Vec<String> = args
+                .into_iter()
+                .map(|a| a.into_string().unwrap_or_default())
+                .collect();
+            let status = std::process::Command::new(program)
+                .args(&str_args)
+                .status()
+                .map_err(|e| format!("Failed to run '{}': {}", program, e))?;
+            Ok(status.code().unwrap_or(-1) as i64)
+        },
+    );
 }
 
 #[cfg(test)]
@@ -1135,7 +1282,11 @@ mod tests {
 
         let result = interpret_result(Dynamic::from(map)).unwrap();
         match result {
-            PluginResult::Action(DeferredAction::Do { task_id, task_title, .. }) => {
+            PluginResult::Action(DeferredAction::Do {
+                task_id,
+                task_title,
+                ..
+            }) => {
                 assert_eq!(task_id.as_deref(), Some("breq-123"));
                 assert_eq!(task_title.as_deref(), Some("Fix the bug"));
             }
@@ -1171,7 +1322,9 @@ mod tests {
     fn test_json_parse_via_engine() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"let v = json_parse("{\"a\": 1}"); v.a"#).unwrap();
+        let ast = engine
+            .compile(r#"let v = json_parse("{\"a\": 1}"); v.a"#)
+            .unwrap();
         let result: i64 = engine.eval_ast(&ast).unwrap();
         assert_eq!(result, 1);
     }
@@ -1190,7 +1343,9 @@ mod tests {
     fn test_env_missing_returns_empty() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"env("__TOREN_NONEXISTENT_VAR__")"#).unwrap();
+        let ast = engine
+            .compile(r#"env("__TOREN_NONEXISTENT_VAR__")"#)
+            .unwrap();
         let result: String = engine.eval_ast(&ast).unwrap();
         assert!(result.is_empty());
     }
@@ -1235,10 +1390,14 @@ mod tests {
     fn test_parse_args_bool_flag() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let p = parse_args(["--push"], #{ push: #{ type: "bool" } });
             [p.opts.push, p.args.len()]
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: rhai::Array = engine.eval_ast(&ast).unwrap();
         assert_eq!(result[0].clone().cast::<bool>(), true);
         assert_eq!(result[1].clone().cast::<i64>(), 0);
@@ -1248,10 +1407,14 @@ mod tests {
     fn test_parse_args_bool_default_false() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let p = parse_args([], #{ push: #{ type: "bool" } });
             p.opts.push
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: bool = engine.eval_ast(&ast).unwrap();
         assert!(!result);
     }
@@ -1272,10 +1435,14 @@ mod tests {
     fn test_parse_args_short_alias() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let p = parse_args(["-s", "toren"], #{ segment: #{ type: "string", short: "s" } });
             p.opts.segment
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: String = engine.eval_ast(&ast).unwrap();
         assert_eq!(result, "toren");
     }
@@ -1284,10 +1451,14 @@ mod tests {
     fn test_parse_args_int_option() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let p = parse_args(["--count", "10"], #{ count: #{ type: "int", default_val: 5 } });
             p.opts.count
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: i64 = engine.eval_ast(&ast).unwrap();
         assert_eq!(result, 10);
     }
@@ -1296,10 +1467,14 @@ mod tests {
     fn test_parse_args_int_default() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let p = parse_args([], #{ count: #{ type: "int", default_val: 5 } });
             p.opts.count
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: i64 = engine.eval_ast(&ast).unwrap();
         assert_eq!(result, 5);
     }
@@ -1308,10 +1483,14 @@ mod tests {
     fn test_parse_args_string_absent_is_unit() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let p = parse_args([], #{ name: #{ type: "string" } });
             p.opts.name == ()
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: bool = engine.eval_ast(&ast).unwrap();
         assert!(result);
     }
@@ -1320,10 +1499,14 @@ mod tests {
     fn test_parse_args_positional() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let p = parse_args(["foo", "--push", "bar"], #{ push: #{ type: "bool" } });
             [p.args[0], p.args[1], p.opts.push]
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: rhai::Array = engine.eval_ast(&ast).unwrap();
         assert_eq!(result[0].clone().into_string().unwrap(), "foo");
         assert_eq!(result[1].clone().into_string().unwrap(), "bar");
@@ -1334,10 +1517,14 @@ mod tests {
     fn test_parse_args_double_dash_stops_parsing() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let p = parse_args(["--", "--push"], #{ push: #{ type: "bool" } });
             [p.opts.push, p.args[0]]
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: rhai::Array = engine.eval_ast(&ast).unwrap();
         assert_eq!(result[0].clone().cast::<bool>(), false);
         assert_eq!(result[1].clone().into_string().unwrap(), "--push");
@@ -1347,9 +1534,13 @@ mod tests {
     fn test_parse_args_unknown_flag_errors() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             parse_args(["--unknown"], #{ push: #{ type: "bool" } })
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result = engine.eval_ast::<Dynamic>(&ast);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1360,7 +1551,9 @@ mod tests {
     fn test_parse_args_combined() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let p = parse_args(
                 ["task-123", "--push", "-i", "act"],
                 #{
@@ -1369,7 +1562,9 @@ mod tests {
                 }
             );
             [p.args[0], p.opts.push, p.opts.intent]
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: rhai::Array = engine.eval_ast(&ast).unwrap();
         assert_eq!(result[0].clone().into_string().unwrap(), "task-123");
         assert_eq!(result[1].clone().cast::<bool>(), true);
@@ -1382,7 +1577,9 @@ mod tests {
     fn test_json_parse_module() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"let v = json::parse("{\"x\": 42}"); v.x"#).unwrap();
+        let ast = engine
+            .compile(r#"let v = json::parse("{\"x\": 42}"); v.x"#)
+            .unwrap();
         let result: i64 = engine.eval_ast(&ast).unwrap();
         assert_eq!(result, 42);
     }
@@ -1391,7 +1588,9 @@ mod tests {
     fn test_json_stringify_module() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"json::stringify(#{ a: 1, b: "hello" })"#).unwrap();
+        let ast = engine
+            .compile(r#"json::stringify(#{ a: 1, b: "hello" })"#)
+            .unwrap();
         let result: String = engine.eval_ast(&ast).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["a"], 1);
@@ -1412,7 +1611,9 @@ mod tests {
     fn test_fs_exists_not_found() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"fs::exists("/nonexistent_path_xyzzy")"#).unwrap();
+        let ast = engine
+            .compile(r#"fs::exists("/nonexistent_path_xyzzy")"#)
+            .unwrap();
         let result: bool = engine.eval_ast(&ast).unwrap();
         assert!(!result);
     }
@@ -1454,7 +1655,9 @@ mod tests {
     fn test_path_filename_module() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"path::filename("/usr/local/bin/bash")"#).unwrap();
+        let ast = engine
+            .compile(r#"path::filename("/usr/local/bin/bash")"#)
+            .unwrap();
         let result: String = engine.eval_ast(&ast).unwrap();
         assert_eq!(result, "bash");
     }
@@ -1463,7 +1666,9 @@ mod tests {
     fn test_path_ext_module() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"path::ext("/home/user/file.rs")"#).unwrap();
+        let ast = engine
+            .compile(r#"path::ext("/home/user/file.rs")"#)
+            .unwrap();
         let result: String = engine.eval_ast(&ast).unwrap();
         assert_eq!(result, "rs");
     }
@@ -1472,10 +1677,14 @@ mod tests {
     fn test_toml_parse_module() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let t = toml::parse("[section]\nkey = \"value\"\nnum = 42");
             [t.section.key, t.section.num]
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: rhai::Array = engine.eval_ast(&ast).unwrap();
         assert_eq!(result[0].clone().into_string().unwrap(), "value");
         assert_eq!(result[1].clone().cast::<i64>(), 42);
@@ -1486,7 +1695,9 @@ mod tests {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
         // tasks.default_source returns empty string when no sources configured
-        let ast = engine.compile(r#"toren::config("tasks.default_source")"#).unwrap();
+        let ast = engine
+            .compile(r#"toren::config("tasks.default_source")"#)
+            .unwrap();
         let _result: String = engine.eval_ast(&ast).unwrap();
     }
 
@@ -1494,10 +1705,14 @@ mod tests {
     fn test_shell_extended_overload() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let r = shell("echo", ["hello"], #{});
             [r.stdout, r.status]
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: rhai::Array = engine.eval_ast(&ast).unwrap();
         assert_eq!(result[0].clone().into_string().unwrap(), "hello");
         assert_eq!(result[1].clone().cast::<i64>(), 0);
@@ -1507,10 +1722,14 @@ mod tests {
     fn test_shell_extended_failure() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let r = shell("false", [], #{});
             r.status
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: i64 = engine.eval_ast(&ast).unwrap();
         assert_ne!(result, 0);
     }
@@ -1519,10 +1738,14 @@ mod tests {
     fn test_shell_extended_with_stdin() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        let ast = engine.compile(r#"
+        let ast = engine
+            .compile(
+                r#"
             let r = shell("cat", [], #{ stdin: "piped input" });
             r.stdout
-        "#).unwrap();
+        "#,
+            )
+            .unwrap();
         let result: String = engine.eval_ast(&ast).unwrap();
         assert_eq!(result, "piped input");
     }

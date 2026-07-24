@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use crate::assignment::{AssignmentManager, CompletionReason};
 use crate::workspace::{CleanupMode, CommitInfo, WorkspaceManager};
-use crate::workspace_setup::{SetupResult, WorkspaceContext, WorkspaceInfo, RepoInfo, TaskInfo};
+use crate::workspace_setup::{RepoInfo, SetupResult, TaskInfo, WorkspaceContext, WorkspaceInfo};
 use crate::Assignment;
 
 /// Options for completing an assignment
@@ -180,8 +180,7 @@ pub fn complete_assignment(
         }
 
         // Capture revision
-        result.revision =
-            ws_mgr.capture_revision(opts.segment_path, &assignment.workspace_path);
+        result.revision = ws_mgr.capture_revision(opts.segment_path, &assignment.workspace_path);
 
         // Capture workspace info (commit list) before cleanup
         result.workspace_info = ws_mgr
@@ -222,11 +221,10 @@ pub fn complete_assignment(
 
     // Close task unless keep_task_open (only if task_id and task_source are present)
     if !opts.keep_task_open {
-        if let (Some(ref task_id), Some(ref source)) = (&assignment.task_id, &assignment.task_source) {
-            let ctx = crate::PluginContext::new(
-                Some(opts.segment_path.to_path_buf()),
-                None,
-            );
+        if let (Some(ref task_id), Some(ref source)) =
+            (&assignment.task_id, &assignment.task_source)
+        {
+            let ctx = crate::PluginContext::new(Some(opts.segment_path.to_path_buf()), None);
             opts.plugin_mgr.resolve_complete(source, task_id, ctx)?;
             info!("Task {} closed", task_id);
         }
@@ -259,10 +257,7 @@ pub fn abort_assignment(
 
     // Handle task status (only if task_id and task_source are present)
     if let (Some(ref task_id), Some(ref source)) = (&assignment.task_id, &assignment.task_source) {
-        let ctx = crate::PluginContext::new(
-            Some(opts.segment_path.to_path_buf()),
-            None,
-        );
+        let ctx = crate::PluginContext::new(Some(opts.segment_path.to_path_buf()), None);
         if opts.close_task {
             opts.plugin_mgr.resolve_complete(source, task_id, ctx)?;
             info!("Task {} closed", task_id);
@@ -310,14 +305,19 @@ pub fn prepare_resume(
         )?;
         setup_result = result;
         workspace_recreated = true;
-        info!("Workspace recreated: {}", assignment.workspace_path.display());
+        info!(
+            "Workspace recreated: {}",
+            assignment.workspace_path.display()
+        );
     }
 
     // Touch updated_at timestamp (assignment is always Active)
     assignment_mgr.touch(&assignment.id)?;
 
     // Ensure task is in_progress and assigned to claude (if task_id and task_source present)
-    let task_title = if let (Some(ref task_id), Some(ref source)) = (&assignment.task_id, &assignment.task_source) {
+    let task_title = if let (Some(ref task_id), Some(ref source)) =
+        (&assignment.task_id, &assignment.task_source)
+    {
         let ctx = crate::PluginContext::new(
             Some(opts.segment_path.to_path_buf()),
             Some(opts.segment_name.to_string()),
@@ -330,7 +330,8 @@ pub fn prepare_resume(
                     Some(opts.segment_path.to_path_buf()),
                     Some(opts.segment_name.to_string()),
                 );
-                opts.plugin_mgr.resolve_claim(source, task_id, "claude", ctx)?;
+                opts.plugin_mgr
+                    .resolve_claim(source, task_id, "claude", ctx)?;
                 assignment
                     .task_title
                     .clone()
@@ -341,22 +342,19 @@ pub fn prepare_resume(
         assignment.task_title.clone().unwrap_or_default()
     };
 
-    let prompt = opts
-        .instruction
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if let Some(ref task_id) = assignment.task_id {
-                format!(
-                    "Continue working on {}: {}. Review progress and complete remaining work.",
-                    task_id, task_title
-                )
-            } else {
-                format!(
-                    "Continue working on: {}. Review progress and complete remaining work.",
-                    task_title
-                )
-            }
-        });
+    let prompt = opts.instruction.map(|s| s.to_string()).unwrap_or_else(|| {
+        if let Some(ref task_id) = assignment.task_id {
+            format!(
+                "Continue working on {}: {}. Review progress and complete remaining work.",
+                task_id, task_title
+            )
+        } else {
+            format!(
+                "Continue working on: {}. Review progress and complete remaining work.",
+                task_title
+            )
+        }
+    });
 
     Ok(ResumeResult {
         prompt,
@@ -423,11 +421,7 @@ pub fn clean_assignment(
     )?;
 
     // Record completion and remove assignment
-    assignment_mgr.record_completion(
-        assignment,
-        CompletionReason::Completed,
-        revision.clone(),
-    )?;
+    assignment_mgr.record_completion(assignment, CompletionReason::Completed, revision.clone())?;
     assignment_mgr.remove(&assignment.id)?;
 
     Ok(CleanResult {
@@ -510,18 +504,10 @@ fn cleanup_workspace(
         let processes = crate::process::find_workspace_processes(&assignment.workspace_path);
         if !processes.is_empty() {
             if kill {
-                info!(
-                    "Terminating {} process(es) in workspace",
-                    processes.len()
-                );
-                crate::process::terminate_processes(
-                    &processes,
-                    std::time::Duration::from_secs(5),
-                )?;
+                info!("Terminating {} process(es) in workspace", processes.len());
+                crate::process::terminate_processes(&processes, std::time::Duration::from_secs(5))?;
             } else {
-                return Err(
-                    crate::process::WorkspaceProcessesRunning { processes }.into()
-                );
+                return Err(crate::process::WorkspaceProcessesRunning { processes }.into());
             }
         }
     } else {
@@ -540,8 +526,7 @@ fn cleanup_workspace(
     let segment_name = crate::ancillary_segment(&assignment.ancillary_id)
         .unwrap_or_else(|| assignment.segment.clone());
 
-    let result =
-        ws_mgr.cleanup_workspace(segment_path, &segment_name, ws_name, mode)?;
+    let result = ws_mgr.cleanup_workspace(segment_path, &segment_name, ws_name, mode)?;
     info!("Workspace cleaned up for assignment {}", assignment.id);
     Ok(result)
 }
@@ -600,8 +585,8 @@ mod tests {
         )
         .unwrap();
 
-        let refused = guard_rmux_session(&assignment, false)
-            .expect_err("a running agent must block cleanup");
+        let refused =
+            guard_rmux_session(&assignment, false).expect_err("a running agent must block cleanup");
         assert!(
             refused
                 .downcast_ref::<crate::process::WorkspaceProcessesRunning>()

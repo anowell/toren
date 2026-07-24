@@ -35,7 +35,11 @@ pub fn infer_task_fields(
             let prefix = &raw_id[..colon_pos];
             let rest = &raw_id[colon_pos + 1..];
             // Only treat as source:id if prefix looks like a source name (no slashes, not a URL scheme)
-            if !prefix.contains('/') && !rest.starts_with("//") && !prefix.is_empty() && !rest.is_empty() {
+            if !prefix.contains('/')
+                && !rest.starts_with("//")
+                && !prefix.is_empty()
+                && !rest.is_empty()
+            {
                 source = Some(prefix.to_string());
                 id = Some(rest.to_string());
             }
@@ -155,7 +159,10 @@ mod tests {
     fn test_infer_url_to_id_extraction() {
         let result = infer_task_fields(None, None, Some("https://linear.app/team/ENG-123"), None);
         assert_eq!(result.task_id.as_deref(), Some("ENG-123"));
-        assert_eq!(result.task_url.as_deref(), Some("https://linear.app/team/ENG-123"));
+        assert_eq!(
+            result.task_url.as_deref(),
+            Some("https://linear.app/team/ENG-123")
+        );
     }
 
     #[test]
@@ -166,7 +173,12 @@ mod tests {
 
     #[test]
     fn test_infer_prompt_to_title() {
-        let result = infer_task_fields(None, None, None, Some("Fix the login bug\nMore details here"));
+        let result = infer_task_fields(
+            None,
+            None,
+            None,
+            Some("Fix the login bug\nMore details here"),
+        );
         assert_eq!(result.task_title.as_deref(), Some("Fix the login bug"));
         assert!(result.task_id.is_none());
         assert!(result.task_source.is_none());
@@ -181,7 +193,12 @@ mod tests {
 
     #[test]
     fn test_infer_explicit_title_not_overridden_by_prompt() {
-        let result = infer_task_fields(Some("breq-abc"), Some("Explicit Title"), None, Some("prompt text"));
+        let result = infer_task_fields(
+            Some("breq-abc"),
+            Some("Explicit Title"),
+            None,
+            Some("prompt text"),
+        );
         assert_eq!(result.task_title.as_deref(), Some("Explicit Title"));
     }
 
@@ -197,7 +214,10 @@ mod tests {
         // "https://..." should not be split as source=https, id=//...
         let result = infer_task_fields(Some("https://example.com/issue/42"), None, None, None);
         // The colon in https: has rest starting with //, so it should NOT be treated as source:id
-        assert_eq!(result.task_id.as_deref(), Some("https://example.com/issue/42"));
+        assert_eq!(
+            result.task_id.as_deref(),
+            Some("https://example.com/issue/42")
+        );
         assert_eq!(result.task_source.as_deref(), None);
     }
 }

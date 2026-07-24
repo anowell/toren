@@ -33,7 +33,9 @@ pub enum PaneStatus {
     /// No session, or no agent window in it.
     Idle,
     Working,
-    Exited { code: Option<i32> },
+    Exited {
+        code: Option<i32>,
+    },
 }
 
 /// A live mirror of one pane: the bytes seen so far, plus a subscription to what comes next.
@@ -436,8 +438,11 @@ impl TranscriptCursor {
         let (Some(pane_id), Some(sequence)) = (self.pane_id, self.last_sequence) else {
             return;
         };
-        let _ = tokio::fs::write(Self::sidecar(transcript), format!("{}:{}", pane_id, sequence))
-            .await;
+        let _ = tokio::fs::write(
+            Self::sidecar(transcript),
+            format!("{}:{}", pane_id, sequence),
+        )
+        .await;
     }
 
     fn already_recorded(&self, pane_id: u64, sequence: u64) -> bool {
@@ -471,7 +476,10 @@ async fn record_pane(
 ) {
     use tokio::io::AsyncWriteExt;
 
-    let mut stream = match pane.output_stream_starting_at(PaneOutputStart::Oldest).await {
+    let mut stream = match pane
+        .output_stream_starting_at(PaneOutputStart::Oldest)
+        .await
+    {
         Ok(stream) => stream,
         Err(e) => {
             warn!("Failed to subscribe to pane output: {}", e);
@@ -540,13 +548,24 @@ fn workspace_name(workspace_path: &Path) -> Result<String> {
         .file_name()
         .and_then(|n| n.to_str())
         .map(|n| n.to_string())
-        .ok_or_else(|| anyhow!("Workspace path has no directory name: {}", workspace_path.display()))
+        .ok_or_else(|| {
+            anyhow!(
+                "Workspace path has no directory name: {}",
+                workspace_path.display()
+            )
+        })
 }
 
 /// Make a string safe to use as a single path component.
 fn sanitize_component(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -609,7 +628,10 @@ mod tests {
 
         // Live: output produced after, delivered on the subscription taken with the backfill.
         let (_, mut live) = mirror.attach().await;
-        runner.send_input("Test One", "AFTER-ATTACH\n").await.unwrap();
+        runner
+            .send_input("Test One", "AFTER-ATTACH\n")
+            .await
+            .unwrap();
 
         let mut seen = Vec::new();
         while !contains(&seen, "AFTER-ATTACH") {
@@ -620,11 +642,20 @@ mod tests {
             seen.extend_from_slice(&chunk);
         }
 
-        assert_eq!(runner.status(&segment, &workspace).await, PaneStatus::Working);
+        assert_eq!(
+            runner.status(&segment, &workspace).await,
+            PaneStatus::Working
+        );
 
         // A detached window sits at 80x24, so this guards the window-vs-pane distinction.
         runner.resize("Test One", 100, 30).await.unwrap();
-        let snapshot = runner.agent_pane(&session).await.unwrap().snapshot().await.unwrap();
+        let snapshot = runner
+            .agent_pane(&session)
+            .await
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap();
         assert_eq!((snapshot.cols, snapshot.rows), (100, 30));
 
         assert!(runner
@@ -835,7 +866,9 @@ mod tests {
     #[tokio::test]
     async fn mirror_announces_truncation_to_new_clients() {
         let mirror = PaneMirror::new(Vec::new(), false);
-        mirror.push(Arc::new(vec![b'x'; REPLAY_CAP_BYTES + 1])).await;
+        mirror
+            .push(Arc::new(vec![b'x'; REPLAY_CAP_BYTES + 1]))
+            .await;
 
         let (backfill, _) = mirror.attach().await;
         assert!(backfill.starts_with(TRUNCATION_NOTICE));

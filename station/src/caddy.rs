@@ -49,13 +49,7 @@ impl CaddyBackend {
 
     /// Add a proxy route (upsert). Removes any existing route for the same
     /// host+port first, creates the per-port server if needed, then adds the route.
-    pub async fn add_route(
-        &self,
-        host: &str,
-        upstream: &str,
-        port: u16,
-        tls: bool,
-    ) -> Result<()> {
+    pub async fn add_route(&self, host: &str, upstream: &str, port: u16, tls: bool) -> Result<()> {
         // Remove existing route for this host+port to avoid duplicates
         self.remove_route(host, port).await?;
 
@@ -209,8 +203,7 @@ impl CaddyBackend {
         // so we must verify the body is an actual JSON object)
         if let Ok(r) = self.client.get(&server_url).send().await {
             if r.status().is_success() {
-                let body: serde_json::Value =
-                    r.json().await.unwrap_or(serde_json::Value::Null);
+                let body: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
                 if body.is_object() {
                     // Server exists — verify routes array exists
                     if body.get("routes").and_then(|v| v.as_array()).is_some() {
@@ -510,12 +503,10 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/config/apps/http/servers/station-8080"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "listen": [":8080"],
-                    "routes": []
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "listen": [":8080"],
+                "routes": []
+            })))
             .expect(1)
             .mount(&mock)
             .await;
@@ -635,7 +626,10 @@ mod tests {
 
     #[test]
     fn test_normalize_upstream_url() {
-        assert_eq!(normalize_upstream("http://localhost:5173"), "localhost:5173");
+        assert_eq!(
+            normalize_upstream("http://localhost:5173"),
+            "localhost:5173"
+        );
         assert_eq!(
             normalize_upstream("https://localhost:8443"),
             "localhost:8443"
@@ -676,9 +670,7 @@ mod tests {
     #[test]
     fn test_build_route_normalizes_upstream() {
         let route = build_route("test-id", "one.lvh.me", "8001");
-        let dial = route["handle"][0]["upstreams"][0]["dial"]
-            .as_str()
-            .unwrap();
+        let dial = route["handle"][0]["upstreams"][0]["dial"].as_str().unwrap();
         assert_eq!(dial, "localhost:8001");
     }
 }

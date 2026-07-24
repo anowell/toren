@@ -189,9 +189,7 @@ impl SegmentManager {
                         if let Some(name) = path.file_name() {
                             let name = name.to_string_lossy().to_string();
                             // Skip hidden directories and duplicates
-                            if !name.starts_with('.')
-                                && !segments.iter().any(|s| s.name == name)
-                            {
+                            if !name.starts_with('.') && !segments.iter().any(|s| s.name == name) {
                                 segments.push(Segment { name, path });
                             }
                         }

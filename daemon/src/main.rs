@@ -60,10 +60,7 @@ async fn main() -> Result<()> {
 
     // Initialize Rhai plugin manager (shared with breq CLI)
     let rhai_plugins = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))?;
-    info!(
-        "Rhai plugins loaded: {:?}",
-        rhai_plugins.list()
-    );
+    info!("Rhai plugins loaded: {:?}", rhai_plugins.list());
     info!("Ancillary systems initialized");
 
     // Start services
@@ -92,9 +89,8 @@ async fn main() -> Result<()> {
     let workspace_manager = Some(WorkspaceManager::new(workspace_root, local_domain));
 
     // Agents run in rmux panes; transcripts of those panes live under the toren root.
-    let pane_runner = services::pane_runner::PaneRunner::new(
-        toren_lib::toren_root().join("transcripts"),
-    );
+    let pane_runner =
+        services::pane_runner::PaneRunner::new(toren_lib::toren_root().join("transcripts"));
     info!("Pane runner initialized");
 
     // Resolve coding agent

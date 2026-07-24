@@ -15,8 +15,13 @@ use super::AppState;
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WsRequest {
     /// Keystrokes, forwarded to the pane verbatim.
-    Data { data: String },
-    Resize { cols: u16, rows: u16 },
+    Data {
+        data: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     /// Ctrl-C, distinct from `Data` so the UI can offer a button for it.
     Interrupt,
 }
@@ -25,8 +30,13 @@ enum WsRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WsResponse {
     /// Pane liveness, sent on connect and when it changes.
-    Status { status: String, session: String },
-    Error { message: String },
+    Status {
+        status: String,
+        session: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// ETX.
@@ -52,7 +62,10 @@ pub async fn handle_ancillary_ws(socket: WebSocket, state: AppState, ancillary_i
         .await
         .unwrap_or_default();
 
-    info!("Client attached to {} (rmux session {})", ancillary_id, session);
+    info!(
+        "Client attached to {} (rmux session {})",
+        ancillary_id, session
+    );
 
     // Taken together, so nothing is missed or repeated.
     let (backfill, mut live) = mirror.attach().await;
@@ -61,7 +74,12 @@ pub async fn handle_ancillary_ws(socket: WebSocket, state: AppState, ancillary_i
     send_json(
         &mut sender,
         &WsResponse::Status {
-            status: if mirror.has_ended() { "ended" } else { "attached" }.to_string(),
+            status: if mirror.has_ended() {
+                "ended"
+            } else {
+                "attached"
+            }
+            .to_string(),
             session: session.clone(),
         },
     )

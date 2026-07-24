@@ -292,7 +292,8 @@ fn main() -> Result<()> {
             // `breq do --help`: inject available intents into help text
             if subcmd == "do" && plugin_args.iter().any(|a| a == "--help" || a == "-h") {
                 if let Ok(config) = Config::load() {
-                    let mut intent_names: Vec<&str> = config.intents.entries.keys().map(|s| s.as_str()).collect();
+                    let mut intent_names: Vec<&str> =
+                        config.intents.entries.keys().map(|s| s.as_str()).collect();
                     intent_names.sort();
                     let intent_list = intent_names.join(", ");
                     let section = format!("Available intents:\n  {}", intent_list);
@@ -310,7 +311,9 @@ fn main() -> Result<()> {
 
             // Top-level help: inject plugin descriptions
             if subcmd == "--help" || subcmd == "-h" {
-                if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")) {
+                if let Ok(plugin_mgr) =
+                    toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))
+                {
                     let plugins = plugin_mgr.list_with_descriptions();
                     if !plugins.is_empty() {
                         let mut section = String::from("Plugins:");
@@ -320,10 +323,7 @@ fn main() -> Result<()> {
                                 None => section.push_str(&format!("\n  {}", name)),
                             }
                         }
-                        Cli::command()
-                            .after_help(section)
-                            .print_help()
-                            .ok();
+                        Cli::command().after_help(section).print_help().ok();
                         std::process::exit(0);
                     }
                 }
@@ -357,7 +357,9 @@ fn main() -> Result<()> {
                 };
 
                 // 1. Plugin dispatch (highest priority)
-                if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")) {
+                if let Ok(plugin_mgr) =
+                    toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))
+                {
                     if plugin_mgr.has(subcmd) {
                         // Per-plugin help
                         if plugin_args.iter().any(|a| a == "--help" || a == "-h") {
@@ -467,7 +469,17 @@ fn main() -> Result<()> {
             segment,
             no_rmux,
             cmd,
-        } => cmd_shell(&config, workspace, hook, task_id, task_title, task_url, segment.as_deref(), no_rmux, cmd),
+        } => cmd_shell(
+            &config,
+            workspace,
+            hook,
+            task_id,
+            task_title,
+            task_url,
+            segment.as_deref(),
+            no_rmux,
+            cmd,
+        ),
         Commands::List {
             reference,
             all,
@@ -480,7 +492,14 @@ fn main() -> Result<()> {
             task_title,
             task_url,
             segment,
-        } => cmd_setup(&config, workspace, task_id, task_title, task_url, segment.as_deref()),
+        } => cmd_setup(
+            &config,
+            workspace,
+            task_id,
+            task_title,
+            task_url,
+            segment.as_deref(),
+        ),
         Commands::Destroy {
             workspace,
             kill,
@@ -547,7 +566,7 @@ fn execute_deferred_action(config: &Config, action: toren_lib::DeferredAction) -
         } => {
             cmd_do(
                 config,
-                None,       // workspace (auto-create)
+                None, // workspace (auto-create)
                 prompt,
                 intent,
                 task_id,
@@ -608,10 +627,15 @@ fn cmd_do(
     // This discovers the source once so downstream operations (complete/abort/resume)
     // never need to search across plugins.
     if inferred.task_id.is_some() && inferred.task_source.is_none() {
-        if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")) {
+        if let Ok(plugin_mgr) =
+            toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))
+        {
             let sources = plugin_mgr.effective_sources(&config.tasks.sources);
             if let Some(ref task_id) = inferred.task_id {
-                let ctx = toren_lib::PluginContext::new(Some(segment.path.clone()), Some(segment.name.clone()));
+                let ctx = toren_lib::PluginContext::new(
+                    Some(segment.path.clone()),
+                    Some(segment.name.clone()),
+                );
                 if let Ok(task) = plugin_mgr.resolve_info_multi(&sources, task_id, ctx) {
                     inferred.task_source = Some(task.source);
                     if inferred.task_title.is_none() {
@@ -631,8 +655,12 @@ fn cmd_do(
 
         // Fetch task description if we have a task_id
         let task_description = inferred.task_id.as_ref().and_then(|id| {
-            let plugin_mgr = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")).ok()?;
-            let ctx = toren_lib::PluginContext::new(Some(segment.path.clone()), Some(segment.name.clone()));
+            let plugin_mgr =
+                toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")).ok()?;
+            let ctx = toren_lib::PluginContext::new(
+                Some(segment.path.clone()),
+                Some(segment.name.clone()),
+            );
             if let Some(source) = inferred.task_source.as_deref() {
                 // Source is known (e.g., "runes:foo-123") — direct lookup
                 plugin_mgr.resolve_info(source, id, ctx).ok()
@@ -640,12 +668,16 @@ fn cmd_do(
                 // Source unknown — search across all task plugins
                 let sources = plugin_mgr.effective_sources(&config.tasks.sources);
                 plugin_mgr.resolve_info_multi(&sources, id, ctx).ok()
-            }.and_then(|t| t.description)
+            }
+            .and_then(|t| t.description)
         });
 
         // Build task context for template rendering
         let task_id = inferred.task_id.clone().unwrap_or_default();
-        let task_title = inferred.task_title.clone().unwrap_or_else(|| task_id.clone());
+        let task_title = inferred
+            .task_title
+            .clone()
+            .unwrap_or_else(|| task_id.clone());
         let ctx = toren_lib::WorkspaceContext {
             ws: toren_lib::WorkspaceInfo {
                 name: String::new(),
@@ -685,8 +717,7 @@ fn cmd_do(
         trimmed
     } else if system_prompt.is_some() {
         // Intent provides system prompt; open editor for user message
-        let text = edit::edit("")
-            .context("Editor returned an error")?;
+        let text = edit::edit("").context("Editor returned an error")?;
         let trimmed = text.trim().to_string();
         if trimmed.is_empty() {
             anyhow::bail!("Empty prompt from editor. Provide -p or pipe a prompt.");
@@ -694,8 +725,7 @@ fn cmd_do(
         trimmed
     } else {
         // No intent, no prompt, no stdin — open editor
-        let text = edit::edit("")
-            .context("Editor returned an error")?;
+        let text = edit::edit("").context("Editor returned an error")?;
         let trimmed = text.trim().to_string();
         if trimmed.is_empty() {
             anyhow::bail!("Empty prompt from editor. Provide -p, -i, or pipe a prompt.");
@@ -709,15 +739,25 @@ fn cmd_do(
         let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name_lower);
 
         if !ws_path.exists() {
-            anyhow::bail!("Workspace '{}' not found at {}", ws_name_lower, ws_path.display());
+            anyhow::bail!(
+                "Workspace '{}' not found at {}",
+                ws_name_lower,
+                ws_path.display()
+            );
         }
 
         // Reuse workspace — update assignment fields if provided
-        if inferred.task_id.is_some() || inferred.task_title.is_some() || inferred.task_url.is_some() {
+        if inferred.task_id.is_some()
+            || inferred.task_title.is_some()
+            || inferred.task_url.is_some()
+        {
             let ancillary_num = toren_lib::word_to_number(&ws_name_lower).unwrap_or(0);
             let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
 
-            if let Some(assignment) = assignment_mgr.get_active_for_ancillary(&ancillary_id_str).cloned() {
+            if let Some(assignment) = assignment_mgr
+                .get_active_for_ancillary(&ancillary_id_str)
+                .cloned()
+            {
                 if assignment_mgr.update_task_fields(
                     &assignment.id,
                     inferred.task_id.as_deref(),
@@ -728,7 +768,10 @@ fn cmd_do(
                     eprintln!("Updated assignment for workspace '{}'", ws_name_lower);
                 }
             } else {
-                info!("No assignment found for ancillary '{}', skipping update", ancillary_id_str);
+                info!(
+                    "No assignment found for ancillary '{}', skipping update",
+                    ancillary_id_str
+                );
             }
         }
 
@@ -779,15 +822,17 @@ fn cmd_do(
         };
 
         // Use inferred title, falling back to first 80 chars of user message
-        let title: Option<String> = inferred.task_title.clone().or_else(|| Some(
-            user_message
-                .lines()
-                .next()
-                .unwrap_or(&user_message)
-                .chars()
-                .take(80)
-                .collect(),
-        ));
+        let title: Option<String> = inferred.task_title.clone().or_else(|| {
+            Some(
+                user_message
+                    .lines()
+                    .next()
+                    .unwrap_or(&user_message)
+                    .chars()
+                    .take(80)
+                    .collect(),
+            )
+        });
 
         assignment_mgr.create(
             &ancillary_id_str,
@@ -854,7 +899,10 @@ fn launch_agent(
         toren_lib::rmux::ensure_session(&session, ws_path)?;
         toren_lib::rmux::spawn_agent(&session, ws_path, &argv)?;
 
-        eprintln!("rmux session: {} (detach leaves the agent running)\n", session);
+        eprintln!(
+            "rmux session: {} (detach leaves the agent running)\n",
+            session
+        );
         let err = toren_lib::rmux::attach_command(&session).exec();
         return Err(err).context(format!("Failed to attach to rmux session '{}'", session));
     }
@@ -882,7 +930,8 @@ fn cmd_shell(
     // Hook mode: run setup/destroy from cwd
     if let Some(hook_type) = hook {
         let workspace_root = config.ancillaries.workspace_root.clone();
-        let workspace_mgr = WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
+        let workspace_mgr =
+            WorkspaceManager::new(workspace_root, Some(config.proxy.domain.clone()));
 
         let (segment_path, workspace_path, workspace_name) = detect_workspace_context()?;
         let ancillary_num = toren_lib::word_to_number(&workspace_name);
@@ -908,11 +957,7 @@ fn cmd_shell(
                     workspace_name,
                     workspace_path.display()
                 );
-                workspace_mgr.run_destroy(
-                    &segment_path,
-                    &workspace_path,
-                    &workspace_name,
-                )?;
+                workspace_mgr.run_destroy(&segment_path, &workspace_path, &workspace_name)?;
                 eprintln!("Destroy complete.");
             }
         }
@@ -930,7 +975,11 @@ fn cmd_shell(
         let ws_path = workspace_mgr.workspace_path(&segment.name, &ws_name_lower);
 
         if !ws_path.exists() {
-            anyhow::bail!("Workspace '{}' not found at {}", ws_name_lower, ws_path.display());
+            anyhow::bail!(
+                "Workspace '{}' not found at {}",
+                ws_name_lower,
+                ws_path.display()
+            );
         }
 
         println!("{}", ws_path.display());
@@ -1085,7 +1134,10 @@ fn cmd_list(
             let name = if all_segments {
                 a.ancillary_id.as_str()
             } else {
-                a.ancillary_id.split_whitespace().last().unwrap_or(&a.ancillary_id)
+                a.ancillary_id
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or(&a.ancillary_id)
             };
             // Account for " *" dirty suffix
             name.len() + 2
@@ -1098,9 +1150,8 @@ fn cmd_list(
 
     for assignment in &assignments {
         // Agent activity
-        let agent_activity = toren_lib::composite_status::detect_agent_activity(
-            &assignment.workspace_path,
-        );
+        let agent_activity =
+            toren_lib::composite_status::detect_agent_activity(&assignment.workspace_path);
 
         // Has changes
         let has_changes = toren_lib::composite_status::workspace_has_changes(
@@ -1121,7 +1172,11 @@ fn cmd_list(
         };
 
         let ws_text = if has_changes {
-            format!("{:<width$}", format!("{} *", ancillary_name), width = ws_col_width)
+            format!(
+                "{:<width$}",
+                format!("{} *", ancillary_name),
+                width = ws_col_width
+            )
         } else {
             format!("{:<width$}", ancillary_name, width = ws_col_width)
         };
@@ -1132,10 +1187,7 @@ fn cmd_list(
         };
 
         // Task ID (if any)
-        let task_id_display = assignment
-            .task_id
-            .as_deref()
-            .unwrap_or("-");
+        let task_id_display = assignment.task_id.as_deref().unwrap_or("-");
 
         let activity_text = format!("{:<6}", agent_activity);
         let activity_colored = if agent_activity == "busy" {
@@ -1165,7 +1217,12 @@ fn cmd_list(
 
         if !orphans.is_empty() {
             for (segment_name, ws_name, path) in &orphans {
-                tracing::debug!("orphaned workspace dir: {}/{} ({})", segment_name, ws_name, path.display());
+                tracing::debug!(
+                    "orphaned workspace dir: {}/{} ({})",
+                    segment_name,
+                    ws_name,
+                    path.display()
+                );
             }
             tracing::debug!(
                 "{} orphaned workspace dir(s) (will be reclaimed on next assign, or run `breq cleanup`)",
@@ -1295,10 +1352,15 @@ fn cmd_setup(
 
     // Resolve task_source from plugins when we have a task_id but no source
     if inferred.task_id.is_some() && inferred.task_source.is_none() {
-        if let Ok(plugin_mgr) = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins")) {
+        if let Ok(plugin_mgr) =
+            toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))
+        {
             let sources = plugin_mgr.effective_sources(&config.tasks.sources);
             if let Some(ref task_id) = inferred.task_id {
-                let ctx = toren_lib::PluginContext::new(Some(segment.path.clone()), Some(segment.name.clone()));
+                let ctx = toren_lib::PluginContext::new(
+                    Some(segment.path.clone()),
+                    Some(segment.name.clone()),
+                );
                 if let Ok(task) = plugin_mgr.resolve_info_multi(&sources, task_id, ctx) {
                     inferred.task_source = Some(task.source);
                     if inferred.task_title.is_none() {
@@ -1318,8 +1380,14 @@ fn cmd_setup(
             let ancillary_num = toren_lib::word_to_number(&ws_name_lower).unwrap_or(0);
             let ancillary_id_str = toren_lib::ancillary_id(&segment.name, ancillary_num);
 
-            if inferred.task_id.is_some() || inferred.task_title.is_some() || inferred.task_url.is_some() {
-                if let Some(assignment) = assignment_mgr.get_active_for_ancillary(&ancillary_id_str).cloned() {
+            if inferred.task_id.is_some()
+                || inferred.task_title.is_some()
+                || inferred.task_url.is_some()
+            {
+                if let Some(assignment) = assignment_mgr
+                    .get_active_for_ancillary(&ancillary_id_str)
+                    .cloned()
+                {
                     if assignment_mgr.update_task_fields(
                         &assignment.id,
                         inferred.task_id.as_deref(),
@@ -1330,7 +1398,10 @@ fn cmd_setup(
                         eprintln!("Updated assignment for workspace '{}'", ws_name_lower);
                     }
                 } else {
-                    info!("No assignment found for ancillary '{}', skipping update", ancillary_id_str);
+                    info!(
+                        "No assignment found for ancillary '{}', skipping update",
+                        ancillary_id_str
+                    );
                 }
             }
 
@@ -1812,9 +1883,7 @@ fn cmd_init(stealth: bool) -> Result<()> {
                     .map(|p| format!("{}/*", toren_lib::tilde_shorten(p)));
 
                 let entry = if let Some(glob) = parent_glob {
-                    eprintln!(
-                        "\nThis repo isn't covered by a segment in ~/.toren/config.toml."
-                    );
+                    eprintln!("\nThis repo isn't covered by a segment in ~/.toren/config.toml.");
                     eprint!("Add parent glob '{}'? [Y/n] ", glob);
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input)?;
@@ -1843,8 +1912,7 @@ fn cmd_init(stealth: bool) -> Result<()> {
 
 const PLUGIN_REPO_RAW: &str =
     "https://raw.githubusercontent.com/anowell/toren/main/contrib/plugins";
-const PLUGIN_REPO_API: &str =
-    "https://api.github.com/repos/anowell/toren/contents/contrib/plugins";
+const PLUGIN_REPO_API: &str = "https://api.github.com/repos/anowell/toren/contents/contrib/plugins";
 const PLUGIN_CATEGORIES: &[&str] = &["commands", "tasks"];
 
 fn cmd_plugin(cmd: PluginCmd) -> Result<()> {
@@ -1932,8 +2000,8 @@ fn install_from_local(src: &Path, installed_root: &Path) -> Result<()> {
         .with_context(|| format!("Failed to create {}", dest_dir.display()))?;
     let dest = dest_dir.join(file_name);
 
-    let contents = std::fs::read(src)
-        .with_context(|| format!("Failed to read {}", src.display()))?;
+    let contents =
+        std::fs::read(src).with_context(|| format!("Failed to read {}", src.display()))?;
     std::fs::write(&dest, contents)
         .with_context(|| format!("Failed to write {}", dest.display()))?;
 
@@ -1984,8 +2052,7 @@ fn install_from_remote(target: &str, installed_root: &Path) -> Result<()> {
     std::fs::create_dir_all(&dest_dir)
         .with_context(|| format!("Failed to create {}", dest_dir.display()))?;
     let dest = dest_dir.join(format!("{}.rhai", name));
-    std::fs::write(&dest, body)
-        .with_context(|| format!("Failed to write {}", dest.display()))?;
+    std::fs::write(&dest, body).with_context(|| format!("Failed to write {}", dest.display()))?;
 
     println!(
         "Installed {}/{} -> {}",
@@ -2072,11 +2139,7 @@ fn list_installed_plugins(installed_root: &Path, category: &str) -> Vec<String> 
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("rhai"))
-        .filter_map(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .map(String::from)
-        })
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
         .collect();
     names.sort();
     names

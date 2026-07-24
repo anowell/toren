@@ -232,12 +232,7 @@ impl PluginManager {
     /// Resolve task info via a resolver plugin's `info(id)` function.
     ///
     /// Returns a unified `ResolvedTask` with all available fields.
-    pub fn resolve_info(
-        &self,
-        source: &str,
-        id: &str,
-        ctx: PluginContext,
-    ) -> Result<ResolvedTask> {
+    pub fn resolve_info(&self, source: &str, id: &str, ctx: PluginContext) -> Result<ResolvedTask> {
         let map = self.call_resolver_map(source, "info", (id.to_string(),), ctx)?;
 
         Ok(ResolvedTask {
@@ -261,12 +256,8 @@ impl PluginManager {
         assignee: &str,
         ctx: PluginContext,
     ) -> Result<()> {
-        let _ = self.call_resolver_raw(
-            source,
-            "claim",
-            (id.to_string(), assignee.to_string()),
-            ctx,
-        )?;
+        let _ =
+            self.call_resolver_raw(source, "claim", (id.to_string(), assignee.to_string()), ctx)?;
         Ok(())
     }
 
@@ -294,12 +285,8 @@ impl PluginManager {
             Some(d) => rhai::Dynamic::from(d.to_string()),
             None => rhai::Dynamic::UNIT,
         };
-        let result = self.call_resolver_raw(
-            source,
-            "create",
-            (title.to_string(), desc_arg),
-            ctx,
-        )?;
+        let result =
+            self.call_resolver_raw(source, "create", (title.to_string(), desc_arg), ctx)?;
         Ok(result.into_string().unwrap_or_default())
     }
 
@@ -307,7 +294,10 @@ impl PluginManager {
     /// otherwise all installed task plugins.
     pub fn effective_sources(&self, config_sources: &[String]) -> Vec<String> {
         if config_sources.is_empty() {
-            self.list_resolvers().iter().map(|s| s.to_string()).collect()
+            self.list_resolvers()
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
         } else {
             config_sources.to_vec()
         }
@@ -320,10 +310,7 @@ impl PluginManager {
         id: &str,
         ctx: PluginContext,
     ) -> Result<ResolvedTask> {
-        let available: Vec<_> = sources
-            .iter()
-            .filter(|s| self.has_resolver(s))
-            .collect();
+        let available: Vec<_> = sources.iter().filter(|s| self.has_resolver(s)).collect();
         if available.is_empty() {
             anyhow::bail!("No task resolvers available (tried: {:?})", sources);
         }
@@ -374,9 +361,9 @@ impl PluginManager {
     ) -> Result<rhai::Map> {
         let result = self.call_resolver_raw(source, fn_name, args, ctx)?;
 
-        result
-            .try_cast::<rhai::Map>()
-            .ok_or_else(|| anyhow::anyhow!("Resolver '{}' {} did not return a map", source, fn_name))
+        result.try_cast::<rhai::Map>().ok_or_else(|| {
+            anyhow::anyhow!("Resolver '{}' {} did not return a map", source, fn_name)
+        })
     }
 
     /// Compile a plugin on demand, caching the result.
@@ -387,11 +374,22 @@ impl PluginManager {
                 return Ok(ast.clone());
             }
         }
-        let source = std::fs::read_to_string(&meta.path)
-            .with_context(|| format!("Failed to read plugin '{}' ({})", meta.name, meta.path.display()))?;
+        let source = std::fs::read_to_string(&meta.path).with_context(|| {
+            format!(
+                "Failed to read plugin '{}' ({})",
+                meta.name,
+                meta.path.display()
+            )
+        })?;
         let engine = rhai::Engine::new();
-        let ast = engine.compile(&source)
-            .map_err(|e| anyhow::anyhow!("Failed to compile plugin '{}' ({}): {}", meta.name, meta.path.display(), e))?;
+        let ast = engine.compile(&source).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to compile plugin '{}' ({}): {}",
+                meta.name,
+                meta.path.display(),
+                e
+            )
+        })?;
         let mut cache = self.compiled.lock().unwrap();
         cache.insert(meta.path.clone(), ast.clone());
         Ok(ast)
@@ -402,9 +400,7 @@ impl PluginManager {
     fn resolver_asts(&self) -> HashMap<String, rhai::AST> {
         self.resolver_metas
             .iter()
-            .filter_map(|(name, meta)| {
-                self.compile(meta).ok().map(|ast| (name.clone(), ast))
-            })
+            .filter_map(|(name, meta)| self.compile(meta).ok().map(|ast| (name.clone(), ast)))
             .collect()
     }
 
@@ -438,7 +434,12 @@ impl PluginManager {
                 Ok(source) => {
                     let (description, usage) = parse_doc_comments(&source);
                     let kind_label = if is_resolver { "resolver" } else { "command" };
-                    info!("Scanned {} plugin '{}' from {}", kind_label, name, path.display());
+                    info!(
+                        "Scanned {} plugin '{}' from {}",
+                        kind_label,
+                        name,
+                        path.display()
+                    );
                     let meta = PluginMeta {
                         name: name.clone(),
                         path,
@@ -597,16 +598,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cmd_dir = dir.path().join("commands");
         std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::write(
-            cmd_dir.join("beta.rhai"),
-            "/// Beta plugin.\nlet x = 1;",
-        )
-        .unwrap();
-        std::fs::write(
-            cmd_dir.join("alpha.rhai"),
-            "/// Alpha plugin.\nlet x = 1;",
-        )
-        .unwrap();
+        std::fs::write(cmd_dir.join("beta.rhai"), "/// Beta plugin.\nlet x = 1;").unwrap();
+        std::fs::write(cmd_dir.join("alpha.rhai"), "/// Alpha plugin.\nlet x = 1;").unwrap();
         std::fs::write(cmd_dir.join("gamma.rhai"), "let x = 1;").unwrap();
 
         let mgr = PluginManager::new(dir.path()).unwrap();
@@ -656,11 +649,7 @@ mod tests {
             "/// Test resolver.\nfn fetch(id) { #{} }",
         )
         .unwrap();
-        std::fs::write(
-            cmd_dir.join("mycmd.rhai"),
-            "/// Test command.\nlet x = 1;",
-        )
-        .unwrap();
+        std::fs::write(cmd_dir.join("mycmd.rhai"), "/// Test command.\nlet x = 1;").unwrap();
 
         let mgr = PluginManager::new(dir.path()).unwrap();
 
@@ -712,16 +701,8 @@ mod tests {
         let cmd_dir = dir.path().join("commands");
         std::fs::create_dir_all(&tasks_dir).unwrap();
         std::fs::create_dir_all(&cmd_dir).unwrap();
-        std::fs::write(
-            tasks_dir.join("alpha.rhai"),
-            "fn fetch(id) { #{} }",
-        )
-        .unwrap();
-        std::fs::write(
-            tasks_dir.join("beta.rhai"),
-            "fn fetch(id) { #{} }",
-        )
-        .unwrap();
+        std::fs::write(tasks_dir.join("alpha.rhai"), "fn fetch(id) { #{} }").unwrap();
+        std::fs::write(tasks_dir.join("beta.rhai"), "fn fetch(id) { #{} }").unwrap();
         std::fs::write(cmd_dir.join("cmd.rhai"), "let x = 1;").unwrap();
 
         let mgr = PluginManager::new(dir.path()).unwrap();
@@ -896,11 +877,7 @@ fn abort(id) { }"#,
         std::fs::create_dir_all(&tasks_dir).unwrap();
 
         // First resolver fails (no info function)
-        std::fs::write(
-            tasks_dir.join("failing.rhai"),
-            r#"fn fetch(id) { #{} }"#,
-        )
-        .unwrap();
+        std::fs::write(tasks_dir.join("failing.rhai"), r#"fn fetch(id) { #{} }"#).unwrap();
 
         // Second resolver succeeds
         std::fs::write(
@@ -959,16 +936,14 @@ fn abort(id) { }"#,
         std::fs::create_dir_all(&tasks_dir).unwrap();
 
         // First resolver has no info function
-        std::fs::write(
-            tasks_dir.join("no_info.rhai"),
-            r#"fn fetch(id) { #{} }"#,
-        ).unwrap();
+        std::fs::write(tasks_dir.join("no_info.rhai"), r#"fn fetch(id) { #{} }"#).unwrap();
 
         // Second resolver has info
         std::fs::write(
             tasks_dir.join("has_info.rhai"),
             r#"fn info(id) { #{ id: id, title: "T", status: "open", assignee: "bob" } }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let mgr = PluginManager::new(dir.path()).unwrap();
 

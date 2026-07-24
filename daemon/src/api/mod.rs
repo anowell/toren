@@ -18,8 +18,7 @@ use crate::services::pane_runner::{PaneRunner, PaneStatus};
 use crate::services::Services;
 use tokio::sync::RwLock;
 use toren_lib::{
-    Agent, Assignment, AssignmentManager, CompositeStatus, Config, SegmentManager,
-    WorkspaceManager,
+    Agent, Assignment, AssignmentManager, CompositeStatus, Config, SegmentManager, WorkspaceManager,
 };
 
 mod ancillary_ws;
@@ -98,16 +97,10 @@ pub async fn serve(
             "/api/assignments/:id/status",
             post(assignments_update_status),
         )
-        .route(
-            "/api/assignments/:id/complete",
-            post(assignments_complete),
-        )
+        .route("/api/assignments/:id/complete", post(assignments_complete))
         .route("/api/assignments/:id/abort", post(assignments_abort))
         .route("/api/assignments/:id/resume", post(assignments_resume))
-        .route(
-            "/api/assignments/:id/action/:name",
-            post(assignment_action),
-        )
+        .route("/api/assignments/:id/action/:name", post(assignment_action))
         .route("/api/segments/list", get(segments_list))
         .route("/api/segments/create", post(segments_create))
         .route("/api/workspaces/list/:segment", get(workspaces_list))
@@ -358,7 +351,11 @@ fn assignment_prompt(assignment: &Assignment, config: &Config) -> String {
 /// The agent runs in a terminal, so there is no message to read the id out of; Claude names its
 /// session log `<session-id>.jsonl`, so watch for one instead. Best-effort: a non-Claude agent
 /// just leaves `session_id` unset.
-fn capture_session_id(state: &AppState, assignment: &Assignment, started_at: std::time::SystemTime) {
+fn capture_session_id(
+    state: &AppState,
+    assignment: &Assignment,
+    started_at: std::time::SystemTime,
+) {
     let assignments = state.assignments.clone();
     let assignment_id = assignment.id.clone();
     let workspace_path = assignment.workspace_path.clone();
@@ -376,7 +373,10 @@ fn capture_session_id(state: &AppState, assignment: &Assignment, started_at: std
             };
 
             let mut mgr = assignments.write().await;
-            if mgr.get(&assignment_id).and_then(|a| a.session_id.clone()).as_deref()
+            if mgr
+                .get(&assignment_id)
+                .and_then(|a| a.session_id.clone())
+                .as_deref()
                 == Some(session_id.as_str())
             {
                 return;
@@ -415,7 +415,11 @@ async fn ancillary_stop_work(
 
     let stopped = state
         .panes
-        .stop_agent(&ancillary_id, &assignment.segment, &assignment.workspace_path)
+        .stop_agent(
+            &ancillary_id,
+            &assignment.segment,
+            &assignment.workspace_path,
+        )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -568,10 +572,7 @@ struct EnrichedAssignment {
 }
 
 /// Compute composite status for an assignment
-async fn compute_composite_status(
-    assignment: &Assignment,
-    state: &AppState,
-) -> CompositeStatus {
+async fn compute_composite_status(assignment: &Assignment, state: &AppState) -> CompositeStatus {
     // 1. Agent activity — a live rmux pane is authoritative; session logs also catch agents
     //    started outside toren entirely.
     let pane_status = state
@@ -594,29 +595,36 @@ async fn compute_composite_status(
     // 3. Task status + assignee — from task resolver
     let segment_path = {
         let segments = state.segments.read().unwrap();
-        segments.find_by_name(&assignment.segment).map(|s| s.path.clone())
+        segments
+            .find_by_name(&assignment.segment)
+            .map(|s| s.path.clone())
     };
 
-    let (task_status, task_assignee) = if let (Some(ref seg_path), Some(ref task_id)) = (&segment_path, &assignment.task_id) {
-        let ctx = toren_lib::PluginContext::new(Some(seg_path.clone()), None);
-        let result = if let Some(source) = assignment.task_source.as_deref() {
-            // Source is known — direct lookup
-            state.rhai_plugins.resolve_info(source, task_id, ctx)
+    let (task_status, task_assignee) =
+        if let (Some(ref seg_path), Some(ref task_id)) = (&segment_path, &assignment.task_id) {
+            let ctx = toren_lib::PluginContext::new(Some(seg_path.clone()), None);
+            let result = if let Some(source) = assignment.task_source.as_deref() {
+                // Source is known — direct lookup
+                state.rhai_plugins.resolve_info(source, task_id, ctx)
+            } else {
+                // Source unknown — search across all task plugins
+                let sources = state
+                    .rhai_plugins
+                    .effective_sources(&state.config.tasks.sources);
+                state
+                    .rhai_plugins
+                    .resolve_info_multi(&sources, task_id, ctx)
+            };
+            match result {
+                Ok(info) => (
+                    info.status.unwrap_or_else(|| "unknown".to_string()),
+                    info.assignee.unwrap_or_default(),
+                ),
+                Err(_) => ("unknown".to_string(), String::new()),
+            }
         } else {
-            // Source unknown — search across all task plugins
-            let sources = state.rhai_plugins.effective_sources(&state.config.tasks.sources);
-            state.rhai_plugins.resolve_info_multi(&sources, task_id, ctx)
+            ("unknown".to_string(), String::new())
         };
-        match result {
-            Ok(info) => (
-                info.status.unwrap_or_else(|| "unknown".to_string()),
-                info.assignee.unwrap_or_default(),
-            ),
-            Err(_) => ("unknown".to_string(), String::new()),
-        }
-    } else {
-        ("unknown".to_string(), String::new())
-    };
 
     CompositeStatus {
         agent_activity,
@@ -720,7 +728,9 @@ async fn assignments_create(
     // Determine task ID - either from existing or create from prompt
     let plugin_mgr = &state.rhai_plugins;
 
-    let (task_id, original_prompt, task_title, resolved_source) = if let Some(ref prompt) = request.prompt {
+    let (task_id, original_prompt, task_title, resolved_source) = if let Some(ref prompt) =
+        request.prompt
+    {
         // Create task from prompt — requires a task source
         let create_source = request.task_source.clone()
             .or_else(|| state.config.tasks.default_source().map(|s| s.to_string()))
@@ -760,10 +770,17 @@ async fn assignments_create(
                 )
             })?;
 
-        (new_task_id, Some(prompt.clone()), Some(title), Some(create_source))
+        (
+            new_task_id,
+            Some(prompt.clone()),
+            Some(title),
+            Some(create_source),
+        )
     } else if let Some(task_id) = request.task_id.clone() {
         // Look up which source has this task, then claim it
-        let task_source = request.task_source.as_deref()
+        let task_source = request
+            .task_source
+            .as_deref()
             .or_else(|| state.config.tasks.default_source());
         if let Some(source) = task_source {
             let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
@@ -780,13 +797,19 @@ async fn assignments_create(
         // Fetch task title for display — search across sources if needed
         let ctx = toren_lib::PluginContext::new(Some(segment_path.clone()), None);
         let (title, discovered_source) = if let Some(source) = request.task_source.as_deref() {
-            let title = plugin_mgr.resolve_info(source, &task_id, ctx).ok().map(|t| t.title);
+            let title = plugin_mgr
+                .resolve_info(source, &task_id, ctx)
+                .ok()
+                .map(|t| t.title);
             (title, Some(source.to_string()))
         } else {
             let sources = plugin_mgr.effective_sources(&state.config.tasks.sources);
             match plugin_mgr.resolve_info_multi(&sources, &task_id, ctx) {
                 Ok(task) => (Some(task.title.clone()), Some(task.source)),
-                Err(_) => (None, state.config.tasks.default_source().map(|s| s.to_string())),
+                Err(_) => (
+                    None,
+                    state.config.tasks.default_source().map(|s| s.to_string()),
+                ),
             }
         };
 
@@ -799,9 +822,7 @@ async fn assignments_create(
     };
 
     // Find next available ancillary, accounting for existing workspaces on disk
-    let existing_workspaces = ws_mgr
-        .list_workspaces(&segment_path)
-        .unwrap_or_default();
+    let existing_workspaces = ws_mgr.list_workspaces(&segment_path).unwrap_or_default();
     let ancillary_id = assignments.next_available_ancillary(
         &request.segment,
         state.config.ancillaries.max_per_segment,
@@ -817,12 +838,7 @@ async fn assignments_create(
 
     // Create workspace (with setup hooks)
     let (ws_path, _setup_result) = ws_mgr
-        .create_workspace_with_setup(
-            &segment_path,
-            &request.segment,
-            &ws_name,
-            ancillary_num,
-        )
+        .create_workspace_with_setup(&segment_path, &request.segment, &ws_name, ancillary_num)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -854,14 +870,15 @@ async fn assignments_create(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({"error": format!("Failed to create assignment: {}", e)}),
-                ),
+                Json(serde_json::json!({"error": format!("Failed to create assignment: {}", e)})),
             )
         })?;
 
     let composite = compute_composite_status(&assignment, &state).await;
-    Ok(Json(EnrichedAssignment { assignment, composite }))
+    Ok(Json(EnrichedAssignment {
+        assignment,
+        composite,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -881,8 +898,8 @@ async fn assignments_update_status(
     let mut assignments = state.assignments.write().await;
 
     // Verify the assignment exists
-    let exists = assignments.get(&id).is_some()
-        || assignments.get_active_for_ancillary(&id).is_some();
+    let exists =
+        assignments.get(&id).is_some() || assignments.get_active_for_ancillary(&id).is_some();
 
     if !exists {
         return Err(StatusCode::NOT_FOUND);
@@ -1000,9 +1017,7 @@ async fn assignments_complete(
 
     let segment_path = segment_path.ok_or((
         StatusCode::NOT_FOUND,
-        Json(
-            serde_json::json!({"error": format!("Segment not found: {}", assignment.segment)}),
-        ),
+        Json(serde_json::json!({"error": format!("Segment not found: {}", assignment.segment)})),
     ))?;
 
     // Render auto-commit message from hardcoded template
@@ -1022,17 +1037,18 @@ async fn assignments_complete(
         plugin_mgr: &state.rhai_plugins,
     };
 
-    let result =
-        toren_lib::complete_assignment(&assignment, &mut assignments, ws_mgr, &opts).map_err(
-            |e| {
-                let status = if e.downcast_ref::<toren_lib::WorkspaceProcessesRunning>().is_some() {
-                    StatusCode::CONFLICT
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
-                (status, Json(serde_json::json!({"error": e.to_string()})))
-            },
-        )?;
+    let result = toren_lib::complete_assignment(&assignment, &mut assignments, ws_mgr, &opts)
+        .map_err(|e| {
+            let status = if e
+                .downcast_ref::<toren_lib::WorkspaceProcessesRunning>()
+                .is_some()
+            {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({"error": e.to_string()})))
+        })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1088,9 +1104,7 @@ async fn assignments_abort(
 
     let segment_path = segment_path.ok_or((
         StatusCode::NOT_FOUND,
-        Json(
-            serde_json::json!({"error": format!("Segment not found: {}", assignment.segment)}),
-        ),
+        Json(serde_json::json!({"error": format!("Segment not found: {}", assignment.segment)})),
     ))?;
 
     let opts = toren_lib::AbortOptions {
@@ -1101,7 +1115,10 @@ async fn assignments_abort(
     };
 
     toren_lib::abort_assignment(&assignment, &mut assignments, ws_mgr, &opts).map_err(|e| {
-        let status = if e.downcast_ref::<toren_lib::WorkspaceProcessesRunning>().is_some() {
+        let status = if e
+            .downcast_ref::<toren_lib::WorkspaceProcessesRunning>()
+            .is_some()
+        {
             StatusCode::CONFLICT
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -1159,9 +1176,7 @@ async fn assignments_resume(
 
     let segment_path = segment_path.ok_or((
         StatusCode::NOT_FOUND,
-        Json(
-            serde_json::json!({"error": format!("Segment not found: {}", assignment.segment)}),
-        ),
+        Json(serde_json::json!({"error": format!("Segment not found: {}", assignment.segment)})),
     ))?;
 
     let opts = toren_lib::ResumeOptions {
@@ -1171,8 +1186,8 @@ async fn assignments_resume(
         plugin_mgr: &state.rhai_plugins,
     };
 
-    let resume_result =
-        toren_lib::prepare_resume(&assignment, &mut assignments, ws_mgr, &opts).map_err(|e| {
+    let resume_result = toren_lib::prepare_resume(&assignment, &mut assignments, ws_mgr, &opts)
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": e.to_string()})),
@@ -1201,7 +1216,10 @@ async fn assignments_resume(
     let work_started = if request.start_work {
         if state
             .panes
-            .status(&updated_assignment.segment, &updated_assignment.workspace_path)
+            .status(
+                &updated_assignment.segment,
+                &updated_assignment.workspace_path,
+            )
             .await
             == PaneStatus::Working
         {
@@ -1282,14 +1300,14 @@ async fn assignment_action(
     let args = request.args;
     let plugin_name = name.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
-        rhai_plugins.run(&plugin_name, &args, ctx)
-    })
-    .await
-    .map_err(|e| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"error": format!("Task join error: {}", e)})),
-    ))?;
+    let result = tokio::task::spawn_blocking(move || rhai_plugins.run(&plugin_name, &args, ctx))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Task join error: {}", e)})),
+            )
+        })?;
 
     match result {
         Ok(toren_lib::PluginResult::Ok) => Ok(Json(serde_json::json!({

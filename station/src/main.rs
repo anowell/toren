@@ -2,7 +2,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "station", about = "Reverse proxy management for local dev services")]
+#[command(
+    name = "station",
+    about = "Reverse proxy management for local dev services"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

@@ -144,7 +144,11 @@ pub fn select_window(session: &str, window: &str) -> Result<()> {
 /// Window names in the session, in index order.
 pub fn list_windows(session: &str) -> Result<Vec<String>> {
     let out = rmux(["list-windows", "-t", session, "-F", "#{window_name}"])?;
-    Ok(out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+    Ok(out
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
 }
 
 /// One pane in a session, as rmux currently sees it.
@@ -161,7 +165,9 @@ pub struct PaneState {
 impl PaneState {
     /// Whether this pane holds work, as opposed to a shell sitting at its prompt.
     pub fn is_busy(&self) -> bool {
-        const SHELLS: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh", "nu", "csh", "tcsh"];
+        const SHELLS: &[&str] = &[
+            "sh", "bash", "zsh", "fish", "dash", "ksh", "nu", "csh", "tcsh",
+        ];
         !self.dead && !SHELLS.contains(&self.command.as_str())
     }
 }
@@ -184,7 +190,10 @@ pub fn list_panes(session: &str) -> Result<Vec<PaneState>> {
             let window = fields.next()?.trim().to_string();
             let dead = fields.next()?.trim() == "1";
             let command = fields.next().unwrap_or("").trim().to_string();
-            let pid = fields.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0);
+            let pid = fields
+                .next()
+                .and_then(|p| p.trim().parse().ok())
+                .unwrap_or(0);
             Some(PaneState {
                 window,
                 dead,
@@ -197,11 +206,7 @@ pub fn list_panes(session: &str) -> Result<Vec<PaneState>> {
 
 /// Whether the session's agent process is still alive.
 pub fn agent_is_running(session: &str) -> bool {
-    list_panes(session).is_ok_and(|panes| {
-        panes
-            .iter()
-            .any(|p| p.window == AGENT_WINDOW && !p.dead)
-    })
+    list_panes(session).is_ok_and(|panes| panes.iter().any(|p| p.window == AGENT_WINDOW && !p.dead))
 }
 
 /// Panes holding work. Callers about to destroy the session check this first.
@@ -296,7 +301,10 @@ mod tests {
 
     #[test]
     fn window_target_joins_with_colon() {
-        assert_eq!(window_target("toren-two-one", AGENT_WINDOW), "toren-two-one:agent");
+        assert_eq!(
+            window_target("toren-two-one", AGENT_WINDOW),
+            "toren-two-one:agent"
+        );
     }
 
     /// The sequence `breq do` performs before it execs `rmux attach`. Needs rmux installed.
@@ -324,7 +332,9 @@ mod tests {
             "sleep 30".to_string(),
         ];
         spawn_agent(&session, dir.path(), &argv).unwrap();
-        assert!(list_windows(&session).unwrap().contains(&AGENT_WINDOW.to_string()));
+        assert!(list_windows(&session)
+            .unwrap()
+            .contains(&AGENT_WINDOW.to_string()));
 
         // A second assignment replaces the agent window rather than stacking a duplicate.
         spawn_agent(&session, dir.path(), &argv).unwrap();
@@ -366,7 +376,12 @@ mod tests {
         .unwrap();
         assert!(agent_is_running(&session));
         let busy = busy_panes(&session);
-        assert_eq!(busy.len(), 1, "expected only the agent to be busy: {:?}", busy);
+        assert_eq!(
+            busy.len(),
+            1,
+            "expected only the agent to be busy: {:?}",
+            busy
+        );
         assert_eq!(busy[0].window, AGENT_WINDOW);
         assert!(busy[0].pid > 0, "busy pane should report a pid for --kill");
 
@@ -394,7 +409,14 @@ mod tests {
         assert!(!shell_is_dead(&session));
 
         // The user typing `exit`.
-        rmux(["send-keys", "-t", &window_target(&session, SHELL_WINDOW), "exit", "Enter"]).unwrap();
+        rmux([
+            "send-keys",
+            "-t",
+            &window_target(&session, SHELL_WINDOW),
+            "exit",
+            "Enter",
+        ])
+        .unwrap();
         wait_until(|| shell_is_dead(&session));
 
         ensure_shell(&session, dir.path()).unwrap();

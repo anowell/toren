@@ -92,7 +92,10 @@ impl Agent {
             "codex" => AgentKind::Codex,
             "gemini" => AgentKind::Gemini,
             "opencode" => AgentKind::Opencode,
-            _ => bail!("Unknown agent: '{}'. Expected one of: claude, codex, gemini, opencode", name),
+            _ => bail!(
+                "Unknown agent: '{}'. Expected one of: claude, codex, gemini, opencode",
+                name
+            ),
         };
 
         Ok(Agent { kind, model })
@@ -105,9 +108,7 @@ impl Agent {
                 return Ok(Agent { kind, model: None });
             }
         }
-        bail!(
-            "No coding agent found on PATH. Install one of: claude, codex, gemini, opencode"
-        )
+        bail!("No coding agent found on PATH. Install one of: claude, codex, gemini, opencode")
     }
 
     /// The full argv (program first) for an interactive agent run.
@@ -155,12 +156,7 @@ impl Agent {
     }
 
     /// [`Agent::build_argv`] as a `Command`, with the working directory set.
-    pub fn build_command(
-        &self,
-        prompt: &str,
-        cwd: &Path,
-        system_prompt: Option<&str>,
-    ) -> Command {
+    pub fn build_command(&self, prompt: &str, cwd: &Path, system_prompt: Option<&str>) -> Command {
         let argv = self.build_argv(prompt, system_prompt, false);
         let mut cmd = Command::new(&argv[0]);
         cmd.current_dir(cwd);
@@ -237,19 +233,30 @@ mod tests {
     fn build_command_claude_with_system_prompt() {
         let agent = Agent::parse("claude:sonnet-4").unwrap();
         let cmd = agent.build_command("fix the bug", Path::new("/tmp"), Some("You are a coder"));
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
-        assert_eq!(args, vec![
-            "--model", "sonnet-4",
-            "--append-system-prompt", "You are a coder",
-            "fix the bug",
-        ]);
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "sonnet-4",
+                "--append-system-prompt",
+                "You are a coder",
+                "fix the bug",
+            ]
+        );
     }
 
     #[test]
     fn build_command_codex_no_system_prompt() {
         let agent = Agent::parse("codex").unwrap();
         let cmd = agent.build_command("fix the bug", Path::new("/tmp"), None);
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
         assert_eq!(args, vec!["fix the bug"]);
     }
 
@@ -257,11 +264,14 @@ mod tests {
     fn build_command_codex_with_system_prompt_prepends() {
         let agent = Agent::parse("codex:o3").unwrap();
         let cmd = agent.build_command("fix the bug", Path::new("/tmp"), Some("You are a coder"));
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
-        assert_eq!(args, vec![
-            "-m", "o3",
-            "You are a coder\n\n---\n\nfix the bug",
-        ]);
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["-m", "o3", "You are a coder\n\n---\n\nfix the bug",]
+        );
     }
 
     #[test]
@@ -298,7 +308,10 @@ mod tests {
 
     #[test]
     fn auto_approve_flags() {
-        assert_eq!(AgentKind::Claude.auto_approve_flag(), Some("--dangerously-skip-permissions"));
+        assert_eq!(
+            AgentKind::Claude.auto_approve_flag(),
+            Some("--dangerously-skip-permissions")
+        );
         assert_eq!(AgentKind::Codex.auto_approve_flag(), Some("--full-auto"));
         assert_eq!(AgentKind::Gemini.auto_approve_flag(), None);
         assert_eq!(AgentKind::Opencode.auto_approve_flag(), None);

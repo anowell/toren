@@ -52,7 +52,12 @@ pub struct CompletionRecord {
     /// Ancillary that worked on it
     pub ancillary_id: String,
     /// Task identifier (e.g., bead ID)
-    #[serde(alias = "external_id", alias = "bead_id", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "external_id",
+        alias = "bead_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub task_id: Option<String>,
     /// Segment name
     pub segment: String,
@@ -81,7 +86,12 @@ pub struct Assignment {
     /// Ancillary identifier (e.g., "Toren One")
     pub ancillary_id: String,
     /// Task identifier (e.g., bead ID "breq-a1b2") — optional
-    #[serde(alias = "external_id", alias = "bead_id", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "external_id",
+        alias = "bead_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub task_id: Option<String>,
     /// Segment name (e.g., "toren")
     pub segment: String,
@@ -96,7 +106,12 @@ pub struct Assignment {
     /// When the assignment was last updated (RFC 3339)
     pub updated_at: String,
     /// Task title for display purposes
-    #[serde(default, alias = "title", alias = "bead_title", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "title",
+        alias = "bead_title",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub task_title: Option<String>,
     /// Task URL (e.g., link to issue tracker)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -668,7 +683,8 @@ impl AssignmentManager {
     /// List active assignments for a specific segment, sorted by ancillary number.
     pub fn list_active_segment(&mut self, segment: &str) -> Vec<&Assignment> {
         self.reload_if_changed();
-        let mut assignments: Vec<&Assignment> = self.assignments
+        let mut assignments: Vec<&Assignment> = self
+            .assignments
             .values()
             .filter(|a| a.segment.to_lowercase() == segment.to_lowercase())
             .collect();
@@ -726,11 +742,13 @@ impl AssignmentManager {
     pub fn resolve(&mut self, ref_: &AssignmentRef) -> Vec<&Assignment> {
         self.reload_if_changed();
         match ref_ {
-            AssignmentRef::TaskId(task_id) => self.assignments
+            AssignmentRef::TaskId(task_id) => self
+                .assignments
                 .values()
                 .filter(|a| a.task_id.as_deref() == Some(task_id.as_str()))
                 .collect(),
-            AssignmentRef::Ancillary(ancillary_id) => self.assignments
+            AssignmentRef::Ancillary(ancillary_id) => self
+                .assignments
                 .values()
                 .filter(|a| a.ancillary_id.to_lowercase() == ancillary_id.to_lowercase())
                 .collect(),
