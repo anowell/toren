@@ -27,10 +27,6 @@ cli SEGMENT *ARGS:
 health:
     curl -s http://localhost:8788/health | jq .
 
-# List available plugins/commands
-plugins:
-    curl -s http://localhost:8788/api/plugins/commands | jq .
-
 # Run all checks (cargo check, clippy, biome, svelte-check)
 check:
     cargo check

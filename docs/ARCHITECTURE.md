@@ -48,15 +48,6 @@
 
 See [terminals.md](terminals.md) for the session layout and how this coexists with zellij.
 
-### Command Plugin System
-```yaml
-# Example: plugins/git.yaml
-commands:
-  - id: "commit"
-    command: "git commit -m {message}"
-    auto_approve: false
-```
-
 ## Protocols
 
 ### WebSocket (`ws://localhost:8787/ws`)

@@ -5,7 +5,6 @@ use tracing::{info, Level};
 
 mod ancillary;
 mod api;
-mod plugins;
 mod security;
 mod services;
 
@@ -49,14 +48,6 @@ async fn main() -> Result<()> {
             security_ctx.pairing_token()
         );
     }
-
-    // Initialize plugin manager (YAML command sets for daemon UI)
-    let mut plugin_manager = plugins::PluginManager::new();
-    plugin_manager.add_plugin_dir(".toren/commands".into());
-    if let Some(home) = dirs::home_dir() {
-        plugin_manager.add_plugin_dir(home.join(".config/toren/commands"));
-    }
-    plugin_manager.load_all()?;
 
     // Initialize Rhai plugin manager (shared with breq CLI)
     let rhai_plugins = toren_lib::PluginManager::new(&toren_lib::toren_root().join("plugins"))?;
@@ -106,7 +97,6 @@ async fn main() -> Result<()> {
         config,
         services,
         security_ctx,
-        plugin_manager,
         rhai_plugins,
         ancillary_manager,
         assignment_manager,

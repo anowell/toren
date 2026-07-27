@@ -12,7 +12,6 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
 use crate::ancillary::AncillaryManager;
-use crate::plugins::PluginManager;
 use crate::security::SecurityContext;
 use crate::services::pane_runner::{PaneRunner, PaneStatus};
 use crate::services::Services;
@@ -30,7 +29,6 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub services: Services,
     pub security: Arc<SecurityContext>,
-    pub plugins: Arc<PluginManager>,
     pub rhai_plugins: Arc<toren_lib::PluginManager>,
     pub ancillaries: Arc<AncillaryManager>,
     pub assignments: Arc<RwLock<AssignmentManager>>,
@@ -46,7 +44,6 @@ pub async fn serve(
     config: Config,
     services: Services,
     security_ctx: SecurityContext,
-    plugin_manager: PluginManager,
     rhai_plugins: toren_lib::PluginManager,
     ancillary_manager: AncillaryManager,
     assignment_manager: AssignmentManager,
@@ -61,7 +58,6 @@ pub async fn serve(
         config: Arc::new(config),
         services,
         security: Arc::new(security_ctx),
-        plugins: Arc::new(plugin_manager),
         rhai_plugins: Arc::new(rhai_plugins),
         ancillaries: Arc::new(ancillary_manager),
         assignments,
@@ -81,8 +77,6 @@ pub async fn serve(
         .route("/api/fs/list", post(handlers::fs_list))
         .route("/api/vcs/status", post(handlers::vcs_status))
         .route("/api/vcs/diff", post(handlers::vcs_diff))
-        .route("/api/plugins/list", get(handlers::plugins_list))
-        .route("/api/plugins/execute", post(handlers::plugins_execute))
         .route("/api/ancillaries/list", get(ancillaries_list))
         .route("/api/ancillaries/:id/start", post(ancillary_start_work))
         .route("/api/ancillaries/:id/stop", post(ancillary_stop_work))
