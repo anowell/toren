@@ -62,6 +62,16 @@ pub enum RepoType {
     Git,
 }
 
+impl RepoType {
+    /// How the backend is spelled in persisted state.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RepoType::Jj => "jj",
+            RepoType::Git => "git",
+        }
+    }
+}
+
 /// Detect the repository type at a given path
 pub fn detect_repo_type(path: &Path) -> Option<RepoType> {
     if path.join(".jj").exists() {
@@ -249,7 +259,14 @@ impl VcsBackend for JjBackend {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("jj workspace forget failed: {}", stderr);
+            warn!(
+                event = "vcs.error",
+                vcs = "jj",
+                op = "workspace forget",
+                workspace = workspace_name,
+                "jj workspace forget failed: {}",
+                stderr
+            );
             // Don't fail - the workspace might already be forgotten
         }
 
@@ -716,10 +733,24 @@ impl VcsBackend for GitWorktreeBackend {
             match output {
                 Ok(o) if !o.status.success() => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
-                    warn!("git worktree remove failed: {}", stderr);
+                    warn!(
+                        event = "vcs.error",
+                        vcs = "git",
+                        op = "worktree remove",
+                        workspace = workspace_name,
+                        "git worktree remove failed: {}",
+                        stderr
+                    );
                     // Directory will be cleaned up by delete_workspace fallback
                 }
-                Err(e) => warn!("Failed to run git worktree remove: {}", e),
+                Err(e) => warn!(
+                    event = "vcs.error",
+                    vcs = "git",
+                    op = "worktree remove",
+                    workspace = workspace_name,
+                    "Failed to run git worktree remove: {}",
+                    e
+                ),
                 _ => {}
             }
         } else {
@@ -749,9 +780,24 @@ impl VcsBackend for GitWorktreeBackend {
             match output {
                 Ok(o) if !o.status.success() => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
-                    warn!("git branch -D '{}' failed: {}", workspace_name, stderr);
+                    warn!(
+                        event = "vcs.error",
+                        vcs = "git",
+                        op = "branch -D",
+                        workspace = workspace_name,
+                        "git branch -D '{}' failed: {}",
+                        workspace_name,
+                        stderr
+                    );
                 }
-                Err(e) => warn!("Failed to run git branch -D: {}", e),
+                Err(e) => warn!(
+                    event = "vcs.error",
+                    vcs = "git",
+                    op = "branch -D",
+                    workspace = workspace_name,
+                    "Failed to run git branch -D: {}",
+                    e
+                ),
                 _ => {}
             }
         } else {

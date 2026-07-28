@@ -8,7 +8,6 @@
 
 use anyhow::{Context, Result};
 use std::fmt;
-use std::path::Path;
 
 use crate::plugins::PluginManager;
 
@@ -37,16 +36,16 @@ impl AgentSpec {
     /// Resolve which agent to use.
     ///
     /// Priority: explicit request > the workspace's own last agent > config > first installed
-    /// agent whose binary is on PATH. The workspace annotation sits high on purpose — coming
+    /// agent whose binary is on PATH. The workspace's own choice sits high on purpose — coming
     /// back to a workspace should reach the agent that has the session history there.
     ///
     /// An explicit request for an unknown agent is an error the user should see. A *stored*
-    /// choice that no longer resolves (a stale annotation, a removed plugin) is not — it falls
-    /// through to the next source rather than wedging the workspace.
+    /// choice that no longer resolves (a removed plugin) is not — it falls through to the next
+    /// source rather than wedging the workspace.
     pub fn resolve(
         plugins: &PluginManager,
         requested: Option<&str>,
-        workspace_agent: Option<&str>,
+        workspace_agent: Option<&Self>,
         configured: Option<&str>,
     ) -> Result<Self> {
         if let Some(requested) = requested {
@@ -63,8 +62,11 @@ impl AgentSpec {
             return Ok(spec);
         }
 
-        for stored in [workspace_agent, configured].into_iter().flatten() {
-            let spec = Self::parse(stored);
+        let stored = workspace_agent
+            .cloned()
+            .into_iter()
+            .chain(configured.map(Self::parse));
+        for spec in stored {
             if plugins.has_agent(&spec.name) {
                 return Ok(spec);
             }
@@ -111,19 +113,16 @@ impl AgentSpec {
         plugins.agent_argv(&self.name, self.ctx_map(prompt, auto_approve, None))
     }
 
-    /// Full argv for resuming the workspace's previous session, when the agent can find one.
-    pub fn resume_argv(
+    /// Full argv for resuming one *named* session — the one the caller picked, via
+    /// [`crate::sessions::resume_target`].
+    pub fn resume_argv_for(
         &self,
         plugins: &PluginManager,
-        ws_path: &Path,
+        session_id: Option<&str>,
         prompt: Option<&str>,
         auto_approve: bool,
     ) -> Result<Vec<String>> {
-        let session_id = plugins.agent_session_id(&self.name, ws_path);
-        plugins.agent_resume_argv(
-            &self.name,
-            self.ctx_map(prompt, auto_approve, session_id.as_deref()),
-        )
+        plugins.agent_resume_argv(&self.name, self.ctx_map(prompt, auto_approve, session_id))
     }
 
     fn ctx_map(
@@ -158,8 +157,8 @@ impl AgentSpec {
         map
     }
 
-    /// How this agent is written back into the workspace's annotations.
-    pub fn annotation(&self) -> String {
+    /// The packed `name[:model]` form `-a` accepts and config stores.
+    pub fn packed(&self) -> String {
         match &self.model {
             Some(model) => format!("{}:{}", self.name, model),
             None => self.name.clone(),
@@ -180,6 +179,7 @@ impl fmt::Display for AgentSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn plugins() -> PluginManager {
         PluginManager::new(Path::new("/nonexistent")).unwrap()
@@ -206,14 +206,16 @@ mod tests {
     #[test]
     fn resolution_prefers_the_explicit_request() {
         let plugins = plugins();
-        let spec = AgentSpec::resolve(&plugins, Some("codex"), Some("claude"), Some("pi")).unwrap();
+        let stored = AgentSpec::parse("claude");
+        let spec = AgentSpec::resolve(&plugins, Some("codex"), Some(&stored), Some("pi")).unwrap();
         assert_eq!(spec.name, "codex");
     }
 
     #[test]
     fn resolution_falls_back_to_the_workspace_agent() {
         let plugins = plugins();
-        let spec = AgentSpec::resolve(&plugins, None, Some("claude:opus"), Some("pi")).unwrap();
+        let stored = AgentSpec::parse("claude:opus");
+        let spec = AgentSpec::resolve(&plugins, None, Some(&stored), Some("pi")).unwrap();
         assert_eq!(spec.name, "claude");
         assert_eq!(spec.model.as_deref(), Some("opus"));
     }
@@ -236,6 +238,6 @@ mod tests {
             vec!["claude", "--model", "opus", "go"]
         );
         assert_eq!(spec.binary(&plugins).unwrap(), "claude");
-        assert_eq!(spec.annotation(), "claude:opus");
+        assert_eq!(spec.packed(), "claude:opus");
     }
 }

@@ -453,7 +453,16 @@ impl PluginManager {
                 PluginContext::default(),
             )
             .map_err(|e| {
-                warn!("agent '{}' {} failed: {:#}", name, func, e);
+                warn!(
+                    event = "plugin.failed",
+                    family = "agents",
+                    plugin = name,
+                    call = func,
+                    "agent '{}' {} failed: {:#}",
+                    name,
+                    func,
+                    e
+                );
                 e
             })
             .ok()?;

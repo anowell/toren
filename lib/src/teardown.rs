@@ -8,8 +8,8 @@
 use anyhow::Result;
 use tracing::{info, warn};
 
-use crate::history::{record_teardown, TeardownRecord};
 use crate::place::Place;
+use crate::plugins::PluginManager;
 use crate::process;
 use crate::rmux;
 use crate::workspace::{CleanupMode, WorkspaceManager};
@@ -44,9 +44,14 @@ pub struct TeardownOutcome {
 pub fn teardown(
     place: &Place,
     ws_mgr: &WorkspaceManager,
+    plugins: &PluginManager,
     opts: TeardownOptions,
 ) -> Result<TeardownOutcome> {
     guard_session(place, opts.kill)?;
+
+    // Asked while the working copy is still there, because that path is how an agent finds its
+    // own session. Afterwards nothing can answer the question.
+    let (agent, session_id) = agent_provenance(place, plugins);
 
     // The session always holds an idle shell sitting in the workspace, which would otherwise
     // trip the process check forever — so it has to come down, but only after the guard above
@@ -83,17 +88,21 @@ pub fn teardown(
         place.undecorate()?;
     }
 
-    let record = TeardownRecord {
-        uid: place.uid(),
-        workspace: place.name.clone(),
-        segment: place.segment.clone(),
-        tasks: place.tasks(),
-        revision: revision.clone(),
-        torn_down_at: chrono::Utc::now().to_rfc3339(),
-    };
-    if let Err(e) = record_teardown(&record) {
-        warn!("Failed to record teardown history: {:#}", e);
-    }
+    // The last thing said about this incarnation. The agent's own session file is the record of
+    // what was done here; this is the line that ties the two together once the workspace is gone.
+    info!(
+        event = "workspace.teardown",
+        segment = %place.segment,
+        workspace = %place.name,
+        uid = place.uid(),
+        tasks = ?place.tasks(),
+        revision = revision.as_deref(),
+        agent = agent.as_deref(),
+        session_id = session_id.as_deref(),
+        deleted = !opts.no_delete,
+        "Tore down '{}'",
+        place.name
+    );
 
     Ok(TeardownOutcome {
         workspace: place.name.clone(),
@@ -102,6 +111,25 @@ pub fn teardown(
         revision,
         deleted: !opts.no_delete,
     })
+}
+
+/// The agent that worked here and the id of the session it kept its own record under.
+///
+/// Nothing else links an incarnation to the agent's transcript of it, and both sides of that link
+/// are gone the moment the workspace is: the workspace's state with `<ws>/.toren/`, and the
+/// agent's answer with the path it keys its sessions by.
+fn agent_provenance(place: &Place, plugins: &PluginManager) -> (Option<String>, Option<String>) {
+    let Some(agent) = place.agent() else {
+        return (None, None);
+    };
+    // The workspace's own record is the cheaper and more specific answer; the agent is asked
+    // only for a workspace that predates the list, or whose last session never got an id.
+    let session_id = place
+        .state
+        .latest_session()
+        .and_then(|s| s.id.clone())
+        .or_else(|| plugins.agent_session_id(&agent.name, &place.path));
+    (Some(agent.name), session_id)
 }
 
 /// Refuse to proceed if the place's session holds live work.
@@ -139,4 +167,44 @@ fn kill_sessions(place: &Place) {
         warn!("Failed to kill rmux session: {:#}", e);
     }
     rmux::reconcile(&place.segment, &place.name, place.uid().as_deref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::AgentSpec;
+    use crate::segments::Segment;
+    use std::path::Path;
+
+    fn place_with(agent: Option<&str>) -> Place {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment {
+            name: "toren".into(),
+            path: dir.path().to_path_buf(),
+        };
+        let mut place = Place::load(&segment, "one", dir.path().join("one"), true);
+        if let Some(agent) = agent {
+            let spec = AgentSpec::parse(agent);
+            place.state.set_agent(&spec.name, spec.model.as_deref());
+        }
+        place
+    }
+
+    /// No plugins installed, so the session id is unanswerable — the agent name still is.
+    fn plugins() -> PluginManager {
+        PluginManager::new(Path::new("/nonexistent")).unwrap()
+    }
+
+    #[test]
+    fn provenance_drops_the_model_from_the_recorded_agent() {
+        let (agent, _) = agent_provenance(&place_with(Some("claude:opus")), &plugins());
+        assert_eq!(agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn a_place_that_never_ran_an_agent_has_no_provenance() {
+        let (agent, session_id) = agent_provenance(&place_with(None), &plugins());
+        assert!(agent.is_none());
+        assert!(session_id.is_none());
+    }
 }

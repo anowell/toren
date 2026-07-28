@@ -116,7 +116,7 @@ function getSegmentIcon(source: string) {
 					Create New Project
 				</button>
 			{:else}
-				<p class="help-text">Configure segment globs in toren.toml</p>
+				<p class="help-text">Configure segment globs in ~/.toren/config.kdl</p>
 			{/if}
 		</div>
 	{:else}

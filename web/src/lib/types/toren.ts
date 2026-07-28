@@ -59,6 +59,8 @@ export interface TaskView {
 	status?: string | null;
 	assignee?: string | null;
 	url?: string | null;
+	/** How stale this read is, e.g. "3h". Absent when it was just made. */
+	age?: string | null;
 	error?: string | null;
 }
 
@@ -72,6 +74,48 @@ export interface Sets {
 	tasks: TaskView[];
 }
 
+/** One task linked to a workspace. */
+export interface TaskLink {
+	source: string;
+	id: string;
+	added_at?: string;
+	primary: boolean;
+}
+
+/** One agent session that ran in a workspace. */
+export interface AgentSession {
+	/** Absent while the session is still opening — the agent has not named it yet. */
+	id?: string;
+	agent: string;
+	started_at?: string;
+	ended_at?: string;
+	exit?: number;
+	title?: string;
+	task?: string;
+}
+
+/** The agent that works a workspace, and the sessions it kept there. */
+export interface AgentState {
+	name: string;
+	model?: string;
+	sessions: AgentSession[];
+}
+
+/** Durable per-workspace state (`<ws>/.toren/state.json`). Absent fields are omitted. */
+export interface WorkspaceState {
+	version: number;
+	uid?: string;
+	created_at?: string;
+	title?: string;
+	prompt?: string;
+	base?: { vcs: string; revision: string };
+	parent?: string;
+	tasks?: TaskLink[];
+	agent?: AgentState;
+	delivery?: { resolver: string };
+	extra?: Record<string, unknown>;
+}
+
 /** A workspace/place as emitted by the daemon (mirrors `breq get <ws> --json`). */
 export interface WorkspaceView {
 	name: string;
@@ -83,7 +127,7 @@ export interface WorkspaceView {
 	parent?: string | null;
 	decorated: boolean;
 	vcs_tracked: boolean;
-	annotations: Record<string, unknown>;
+	state: WorkspaceState;
 	sets: Sets;
 }
 
@@ -102,6 +146,8 @@ export interface StartWorkspaceRequest {
 	prompt?: string;
 	model?: string;
 	resume?: boolean;
+	/** Resume one recorded session by id. Implies `resume`. */
+	session?: string;
 }
 
 export interface StartWorkspaceResponse {
@@ -109,6 +155,8 @@ export interface StartWorkspaceResponse {
 	session: string;
 	/** The window that was started (e.g. "agent"). */
 	window?: string;
+	/** The agent session this run continues, when it continues one. */
+	agent_session?: string | null;
 }
 
 export interface StopWorkspaceResponse {

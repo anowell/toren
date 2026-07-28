@@ -5,7 +5,7 @@
 - **[CONCEPTS.md](CONCEPTS.md)** - Toren naming and metaphor (Ancillary Justice inspired)
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - System design and protocols
 - **[SEGMENTS.md](SEGMENTS.md)** - Segment configuration
-- **[terminals.md](terminals.md)** - rmux sessions, zellij interop, and transcripts
+- **[terminals.md](terminals.md)** - rmux sessions and zellij interop
 - **[JUSTFILE_GUIDE.md](JUSTFILE_GUIDE.md)** - Command reference
 - **[CALCULATOR_KATA_RESULTS.md](CALCULATOR_KATA_RESULTS.md)** - End-to-end test proof
 

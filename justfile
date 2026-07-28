@@ -21,7 +21,7 @@ web:
 
 # Run the breq CLI in an example segment directory (dev mode)
 cli SEGMENT *ARGS:
-    cd examples/{{SEGMENT}} && cargo run --manifest-path {{justfile_directory()}}/Cargo.toml --bin breq -- --config {{justfile_directory()}}/toren-test.toml {{ARGS}}
+    cd examples/{{SEGMENT}} && cargo run --manifest-path {{justfile_directory()}}/Cargo.toml --bin breq -- --config {{justfile_directory()}}/toren-test.kdl {{ARGS}}
 
 # Check daemon health
 health:

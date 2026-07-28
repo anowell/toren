@@ -44,7 +44,7 @@ pub fn execute_alias(expanded: &str, env_vars: &HashMap<String, String>) -> Resu
 /// Default aliases (empty).
 ///
 /// Aliases are the last resort in verb dispatch, below `breq-<name>` PATH scripts. User-defined
-/// `[aliases]` in config.toml still work for one-line shell expansions.
+/// `aliases` in config.kdl still work for one-line shell expansions.
 pub fn default_aliases() -> HashMap<String, String> {
     HashMap::new()
 }

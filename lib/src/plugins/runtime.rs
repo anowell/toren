@@ -795,7 +795,11 @@ fn build_toren_module() -> rhai::Shared<Module> {
 
 fn config_impl(key: &str) -> Result<String, Box<rhai::EvalAltResult>> {
     let config = crate::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
+    config_value(&config, key)
+}
 
+/// One dotted key out of a loaded config, as a string.
+fn config_value(config: &crate::Config, key: &str) -> Result<String, Box<rhai::EvalAltResult>> {
     // Virtual key for backwards compat: tasks.default_source -> first element of sources
     if key == "tasks.default_source" {
         return Ok(config
@@ -806,7 +810,7 @@ fn config_impl(key: &str) -> Result<String, Box<rhai::EvalAltResult>> {
     }
 
     let json_value =
-        serde_json::to_value(&config).map_err(|e| format!("Failed to serialize config: {}", e))?;
+        serde_json::to_value(config).map_err(|e| format!("Failed to serialize config: {}", e))?;
 
     // Traverse dot-path segments
     let mut current = &json_value;
@@ -939,11 +943,11 @@ mod tests {
 
     #[test]
     fn test_config_via_engine() {
+        // Compiled, not evaluated: the flat alias reads the user's own config, and
+        // `test_toren_config_module` covers the lookup itself.
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        // tasks.default_source returns empty string when no sources configured
-        let ast = engine.compile(r#"config("tasks.default_source")"#).unwrap();
-        let _result: String = engine.eval_ast(&ast).unwrap();
+        engine.compile(r#"config("tasks.default_source")"#).unwrap();
     }
 
     #[test]
@@ -1250,15 +1254,25 @@ mod tests {
         assert_eq!(result[1].clone().cast::<i64>(), 42);
     }
 
+    /// Evaluating this would load the user's own config, so the module is only compiled here
+    /// and the lookup itself is exercised against a config the test owns.
     #[test]
     fn test_toren_config_module() {
         let ctx = Arc::new(PluginContext::default());
         let engine = create_engine(ctx);
-        // tasks.default_source returns empty string when no sources configured
-        let ast = engine
+        engine
             .compile(r#"toren::config("tasks.default_source")"#)
             .unwrap();
-        let _result: String = engine.eval_ast(&ast).unwrap();
+
+        let mut config = crate::Config::default();
+        config.tasks.sources = vec!["runes".into()];
+        assert_eq!(
+            config_value(&config, "tasks.default_source").unwrap(),
+            "runes"
+        );
+        assert_eq!(config_value(&config, "proxy.domain").unwrap(), "lvh.me");
+        assert_eq!(config_value(&config, "server.port").unwrap(), "8787");
+        assert!(config_value(&config, "nope.nothing").is_err());
     }
 
     #[test]

@@ -1,20 +1,21 @@
-//! Workspaces as *places*: a directory, its VCS state, and its annotations.
+//! Workspaces as *places*: a directory, its VCS state, and the state breq keeps beside it.
 //!
 //! Breq keeps no database of workspaces. The VCS is the registry: segments come from
 //! config, each segment's working copies come from `jj workspace list` / `git worktree
 //! list`, and anything sitting in the workspace root is listed too — so a manually deleted
 //! workspace shows up as prunable and a hand-made working copy shows up as adoptable.
 //!
-//! Workspaces are duck-typed. A *decorated* one carries `<ws>/.toren/annotations.json`;
+//! Workspaces are duck-typed. A *decorated* one carries `<ws>/.toren/state.json`;
 //! an undecorated one is still a place breq can list, enter, and adopt.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::annotations::{self, Annotations, Cache};
+use crate::agents::AgentSpec;
 use crate::config::Config;
 use crate::segments::{Segment, SegmentManager};
-use crate::workspace::WorkspaceManager;
+use crate::state::{self, Cache, WorkspaceState};
+use crate::workspace::{detect_repo_type, RepoType, WorkspaceManager};
 
 /// One workspace, as breq sees it.
 #[derive(Debug, Clone)]
@@ -29,19 +30,37 @@ pub struct Place {
     pub path: PathBuf,
     /// Whether the VCS still tracks this working copy.
     pub vcs_tracked: bool,
-    pub annotations: Annotations,
+    /// The segment's backend, so a recorded revision says which one can resolve it.
+    pub vcs: Option<RepoType>,
+    pub state: WorkspaceState,
+    /// Why `<ws>/.toren/state.json` would not load, when it would not.
+    ///
+    /// The state alongside it reads as empty then, which is exactly what an undecorated
+    /// working copy looks like — so this is what keeps a file written by a newer breq, or a
+    /// corrupt one, from being overwritten by the next save or swept up by `breq cleanup`.
+    pub state_error: Option<String>,
 }
 
 impl Place {
     /// Load a place from disk. Cheap: two small file reads at most.
     pub fn load(segment: &Segment, name: &str, path: PathBuf, vcs_tracked: bool) -> Self {
+        let vcs = detect_repo_type(&segment.path);
+        let (state, state_error) = match WorkspaceState::load(&path, vcs.map(|v| v.as_str())) {
+            Ok(state) => (state, None),
+            Err(e) => {
+                tracing::warn!("{:#}", e);
+                (WorkspaceState::default(), Some(format!("{:#}", e)))
+            }
+        };
         Self {
             name: name.to_string(),
             segment: segment.name.clone(),
             segment_path: segment.path.clone(),
-            annotations: Annotations::load_lossy(&path),
+            state,
+            state_error,
             path,
             vcs_tracked,
+            vcs,
         }
     }
 
@@ -50,13 +69,16 @@ impl Place {
     }
 
     /// Whether breq state lives here, as opposed to a working copy it merely found.
+    ///
+    /// State breq could not read still counts as state: reading it as undecorated would have
+    /// `breq cleanup` delete the workspace as an orphan.
     pub fn is_decorated(&self) -> bool {
-        !self.annotations.is_empty()
+        !self.state.is_empty() || self.state_error.is_some()
     }
 
     /// This incarnation's id. Undecorated places have none.
     pub fn uid(&self) -> Option<String> {
-        self.annotations.get_str("uid")
+        self.state.uid.clone()
     }
 
     /// The rmux session this incarnation owns. Sessions matching the workspace but not the
@@ -67,26 +89,39 @@ impl Place {
 
     /// The commit the workspace was forked from, if setup recorded one.
     pub fn base(&self) -> Option<String> {
-        self.annotations.get_str("base")
+        self.state.base.as_ref().map(|b| b.revision.clone())
     }
 
     /// Stack parent workspace name, for `setup --from` children.
     pub fn parent(&self) -> Option<String> {
-        self.annotations.get_str("parent")
+        self.state.parent.clone()
     }
 
     /// Task links, as `source:id` strings.
     pub fn tasks(&self) -> Vec<String> {
-        self.annotations.get_list("task")
+        self.state.task_links()
+    }
+
+    /// How this place's backend is spelled in `state.json`.
+    pub fn vcs_label(&self) -> Option<&'static str> {
+        self.vcs.map(|v| v.as_str())
+    }
+
+    /// The agent that works here, as `-a` would have spelled it.
+    pub fn agent(&self) -> Option<AgentSpec> {
+        self.state.agent.as_ref().map(|agent| AgentSpec {
+            name: agent.name.clone(),
+            model: agent.model.clone(),
+        })
     }
 
     pub fn cache(&self) -> Cache {
         Cache::load(&self.path)
     }
 
-    /// Age of the workspace, from the `created_at` annotation.
+    /// Age of the workspace, from its recorded creation time.
     pub fn age(&self) -> Option<chrono::Duration> {
-        let created = self.annotations.get_str("created_at")?;
+        let created = self.state.created_at.clone()?;
         let then = chrono::DateTime::parse_from_rfc3339(&created).ok()?;
         Some(chrono::Utc::now().signed_duration_since(then.with_timezone(&chrono::Utc)))
     }
@@ -119,31 +154,43 @@ impl Place {
         env
     }
 
-    /// Mint annotations for a freshly created workspace.
+    /// Mint state for a freshly created workspace.
     pub fn initialize(&mut self, base: Option<String>, parent: Option<&str>) -> Result<String> {
-        let uid = annotations::mint_uid();
-        self.annotations.set_str("uid", uid.clone());
-        self.annotations.set_str("name", self.name.clone());
-        self.annotations.set_str("segment", self.segment.clone());
-        self.annotations
-            .set_default("created_at", chrono::Utc::now().to_rfc3339());
+        let uid = state::mint_uid();
+        self.state.uid = Some(uid.clone());
+        self.state
+            .created_at
+            .get_or_insert_with(|| chrono::Utc::now().to_rfc3339());
         if let Some(base) = base {
-            self.annotations.set_str("base", base);
+            self.state.set_base(self.vcs_label(), base);
         }
         if let Some(parent) = parent {
-            self.annotations.set_str("parent", parent);
+            self.state.parent = Some(parent.to_string());
         }
         self.save()?;
         Ok(uid)
     }
 
+    /// Persist this place's state, unless breq could not read what is already there.
+    ///
+    /// Writing over a file breq does not understand would drop everything it holds — `uid`
+    /// first among them, which orphans the live rmux session named after it.
     pub fn save(&self) -> Result<()> {
-        self.annotations.save(&self.path)
+        if let Some(e) = &self.state_error {
+            anyhow::bail!(
+                "Refusing to overwrite state breq could not read in workspace '{}': {}\n  \
+                 Fix or remove {} first.",
+                self.name,
+                e,
+                WorkspaceState::path(&self.path).display()
+            );
+        }
+        self.state.save(&self.path)
     }
 
     /// Drop `<ws>/.toren/` — the inverse of adoption.
     pub fn undecorate(&self) -> Result<()> {
-        let dir = annotations::toren_dir(&self.path);
+        let dir = state::toren_dir(&self.path);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)
                 .with_context(|| format!("Failed to remove {}", dir.display()))?;
@@ -181,10 +228,11 @@ impl PlaceRegistry {
         let cwd = std::env::current_dir()?;
         self.segments.resolve_from_path(&cwd).with_context(|| {
             "Current directory is not under any configured segment.\n\
-             Configure segments in ~/.toren/config.toml:\n\
-             [ancillaries]\n\
-             segments = [\"~/proj/*\"]"
-                .to_string()
+             Configure segments in ~/.toren/config.kdl:\n\
+             ancillaries {\n\
+                 segments \"~/proj/*\"\n\
+             }"
+            .to_string()
         })
     }
 
@@ -303,7 +351,7 @@ impl PlaceRegistry {
         self.resolve_from_path(&cwd)
     }
 
-    /// Materialize a new place: VCS workspace, setup (or fork) hooks, annotations.
+    /// Materialize a new place: VCS workspace, setup (or fork) hooks, state.
     ///
     /// `from` stacks the new workspace on another one that is still in flight — the child's
     /// base is the parent's working copy, so its change set covers only its own work.
@@ -350,10 +398,20 @@ impl PlaceRegistry {
         let base = self.workspaces.base_revision(&segment.path, &path);
         let mut place = Place::load(segment, &name, path, true);
         place.initialize(base, from.map(|p| p.name.as_str()))?;
+        tracing::info!(
+            event = "workspace.create",
+            segment = %segment.name,
+            workspace = %place.name,
+            uid = place.uid(),
+            path = %place.path.display(),
+            from = from.map(|p| p.name.as_str()),
+            "Created '{}'",
+            place.name
+        );
         Ok(place)
     }
 
-    /// Adopt an existing working copy: mint annotations and run setup hooks in place.
+    /// Adopt an existing working copy: mint state and run setup hooks in place.
     ///
     /// The inverse of `teardown --no-delete`, and the reason workspaces are duck-typed —
     /// anything that is a working copy can become a place breq manages.
@@ -373,6 +431,15 @@ impl PlaceRegistry {
             .workspaces
             .base_revision(&place.segment_path, &place.path);
         place.initialize(base, None)?;
+        tracing::info!(
+            event = "workspace.adopt",
+            segment = %place.segment,
+            workspace = %place.name,
+            uid = place.uid(),
+            path = %place.path.display(),
+            "Adopted '{}'",
+            place.name
+        );
         Ok(())
     }
 
@@ -429,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn annotations_come_from_the_workspace() {
+    fn state_comes_from_the_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let ws_root = dir.path().join("workspaces");
         let ws = ws_root.join("demo/two");
@@ -446,6 +513,48 @@ mod tests {
         assert_eq!(reloaded.base().as_deref(), Some("abc123"));
         assert!(reloaded.is_decorated());
         assert!(reloaded.session_name().ends_with(&uid));
+    }
+
+    /// A workspace whose state breq cannot read, written by hand.
+    fn undecodable_state(root: &Path, content: &str) -> (PlaceRegistry, Segment, PathBuf) {
+        let ws_root = root.join("workspaces");
+        let ws = ws_root.join("demo/one");
+        std::fs::create_dir_all(state::toren_dir(&ws)).unwrap();
+        let file = WorkspaceState::path(&ws);
+        std::fs::write(&file, content).unwrap();
+
+        let registry = registry_with_root(&ws_root);
+        let segment = segment_at(&root.join("demo"), "demo");
+        (registry, segment, file)
+    }
+
+    #[test]
+    fn state_from_a_newer_breq_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = r#"{"version": 99, "uid": "k3m9xz"}"#;
+        let (registry, segment, file) = undecodable_state(dir.path(), content);
+
+        let mut place = registry.get(&segment, "one");
+        assert!(place.state_error.is_some());
+        // Still breq's workspace, so `cleanup` must not take it for an orphan.
+        assert!(place.is_decorated());
+
+        place.state.title = Some("clobber".to_string());
+        assert!(place.save().is_err());
+        assert!(place.initialize(None, None).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+    }
+
+    #[test]
+    fn corrupt_state_is_never_overwritten_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "{ \"uid\": \"k3m9";
+        let (registry, segment, file) = undecodable_state(dir.path(), content);
+
+        let place = registry.get(&segment, "one");
+        assert!(place.is_decorated());
+        assert!(place.save().is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
     }
 
     #[test]
@@ -505,7 +614,7 @@ mod tests {
         place.initialize(None, None).unwrap();
 
         place.undecorate().unwrap();
-        assert!(!annotations::is_decorated(&ws));
+        assert!(!state::is_decorated(&ws));
         assert!(ws.join("keep.txt").exists());
     }
 }

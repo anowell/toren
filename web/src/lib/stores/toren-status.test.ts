@@ -18,7 +18,7 @@ function makeWorkspace(sessions: SessionInfo[] = []): WorkspaceView {
 		parent: null,
 		decorated: true,
 		vcs_tracked: true,
-		annotations: {},
+		state: { version: 1 },
 		sets: {
 			sessions,
 			changes: [],

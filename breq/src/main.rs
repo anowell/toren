@@ -21,7 +21,11 @@ use toren_lib::{
     AgentSpec, CollectOptions, Config, Family, Place, PlaceRegistry, PluginContext, PluginManager,
     Segment, Sets,
 };
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 
 mod render;
 
@@ -62,7 +66,7 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
-    /// Path to config file (default: auto-discovered ~/.toren/config.toml)
+    /// Path to config file (default: auto-discovered ~/.toren/config.kdl)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
@@ -95,9 +99,12 @@ enum Commands {
         #[arg(long)]
         agent: Option<String>,
 
-        /// Resume the workspace's previous agent session instead of starting a new one
-        #[arg(long)]
-        resume: bool,
+        /// Resume the workspace's most recent agent session, or `--resume=<id>` for a specific
+        /// one (`breq get <ws> agent.sessions` lists them)
+        ///
+        /// The id only attaches with `=`, so `breq do --resume <task>` still reads as a task.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "")]
+        resume: Option<String>,
 
         /// Segment to use (defaults to the current directory's segment)
         #[arg(short, long)]
@@ -213,7 +220,7 @@ enum Commands {
         segment: Option<String>,
     },
 
-    /// Write a workspace annotation, or a task field (pass-through to its source)
+    /// Write a workspace state field, or a task field (pass-through to its source)
     ///
     /// List-valued keys take +/- prefixes: `breq set one +task runes:tor-456`.
     Set {
@@ -233,7 +240,7 @@ enum Commands {
         segment: Option<String>,
     },
 
-    /// Remove leftovers: orphaned workspace dirs, aged-out transcripts
+    /// Remove leftovers: orphaned workspace dirs
     Cleanup {
         /// Segment to clean up
         #[arg(short, long)]
@@ -242,10 +249,6 @@ enum Commands {
         /// Clean up all segments
         #[arg(short, long, conflicts_with = "segment")]
         all: bool,
-
-        /// Delete transcripts older than this many days
-        #[arg(long)]
-        transcripts: Option<u64>,
     },
 
     /// Initialize toren.kdl in the current repository
@@ -310,10 +313,14 @@ fn main() -> Result<()> {
         1 => tracing::Level::DEBUG,
         _ => tracing::Level::TRACE,
     };
-    tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .with_target(false)
-        .with_timer(ShortTime)
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_timer(ShortTime)
+                .with_filter(LevelFilter::from_level(log_level)),
+        )
+        .with(toren_lib::logging::file_layer("breq"))
         .init();
 
     let config = Config::load_from(cli.config.as_deref())?;
@@ -381,11 +388,7 @@ fn main() -> Result<()> {
             task,
             segment,
         } => cmd_set(&config, args, task, segment.as_deref()),
-        Commands::Cleanup {
-            segment,
-            all,
-            transcripts,
-        } => cmd_cleanup(&config, all, segment.as_deref(), transcripts),
+        Commands::Cleanup { segment, all } => cmd_cleanup(&config, all, segment.as_deref()),
         Commands::Init { stealth } => cmd_init(stealth),
         Commands::Doctor { fix } => cmd_doctor(&config, fix),
         Commands::Plugin { cmd } => cmd_plugin(cmd),
@@ -495,7 +498,8 @@ struct DoArgs {
     prompt: Option<String>,
     model: Option<String>,
     agent: Option<String>,
-    resume: bool,
+    /// `None` — a fresh run; `Some("")` — the most recent session; `Some(id)` — that one.
+    resume: Option<String>,
     segment: Option<String>,
     no_rmux: bool,
     force: bool,
@@ -515,7 +519,7 @@ fn cmd_do(config: &Config, args: DoArgs) -> Result<()> {
         (None, Some(_)) => None,
     };
 
-    if args.task.is_none() && user_prompt.is_none() && !args.resume {
+    if args.task.is_none() && user_prompt.is_none() && args.resume.is_none() {
         anyhow::bail!(
             "`breq do` needs a task or a prompt.\n  \
              breq do <task-id>              work a task\n  \
@@ -542,6 +546,14 @@ fn cmd_do(config: &Config, args: DoArgs) -> Result<()> {
 
     // What: task context, if a task was named. Claiming it here is the only tracker side
     // effect in any place verb.
+    // The prompt is kept apart from the title: the title is mutable and derived, the prompt is
+    // what was actually asked for and is the fallback the chain lands on.
+    if let Some(ref p) = user_prompt {
+        if place.state.prompt.is_none() {
+            place.state.prompt = Some(p.clone());
+        }
+    }
+
     let mut prompt = user_prompt.clone();
     if let Some(ref task_ref) = args.task {
         let task = resolve_task(&plugins, config, &place, task_ref)?;
@@ -552,34 +564,63 @@ fn cmd_do(config: &Config, args: DoArgs) -> Result<()> {
             eprintln!("warning: could not claim {}: {:#}", link, e);
         }
 
-        place.annotations.add_to_list("task", &link);
+        // Resolving the task was a live tracker call; the cache gets it for free.
+        toren_lib::sets::cache_task(&place, &task);
+        place.state.add_task(&task.source, &task.id);
+        // A tracker with no title to give falls through to the prompt rather than erasing the
+        // title the workspace already carries.
+        let title = Some(task.title.trim())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .or_else(|| user_prompt.as_deref().map(|p| first_chars(p, TITLE_CHARS)));
+        if let Some(title) = title {
+            place.state.title = Some(title);
+        }
         prompt = Some(compose_prompt(&task, user_prompt.as_deref()));
         eprintln!("Task: {} — {}", link, task.title);
     } else if let Some(ref p) = user_prompt {
         // A task-less workspace needs *something* to be legible in `breq list`.
-        place.annotations.set_default("title", first_chars(p, 100));
+        place.state.title = Some(first_chars(p, TITLE_CHARS));
     }
 
+    let stored = place.agent();
     let agent = AgentSpec::resolve(
         &plugins,
         args.agent.as_deref(),
-        place.annotations.get_str("agent").as_deref(),
+        stored.as_ref(),
         config.ancillaries.agent.as_deref(),
     )?;
     let agent = AgentSpec {
         name: agent.name,
         model: args.model.clone().or(agent.model),
     };
-    place.annotations.set_str("agent", agent.annotation());
+    place.state.set_agent(&agent.name, agent.model.as_deref());
     place.save()?;
 
-    let argv = if args.resume {
-        agent.resume_argv(&plugins, &place.path, prompt.as_deref(), false)?
+    // Which session this run belongs to: named, most recent, or one the agent has yet to open.
+    let session_id = match args.resume.as_deref() {
+        Some("") => toren_lib::sessions::resume_target(&place, &plugins, &agent.name, None),
+        Some(id) => toren_lib::sessions::resume_target(&place, &plugins, &agent.name, Some(id)),
+        None => None,
+    };
+
+    let argv = if args.resume.is_some() {
+        agent.resume_argv_for(&plugins, session_id.as_deref(), prompt.as_deref(), false)?
     } else {
         agent.argv(&plugins, prompt.as_deref(), false)?
     };
 
-    eprintln!("Starting {} in {}\n", agent, place.path.display());
+    toren_lib::sessions::record_start(&mut place, &plugins, &agent.name, session_id.as_deref())?;
+
+    match &session_id {
+        Some(id) => eprintln!(
+            "Starting {} in {} (session {})\n",
+            agent,
+            place.path.display(),
+            id
+        ),
+        None => eprintln!("Starting {} in {}\n", agent, place.path.display()),
+    }
     launch(&place, &argv, args.no_rmux, args.force, &args.passthrough)
 }
 
@@ -619,6 +660,9 @@ fn compose_prompt(task: &toren_lib::ResolvedTask, user_prompt: Option<&str>) -> 
     }
     prompt
 }
+
+/// How much of a prompt becomes the workspace title.
+const TITLE_CHARS: usize = 80;
 
 fn first_chars(s: &str, n: usize) -> String {
     let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s);
@@ -810,7 +854,7 @@ fn cmd_setup(
     };
 
     // An existing working copy is adopted in place rather than recreated — that's how a
-    // hand-made worktree, or one that outlived its annotations, becomes a place breq manages.
+    // hand-made worktree, or one that outlived its state, becomes a place breq manages.
     if let Some(ref name) = workspace {
         let mut place = registry.get(&segment, name);
         if place.exists() {
@@ -898,6 +942,7 @@ fn cmd_teardown(
     let outcome = toren_lib::teardown(
         &place,
         &registry.workspaces,
+        &plugins()?,
         toren_lib::TeardownOptions { kill, no_delete },
     )?;
 
@@ -932,13 +977,13 @@ fn cmd_list(
         return Ok(());
     }
 
+    // The one command that never writes: `list` renders the cache, and `--refresh` is the
+    // explicit act of paying for the round trips — for this render only, since a read across
+    // every workspace has no business rewriting every workspace's cache.
     let opts = if local {
         CollectOptions::local()
     } else {
-        CollectOptions {
-            tasks: true,
-            refresh_delivery: refresh,
-        }
+        CollectOptions::cached().with_refresh(refresh).read_only()
     };
 
     let rows: Vec<(Place, Sets)> = places
@@ -965,7 +1010,7 @@ fn cmd_get(
 ) -> Result<()> {
     let registry = PlaceRegistry::new(config)?;
     let plugins = plugins()?;
-    let (place, key) = split_place_args(&registry, args, segment_name, 0)?;
+    let (mut place, key) = split_place_args(&registry, args, segment_name, 0)?;
 
     if let Some(key) = key {
         return get_key(
@@ -979,15 +1024,18 @@ fn cmd_get(
         );
     }
 
+    // Looking at one workspace is when a finished agent session gets its ending written down;
+    // nothing else is watching the pane for it.
+    toren_lib::sessions::settle_saved(&mut place, &plugins);
+
+    // Rendering one workspace already pays for the calls, so it refreshes the cache on the way
+    // past — which is what keeps `breq list` current for the workspaces you actually work in.
     let sets = Sets::collect(
         &place,
         &registry.workspaces,
         &plugins,
         config,
-        CollectOptions {
-            tasks: true,
-            refresh_delivery: refresh,
-        },
+        CollectOptions::live(),
     );
 
     if json {
@@ -1015,6 +1063,7 @@ fn get_key(
             let (source, id) = toren_lib::split_link(&link)
                 .with_context(|| format!("Malformed task link '{}'", link))?;
             let task = plugins.resolve_info(&source, &id, plugin_ctx(place))?;
+            toren_lib::sets::cache_task(place, &task);
             let value = match field {
                 "id" => Some(task.id),
                 "title" => Some(task.title),
@@ -1075,7 +1124,7 @@ fn get_key(
                 config,
                 CollectOptions {
                     tasks: false,
-                    refresh_delivery: refresh,
+                    ..CollectOptions::cached().with_refresh(refresh)
                 },
             );
             for pr in &sets.prs {
@@ -1086,23 +1135,22 @@ fn get_key(
         _ => {}
     }
 
-    // Plain annotations. List-valued keys print one per line so `for x in $(breq get ...)`
-    // does the obvious thing.
-    match place.annotations.get(key) {
-        Some(serde_json::Value::Array(_)) | None if !place.annotations.get_list(key).is_empty() => {
-            for item in place.annotations.get_list(key) {
-                println!("{}", item);
-            }
+    // Cached reads are asked for by name. They used to answer as a silent fallback for any key
+    // stored state did not know, which made durable and disposable data indistinguishable at the
+    // call site — `cache.` is the caller saying which of the two they meant.
+    if let Some(cached) = key.strip_prefix(toren_lib::state::CACHE_NAMESPACE) {
+        if let Some(entry) = place.cache().get(cached) {
+            println!("{}", entry.value);
+            eprintln!("(cached {})", entry.age_label());
         }
-        Some(value) => println!(
-            "{}",
-            toren_lib::annotations::value_to_string(value).unwrap_or_default()
-        ),
-        None => {
-            // Cached values are readable by their key too, marked with their age.
-            if let Some(entry) = place.cache().get(key) {
-                println!("{}", entry.value);
-            }
+        return Ok(());
+    }
+
+    // Stored state. List-valued fields print one per line so `for x in $(breq get ...)`
+    // does the obvious thing.
+    if let Some(values) = place.state.get_field(key) {
+        for value in values {
+            println!("{}", value);
         }
     }
     Ok(())
@@ -1163,14 +1211,14 @@ fn cmd_set(
 
     // `+key value` / `-key value` mutate a list without rewriting it.
     if let Some(list_key) = key.strip_prefix('+') {
-        if place.annotations.add_to_list(list_key, &value) {
+        if place.state.add_to_field(list_key, &value)? {
             place.save()?;
             eprintln!("{}: +{} {}", place.name, list_key, value);
         }
         return Ok(());
     }
     if let Some(list_key) = key.strip_prefix('-') {
-        if place.annotations.remove_from_list(list_key, &value) {
+        if place.state.remove_from_field(list_key, &value)? {
             place.save()?;
             eprintln!("{}: -{} {}", place.name, list_key, value);
         }
@@ -1178,8 +1226,8 @@ fn cmd_set(
     }
 
     place
-        .annotations
-        .set(&key, toren_lib::annotations::parse_value(&value));
+        .state
+        .set_field(&key, toren_lib::state::parse_value(&value))?;
     place.save()?;
     eprintln!("{}: {} = {}", place.name, key, value);
     Ok(())
@@ -1224,12 +1272,7 @@ fn split_place_args_multi(
 
 // ─── cleanup ────────────────────────────────────────────────────────────────
 
-fn cmd_cleanup(
-    config: &Config,
-    all_segments: bool,
-    segment_name: Option<&str>,
-    transcript_days: Option<u64>,
-) -> Result<()> {
+fn cmd_cleanup(config: &Config, all_segments: bool, segment_name: Option<&str>) -> Result<()> {
     let registry = PlaceRegistry::new(config)?;
 
     let segments: Vec<Segment> = if all_segments {
@@ -1257,15 +1300,6 @@ fn cmd_cleanup(
 
     if removed == 0 {
         println!("No orphaned workspace directories found.");
-    }
-
-    if let Some(days) = transcript_days {
-        let pruned = toren_lib::transcripts::prune(days)?;
-        println!(
-            "Pruned {} transcript director(ies) older than {}d",
-            pruned.len(),
-            days
-        );
     }
 
     Ok(())
@@ -1531,7 +1565,7 @@ fn offer_segment_registration(cwd: &Path) -> Result<()> {
         .map(|p| format!("{}/*", toren_lib::tilde_shorten(p)));
 
     let entry = if let Some(glob) = parent_glob {
-        eprintln!("\nThis repo isn't covered by a segment in ~/.toren/config.toml.");
+        eprintln!("\nThis repo isn't covered by a segment in ~/.toren/config.kdl.");
         eprint!("Add parent glob '{}'? [Y/n] ", glob);
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
@@ -1545,46 +1579,55 @@ fn offer_segment_registration(cwd: &Path) -> Result<()> {
         repo_path
     };
 
-    let config_path = dirs::home_dir()
-        .context("Could not determine home directory")?
-        .join(".toren/config.toml");
-    add_segment_to_config(&config_path, &entry)
+    add_segment_to_config(&toren_lib::default_config_path(), &entry)
 }
 
-/// Add a segment entry to ~/.toren/config.toml, preserving comments.
+/// Add a segment entry to ~/.toren/config.kdl, preserving comments.
 fn add_segment_to_config(config_path: &Path, entry: &str) -> Result<()> {
-    use toml_edit::{value, Array, DocumentMut};
+    use kdl::{KdlDocument, KdlNode};
 
-    let content = if config_path.exists() {
+    let mut doc = if config_path.exists() {
         std::fs::read_to_string(config_path)?
+            .parse::<KdlDocument>()
+            .with_context(|| format!("Failed to parse {}", config_path.display()))?
     } else {
-        String::new()
+        KdlDocument::new()
     };
 
-    let mut doc: DocumentMut = content.parse().unwrap_or_default();
-
-    if !doc.contains_table("ancillaries") {
-        doc["ancillaries"] = toml_edit::Item::Table(toml_edit::Table::new());
+    if doc.get("ancillaries").is_none() {
+        doc.nodes_mut().push(KdlNode::new("ancillaries"));
     }
-    let ancillaries = doc["ancillaries"].as_table_mut().unwrap();
+    let ancillaries = doc
+        .get_mut("ancillaries")
+        .expect("just ensured")
+        .ensure_children();
 
-    if !ancillaries.contains_key("segments") {
-        let mut arr = Array::new();
-        arr.push(entry);
-        ancillaries["segments"] = value(arr);
-    } else if let Some(arr) = ancillaries["segments"].as_array_mut() {
-        if arr.iter().any(|v| v.as_str() == Some(entry)) {
-            println!("'{}' already in config", entry);
-            return Ok(());
+    match ancillaries.get_mut("segments") {
+        Some(segments) => {
+            if segments
+                .entries()
+                .iter()
+                .any(|e| e.value().as_string() == Some(entry))
+            {
+                println!("'{}' already in config", entry);
+                return Ok(());
+            }
+            segments.push(entry);
         }
-        arr.push(entry);
+        None => {
+            let mut segments = KdlNode::new("segments");
+            segments.push(entry);
+            ancillaries.nodes_mut().push(segments);
+        }
     }
+    doc.autoformat();
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(config_path, doc.to_string()).context("Failed to write config file")?;
-    println!("Added '{}' to ~/.toren/config.toml", entry);
+    toren_lib::fsutil::write_atomic(config_path, doc.to_string())
+        .context("Failed to write config file")?;
+    println!("Added '{}' to ~/.toren/config.kdl", entry);
     Ok(())
 }
 
@@ -1784,4 +1827,41 @@ fn http_agent() -> ureq::Agent {
             .http_status_as_error(false)
             .build(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adding_a_segment_keeps_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.kdl");
+        std::fs::write(
+            &config,
+            "// hand-written\nserver {\n    port 8788\n}\n\nancillaries {\n    segments \"~/proj/*\"\n}\n",
+        )
+        .unwrap();
+
+        add_segment_to_config(&config, "~/work/repo").unwrap();
+
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert!(written.contains("// hand-written"), "{}", written);
+        assert!(written.contains("~/proj/*"), "{}", written);
+        assert!(written.contains("~/work/repo"), "{}", written);
+        assert!(written.contains("port 8788"), "{}", written);
+    }
+
+    #[test]
+    fn a_segment_is_only_added_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.kdl");
+
+        add_segment_to_config(&config, "~/proj/*").unwrap();
+        add_segment_to_config(&config, "~/proj/*").unwrap();
+
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(written.matches("~/proj/*").count(), 1, "{}", written);
+        assert!(written.contains("ancillaries"), "{}", written);
+    }
 }

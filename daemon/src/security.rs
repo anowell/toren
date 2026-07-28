@@ -8,7 +8,8 @@ use std::sync::{Arc, RwLock};
 
 use toren_lib::Config;
 
-const SESSION_FILE: &str = ".toren/sessions.json";
+/// Web session tokens, alongside the rest of toren's global state.
+const SESSION_FILE: &str = "sessions.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -17,33 +18,50 @@ pub struct Session {
     pub created_at: String, // ISO 8601 timestamp
 }
 
+/// On-disk shape of the session file: a schema version wrapped around the sessions.
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionFile {
+    version: u32,
+    #[serde(default)]
+    sessions: HashMap<String, Session>,
+}
+
 pub struct SecurityContext {
     pairing_token: String,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     session_file: PathBuf,
+    /// Cleared when the session file would not load. Rewriting a file this daemon could not
+    /// read would un-pair every client listed in it.
+    persist: bool,
 }
 
 impl SecurityContext {
     pub fn new(_config: &Config) -> Result<Self> {
+        Self::with_session_file(toren_lib::toren_root().join(SESSION_FILE))
+    }
+
+    /// The same context over an explicit session file, so a test never reaches ~/.toren.
+    fn with_session_file(session_file: PathBuf) -> Result<Self> {
         // Check for PAIRING_TOKEN env var, otherwise generate random
         let pairing_token = std::env::var("PAIRING_TOKEN")
             .ok()
             .unwrap_or_else(Self::generate_pairing_token);
 
-        // Determine session file path
-        let session_file = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(SESSION_FILE);
-
-        let context = Self {
+        let mut context = Self {
             pairing_token,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             session_file,
+            persist: true,
         };
 
         // Load persisted sessions
         if let Err(e) = context.load_sessions() {
-            tracing::warn!("Failed to load persisted sessions: {}", e);
+            tracing::warn!(
+                "Failed to load persisted sessions: {}; leaving {} untouched",
+                e,
+                context.session_file.display()
+            );
+            context.persist = false;
         }
 
         Ok(context)
@@ -94,8 +112,27 @@ impl SecurityContext {
         let content =
             fs::read_to_string(&self.session_file).context("Failed to read session file")?;
 
-        let sessions: HashMap<String, Session> =
+        let value: serde_json::Value =
             serde_json::from_str(&content).context("Failed to parse session file")?;
+
+        // Pre-version files were the bare session map.
+        let sessions: HashMap<String, Session> = match value.get("version").and_then(|v| v.as_u64())
+        {
+            Some(version) => {
+                if version > toren_lib::state::SCHEMA_VERSION as u64 {
+                    anyhow::bail!(
+                        "{} is schema version {}, newer than this daemon understands ({})",
+                        self.session_file.display(),
+                        version,
+                        toren_lib::state::SCHEMA_VERSION
+                    );
+                }
+                serde_json::from_value::<SessionFile>(value)
+                    .context("Failed to parse session file")?
+                    .sessions
+            }
+            None => serde_json::from_value(value).context("Failed to parse session file")?,
+        };
 
         let mut guard = self.sessions.write().unwrap();
         *guard = sessions;
@@ -106,16 +143,30 @@ impl SecurityContext {
     }
 
     fn save_sessions(&self) -> Result<()> {
+        if !self.persist {
+            anyhow::bail!(
+                "{} was not readable at startup; this session stays in memory",
+                self.session_file.display()
+            );
+        }
+
         // Create parent directory if it doesn't exist
         if let Some(parent) = self.session_file.parent() {
             fs::create_dir_all(parent).context("Failed to create session directory")?;
         }
 
-        let sessions = self.sessions.read().unwrap();
+        let file = {
+            let sessions = self.sessions.read().unwrap();
+            SessionFile {
+                version: toren_lib::state::SCHEMA_VERSION,
+                sessions: sessions.clone(),
+            }
+        };
         let content =
-            serde_json::to_string_pretty(&*sessions).context("Failed to serialize sessions")?;
+            serde_json::to_string_pretty(&file).context("Failed to serialize sessions")?;
 
-        fs::write(&self.session_file, content).context("Failed to write session file")?;
+        toren_lib::fsutil::write_atomic(&self.session_file, content)
+            .context("Failed to write session file")?;
 
         Ok(())
     }
@@ -144,10 +195,14 @@ impl SecurityContext {
 mod tests {
     use super::*;
 
+    fn context(dir: &tempfile::TempDir) -> SecurityContext {
+        SecurityContext::with_session_file(dir.path().join("sessions.json")).unwrap()
+    }
+
     #[test]
     fn test_pairing_token_validation() {
-        let config = Config::default();
-        let ctx = SecurityContext::new(&config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(&dir);
 
         let token = ctx.pairing_token();
         assert!(ctx.validate_pairing_token(&token));
@@ -156,10 +211,33 @@ mod tests {
 
     #[test]
     fn test_session_creation() {
-        let config = Config::default();
-        let ctx = SecurityContext::new(&config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(&dir);
 
         let session = ctx.create_session().unwrap();
         assert!(ctx.validate_session(&session.token));
+    }
+
+    #[test]
+    fn sessions_survive_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = context(&dir).create_session().unwrap();
+
+        let reloaded = context(&dir);
+        assert!(reloaded.validate_session(&session.token));
+    }
+
+    #[test]
+    fn a_session_file_from_a_newer_daemon_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let content = r#"{"version": 99, "sessions": {}}"#;
+        fs::write(&path, content).unwrap();
+
+        let ctx = context(&dir);
+        // Pairing still works in memory; the file it could not read is not rewritten.
+        let session = ctx.create_session().unwrap();
+        assert!(ctx.validate_session(&session.token));
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
     }
 }

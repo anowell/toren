@@ -102,8 +102,8 @@ pub struct ResolvedTask {
 
 /// Split a `source:id` task link into its parts.
 ///
-/// Task links are annotations, so they must round-trip through a text file and a shell
-/// script unchanged — hence the flat `source:id` form rather than a nested object.
+/// Task links round-trip through shell scripts and plugin calls unchanged, which is why the
+/// flat `source:id` form survives alongside the structured [`crate::state::TaskLink`].
 pub fn split_link(link: &str) -> Option<(String, String)> {
     let (source, id) = link.split_once(':')?;
     if source.is_empty() || id.is_empty() {

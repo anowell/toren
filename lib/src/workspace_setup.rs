@@ -23,7 +23,7 @@ const TOREN_CONFIG_FILE: &str = "toren.kdl";
 const TOREN_CONFIG_FILE_HIDDEN: &str = ".toren.kdl";
 
 /// Extract an i64 from a KdlValue (kdl 6.x uses i128 internally)
-fn kdl_value_as_i64(val: &kdl::KdlValue) -> Option<i64> {
+pub(crate) fn kdl_value_as_i64(val: &kdl::KdlValue) -> Option<i64> {
     val.as_integer().and_then(|n| i64::try_from(n).ok())
 }
 
@@ -151,7 +151,7 @@ fn validate_identifier(name: &str, kind: &str) -> Result<()> {
 
 /// Convert a KDL property value to a string. Handles strings, integers, floats, bools.
 /// Returns None for null or unsupported types.
-fn kdl_value_as_str(val: &kdl::KdlValue) -> Option<String> {
+pub(crate) fn kdl_value_as_str(val: &kdl::KdlValue) -> Option<String> {
     if let Some(s) = val.as_string() {
         Some(s.to_string())
     } else if let Some(n) = kdl_value_as_i64(val) {

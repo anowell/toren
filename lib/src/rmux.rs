@@ -1,7 +1,7 @@
 //! rmux session conventions shared by `breq` and the toren daemon.
 //!
 //! One workspace incarnation maps to one session ([`session_name`]) holding a `shell` window and
-//! an `agent` window. Both interfaces derive the same name from the workspace's annotations, so
+//! an `agent` window. Both interfaces derive the same name from the workspace's state, so
 //! either can attach to the other's agent.
 //!
 //! Session names carry the workspace's instance uid. A session that matches the workspace but not
@@ -36,7 +36,7 @@ pub fn is_available() -> bool {
 
 /// `toren-<segment>-<workspace>-<uid>`, e.g. `toren-toren-one-k3m9xz`.
 ///
-/// A workspace with no uid (undecorated, or pre-annotation) gets the bare prefix, so breq still
+/// A workspace with no uid (undecorated, or pre-uid) gets the bare prefix, so breq still
 /// works in a working copy it merely adopted.
 pub fn session_name(segment: &str, workspace: &str, uid: Option<&str>) -> String {
     let prefix = session_prefix(segment, workspace);
@@ -286,6 +286,8 @@ pub struct PaneState {
     /// Current foreground command, e.g. `zsh` or `claude`.
     pub command: String,
     pub pid: i32,
+    /// Exit code of a dead pane's process. Only `remain-on-exit` panes keep one around to read.
+    pub exit: Option<i32>,
 }
 
 impl PaneState {
@@ -338,7 +340,7 @@ pub fn list_panes(session: &str) -> Result<Vec<PaneState>> {
         session,
         "-s",
         "-F",
-        "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_pid}",
+        "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_pid}\t#{pane_dead_status}",
     ])?;
 
     Ok(out
@@ -352,14 +354,24 @@ pub fn list_panes(session: &str) -> Result<Vec<PaneState>> {
                 .next()
                 .and_then(|p| p.trim().parse().ok())
                 .unwrap_or(0);
+            let exit = fields.next().and_then(|s| s.trim().parse().ok());
             Some(PaneState {
                 window,
                 dead,
                 command,
                 pid,
+                exit,
             })
         })
         .collect())
+}
+
+/// The session's agent pane, whether alive or held dead. `None` once the window is gone.
+pub fn agent_pane(session: &str) -> Option<PaneState> {
+    list_panes(session)
+        .ok()?
+        .into_iter()
+        .find(|p| p.window == AGENT_WINDOW)
 }
 
 /// Whether the session's agent process is still alive.
@@ -679,19 +691,17 @@ mod tests {
         spawn_agent(
             &session,
             dir.path(),
-            &["/bin/sh".into(), "-c".into(), "true".into()],
+            &["/bin/sh".into(), "-c".into(), "exit 3".into()],
         )
         .unwrap();
-        wait_until(|| {
-            list_panes(&session)
-                .unwrap_or_default()
-                .iter()
-                .any(|p| p.window == AGENT_WINDOW && p.dead)
-        });
+        wait_until(|| agent_pane(&session).is_some_and(|p| p.dead));
         assert!(
             window_exists(&session, AGENT_WINDOW),
             "the exited agent lingers"
         );
+        // Holding the pane is what makes its exit status readable at all — the session record
+        // has nowhere else to get it from.
+        assert_eq!(agent_pane(&session).and_then(|p| p.exit), Some(3));
 
         // ensure_shell brings back a shell to attach to after the user exited theirs.
         ensure_shell(&session, dir.path()).unwrap();

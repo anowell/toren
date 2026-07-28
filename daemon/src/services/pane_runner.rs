@@ -3,29 +3,25 @@
 //! Agents are spawned into the same sessions `breq do` uses, so either side can attach to the
 //! other's agent without re-spawning it.
 //!
-//! Every mirrored pane is also recorded to a transcript file. rmux keeps scrollback in daemon
-//! memory only, and an exited pane loses its screen entirely, so that file is the only history
-//! that survives either.
+//! A mirror's history is what rmux still holds for the pane plus what this process has seen since
+//! it started following it; nothing is written to disk.
 
 use anyhow::{anyhow, Context, Result};
 use rmux_sdk::{PaneId, PaneOutputChunk, PaneOutputStart, PaneProcessState, Rmux, SessionName};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, OnceCell, RwLock};
 use tracing::{debug, info, warn};
 
 use toren_lib::rmux as rmux_conv;
 
-/// How much output a newly connected browser replays. The transcript keeps the full record.
+/// How much output a newly connected browser replays.
 const REPLAY_CAP_BYTES: usize = 2 * 1024 * 1024;
 
 /// Fan-out depth; a client further behind than this gets a lag notice rather than back-pressuring
 /// the recorder.
 const BROADCAST_CAPACITY: usize = 512;
-
-/// Prefixed to a backfill that had older output aged out, so the start reads as elision.
-const TRUNCATION_NOTICE: &[u8] = b"\x1b[2m[earlier output truncated \xe2\x80\x94 see the transcript for the full record]\x1b[0m\r\n";
 
 /// Liveness of an ancillary's agent pane, as far as rmux is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,18 +46,14 @@ pub struct PaneMirror {
 struct MirrorState {
     /// Trailing window of output, for replay to newly connected clients.
     replay: Vec<u8>,
-    truncated: bool,
 }
 
 impl PaneMirror {
-    fn new(seed: Vec<u8>, truncated: bool) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (ended, _) = tokio::sync::watch::channel(false);
         Arc::new(Self {
-            state: Mutex::new(MirrorState {
-                replay: seed,
-                truncated,
-            }),
+            state: Mutex::new(MirrorState { replay: Vec::new() }),
             tx,
             ended,
         })
@@ -84,13 +76,7 @@ impl PaneMirror {
     pub async fn attach(&self) -> (Vec<u8>, broadcast::Receiver<Arc<Vec<u8>>>) {
         let state = self.state.lock().await;
         let rx = self.tx.subscribe();
-
-        let mut backfill = Vec::with_capacity(state.replay.len() + TRUNCATION_NOTICE.len());
-        if state.truncated {
-            backfill.extend_from_slice(TRUNCATION_NOTICE);
-        }
-        backfill.extend_from_slice(&state.replay);
-        (backfill, rx)
+        (state.replay.clone(), rx)
     }
 
     async fn push(&self, bytes: Arc<Vec<u8>>) {
@@ -104,7 +90,6 @@ impl PaneMirror {
                 .position(|b| *b == b'\n')
                 .map_or(drop_to, |offset| drop_to + offset + 1);
             state.replay.drain(..cut);
-            state.truncated = true;
         }
         // Send while holding the lock so `attach` cannot interleave.
         let _ = self.tx.send(bytes);
@@ -160,8 +145,8 @@ impl PaneRunner {
 
     /// Start (or restart) an agent in a workspace's session and begin mirroring its pane.
     ///
-    /// The session name and transcript path come from the caller, which derives them from the
-    /// workspace's annotations — that's what keys both to the instance uid.
+    /// The session name comes from the caller, which derives it from the workspace's
+    /// state — that's what keys it to the instance uid.
     pub async fn start_agent(
         &self,
         key: &str,
@@ -169,7 +154,6 @@ impl PaneRunner {
         workspace_path: &Path,
         env: &[(String, String)],
         argv: &[String],
-        transcript: &Path,
     ) -> Result<String> {
         // Same helpers `breq` uses, so both interfaces produce identical sessions.
         rmux_conv::ensure_session(session, workspace_path, env)?;
@@ -177,8 +161,7 @@ impl PaneRunner {
 
         info!("{}: spawned {} in rmux session {}", key, argv[0], session);
 
-        self.track(key, session, rmux_conv::AGENT_WINDOW, transcript)
-            .await?;
+        self.track(key, session, rmux_conv::AGENT_WINDOW).await?;
         Ok(session.to_string())
     }
 
@@ -203,13 +186,7 @@ impl PaneRunner {
     /// Adopts a session this process never started, and replaces a mirror left following a pane
     /// that `breq do` or a resume has since swapped out. `key` scopes the mirror to one window,
     /// so a workspace can have its agent and several shells mirrored at once.
-    pub async fn ensure_current(
-        &self,
-        key: &str,
-        session: &str,
-        window: &str,
-        transcript: &Path,
-    ) -> Result<String> {
+    pub async fn ensure_current(&self, key: &str, session: &str, window: &str) -> Result<String> {
         if !rmux_conv::session_exists(session) {
             return Err(anyhow!("No rmux session '{}'", session));
         }
@@ -226,33 +203,18 @@ impl PaneRunner {
             return Ok(session.to_string());
         }
 
-        self.track(key, session, window, transcript).await?;
+        self.track(key, session, window).await?;
         Ok(session.to_string())
     }
 
     /// Attach a recorder to `window`'s pane, replacing any previous one under `key`.
-    async fn track(&self, key: &str, session: &str, window: &str, transcript: &Path) -> Result<()> {
+    async fn track(&self, key: &str, session: &str, window: &str) -> Result<()> {
         let discovered = self.find_window(session, window).await?;
-        let (pane, pane_id) = (discovered.pane, discovered.pane_id);
+        let pane = discovered.pane;
+        let pane_id = discovered.pane_id;
 
-        let transcript = transcript.to_path_buf();
-        if let Some(parent) = transcript.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-
-        // Without this a browser attaching after a restart, or to an exited agent, sees a blank
-        // terminal: rmux has no scrollback left for it.
-        let (seed, truncated) = read_transcript_tail(&transcript, REPLAY_CAP_BYTES).await;
-        let mirror = PaneMirror::new(seed, truncated);
-
-        let cursor = TranscriptCursor::load(&transcript).await;
-        let recorder = tokio::spawn(record_pane(
-            pane,
-            pane_id,
-            mirror.clone(),
-            transcript,
-            cursor,
-        ));
+        let mirror = PaneMirror::new();
+        let recorder = tokio::spawn(record_pane(pane, mirror.clone()));
 
         // Clients on the outgoing mirror would otherwise hang on a subscription nothing feeds.
         let previous = self.tracked.write().await.insert(
@@ -421,77 +383,11 @@ impl PaneRunner {
     }
 }
 
-/// Where a transcript left off, so re-attaching doesn't duplicate history.
+/// Pump one pane's output into its mirror until the stream ends.
 ///
-/// A first attach wants `PaneOutputStart::Oldest`; a re-attach replays output already in the file.
-/// rmux gives every chunk a monotonic per-pane sequence, so the last one written resumes exactly.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct TranscriptCursor {
-    /// Sequences restart at 0 per pane, so a cursor from another pane must not be used to skip.
-    pane_id: Option<u64>,
-    last_sequence: Option<u64>,
-}
-
-impl TranscriptCursor {
-    fn sidecar(transcript: &Path) -> PathBuf {
-        transcript.with_extension("raw.cursor")
-    }
-
-    async fn load(transcript: &Path) -> Self {
-        let Ok(text) = tokio::fs::read_to_string(Self::sidecar(transcript)).await else {
-            return Self::default();
-        };
-        let mut fields = text.trim().split(':');
-        let pane_id = fields.next().and_then(|f| f.parse().ok());
-        let last_sequence = fields.next().and_then(|f| f.parse().ok());
-        Self {
-            pane_id,
-            last_sequence,
-        }
-    }
-
-    async fn save(&self, transcript: &Path) {
-        let (Some(pane_id), Some(sequence)) = (self.pane_id, self.last_sequence) else {
-            return;
-        };
-        let _ = tokio::fs::write(
-            Self::sidecar(transcript),
-            format!("{}:{}", pane_id, sequence),
-        )
-        .await;
-    }
-
-    fn already_recorded(&self, pane_id: u64, sequence: u64) -> bool {
-        self.pane_id == Some(pane_id) && self.last_sequence.is_some_and(|last| sequence <= last)
-    }
-}
-
-/// The tail of a transcript, plus whether anything was elided from the front.
-async fn read_transcript_tail(transcript: &Path, max_bytes: usize) -> (Vec<u8>, bool) {
-    let Ok(bytes) = tokio::fs::read(transcript).await else {
-        return (Vec::new(), false);
-    };
-    if bytes.len() <= max_bytes {
-        return (bytes, false);
-    }
-    let start = bytes.len() - max_bytes;
-    let cut = bytes[start..]
-        .iter()
-        .position(|b| *b == b'\n')
-        .map_or(start, |offset| start + offset + 1);
-    (bytes[cut..].to_vec(), true)
-}
-
-/// Pump one pane's output into its mirror and its transcript file until the stream ends.
-async fn record_pane(
-    pane: rmux_sdk::Pane,
-    pane_id: PaneId,
-    mirror: Arc<PaneMirror>,
-    transcript: PathBuf,
-    mut cursor: TranscriptCursor,
-) {
-    use tokio::io::AsyncWriteExt;
-
+/// Starts from rmux's oldest retained output, so a mirror attached long after the pane started
+/// still opens with whatever rmux has kept rather than a blank screen.
+async fn record_pane(pane: rmux_sdk::Pane, mirror: Arc<PaneMirror>) {
     let mut stream = match pane
         .output_stream_starting_at(PaneOutputStart::Oldest)
         .await
@@ -504,41 +400,10 @@ async fn record_pane(
         }
     };
 
-    let pane_key = u64::from(pane_id.as_u32());
-    let mut file = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&transcript)
-        .await
-    {
-        Ok(file) => Some(file),
-        Err(e) => {
-            // Degrades history, not the live view — keep streaming.
-            warn!("Failed to open transcript {}: {}", transcript.display(), e);
-            None
-        }
-    };
-
     loop {
         match stream.next().await {
-            Ok(Some(PaneOutputChunk::Bytes { sequence, bytes })) => {
-                // Already on disk and already in the mirror's seed.
-                if cursor.already_recorded(pane_key, sequence) {
-                    continue;
-                }
-
-                let bytes = Arc::new(bytes);
-                if let Some(handle) = file.as_mut() {
-                    if let Err(e) = handle.write_all(&bytes).await {
-                        warn!("Transcript write failed, dropping transcript: {}", e);
-                        file = None;
-                    } else {
-                        cursor.pane_id = Some(pane_key);
-                        cursor.last_sequence = Some(sequence);
-                        cursor.save(&transcript).await;
-                    }
-                }
-                mirror.push(bytes).await;
+            Ok(Some(PaneOutputChunk::Bytes { bytes, .. })) => {
+                mirror.push(Arc::new(bytes)).await;
             }
             Ok(Some(PaneOutputChunk::Lag(notice))) => {
                 debug!("rmux reported pane output lag: {:?}", notice);
@@ -552,9 +417,6 @@ async fn record_pane(
         }
     }
 
-    if let Some(file) = file.as_mut() {
-        let _ = file.flush().await;
-    }
     mirror.mark_ended();
 }
 
@@ -618,7 +480,6 @@ mod tests {
 
         let segment = format!("panerunner{}", std::process::id());
         let session = rmux_conv::session_name(&segment, "one", None);
-        let transcript = dir.path().join("transcripts").join("one.raw");
         rmux_conv::ensure_session(&session, &workspace, &[]).unwrap();
         rmux_conv::spawn_agent(
             &session,
@@ -635,7 +496,7 @@ mod tests {
         let runner = PaneRunner::new();
         wait_for(|| async {
             runner
-                .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW, &transcript)
+                .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW)
                 .await
                 .is_ok()
         })
@@ -684,7 +545,7 @@ mod tests {
     /// Replacing the agent re-points the mirror and releases clients on the old pane; re-adopting
     /// an unchanged pane changes nothing. Needs rmux installed.
     #[tokio::test]
-    async fn re_adoption_refreshes_the_mirror_without_duplicating_the_transcript() {
+    async fn re_adoption_refreshes_the_mirror_only_when_the_pane_changed() {
         if !rmux_conv::is_available() {
             eprintln!("skipping: rmux not on PATH");
             return;
@@ -696,7 +557,6 @@ mod tests {
 
         let segment = format!("readopt{}", std::process::id());
         let session = rmux_conv::session_name(&segment, "one", None);
-        let transcript = dir.path().join("transcripts").join("one.raw");
         let runner = PaneRunner::new();
 
         let first_agent = vec![
@@ -705,14 +565,7 @@ mod tests {
             "echo FIRST-AGENT; sleep 30".to_string(),
         ];
         runner
-            .start_agent(
-                &session,
-                &session,
-                &workspace,
-                &[],
-                &first_agent,
-                &transcript,
-            )
+            .start_agent(&session, &session, &workspace, &[], &first_agent)
             .await
             .unwrap();
 
@@ -720,23 +573,12 @@ mod tests {
         wait_for(|| async { contains(&first_mirror.attach().await.0, "FIRST-AGENT") }).await;
 
         runner
-            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW, &transcript)
+            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW)
             .await
             .unwrap();
         assert!(
             Arc::ptr_eq(&first_mirror, &runner.mirror(&session).await.unwrap()),
             "re-adopting an unchanged pane should not rebuild the mirror"
-        );
-
-        wait_for(|| async { occurrences(&transcript, "FIRST-AGENT").await == 1 }).await;
-        runner
-            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW, &transcript)
-            .await
-            .unwrap();
-        assert_eq!(
-            occurrences(&transcript, "FIRST-AGENT").await,
-            1,
-            "transcript must not accumulate a second copy of the same output"
         );
 
         // Replace the agent the way `breq do` does, behind the daemon's back.
@@ -753,7 +595,7 @@ mod tests {
         .unwrap();
 
         runner
-            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW, &transcript)
+            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW)
             .await
             .unwrap();
 
@@ -772,9 +614,9 @@ mod tests {
         rmux_conv::kill_session(&session).unwrap();
     }
 
-    /// A pane that has already exited still shows what the run left behind. Needs rmux installed.
+    /// A mirror built after the fact still opens on what rmux retained. Needs rmux installed.
     #[tokio::test]
-    async fn history_survives_the_pane_it_came_from() {
+    async fn a_fresh_mirror_seeds_from_rmux_retained_output() {
         if !rmux_conv::is_available() {
             eprintln!("skipping: rmux not on PATH");
             return;
@@ -786,7 +628,6 @@ mod tests {
 
         let segment = format!("history{}", std::process::id());
         let session = rmux_conv::session_name(&segment, "one", None);
-        let transcript = dir.path().join("transcripts").join("one.raw");
 
         {
             let runner = PaneRunner::new();
@@ -801,7 +642,6 @@ mod tests {
                         "-c".to_string(),
                         "echo WORK-THAT-HAPPENED; sleep 30".to_string(),
                     ],
-                    &transcript,
                 )
                 .await
                 .unwrap();
@@ -813,26 +653,14 @@ mod tests {
         // A fresh PaneRunner stands in for a daemon restart: no in-memory replay buffer left.
         let restarted = PaneRunner::new();
         restarted
-            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW, &transcript)
+            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW)
             .await
             .unwrap();
 
         let mirror = restarted.mirror(&session).await.unwrap();
-        let (backfill, _) = mirror.attach().await;
-        assert!(
-            contains(&backfill, "WORK-THAT-HAPPENED"),
-            "a restarted daemon should replay the transcript, got {:?}",
-            String::from_utf8_lossy(&backfill)
-        );
+        wait_for(|| async { contains(&mirror.attach().await.0, "WORK-THAT-HAPPENED") }).await;
 
         rmux_conv::kill_session(&session).unwrap();
-    }
-
-    async fn occurrences(path: &Path, needle: &str) -> usize {
-        let Ok(bytes) = tokio::fs::read(path).await else {
-            return 0;
-        };
-        String::from_utf8_lossy(&bytes).matches(needle).count()
     }
 
     fn contains(haystack: &[u8], needle: &str) -> bool {
@@ -856,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn mirror_replays_then_streams() {
-        let mirror = PaneMirror::new(Vec::new(), false);
+        let mirror = PaneMirror::new();
         mirror.push(Arc::new(b"hello ".to_vec())).await;
 
         let (replay, mut rx) = mirror.attach().await;
@@ -867,31 +695,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mirror_caps_replay_and_marks_truncation() {
-        let mirror = PaneMirror::new(Vec::new(), false);
+    async fn mirror_caps_its_replay_buffer() {
+        let mirror = PaneMirror::new();
         let chunk = vec![b'x'; REPLAY_CAP_BYTES / 2 + 1];
         mirror.push(Arc::new(chunk.clone())).await;
         mirror.push(Arc::new(chunk)).await;
 
         let state = mirror.state.lock().await;
         assert!(state.replay.len() <= REPLAY_CAP_BYTES);
-        assert!(state.truncated);
-    }
-
-    #[tokio::test]
-    async fn mirror_announces_truncation_to_new_clients() {
-        let mirror = PaneMirror::new(Vec::new(), false);
-        mirror
-            .push(Arc::new(vec![b'x'; REPLAY_CAP_BYTES + 1]))
-            .await;
-
-        let (backfill, _) = mirror.attach().await;
-        assert!(backfill.starts_with(TRUNCATION_NOTICE));
     }
 
     #[tokio::test]
     async fn mirror_trims_on_a_line_boundary_when_it_can() {
-        let mirror = PaneMirror::new(Vec::new(), false);
+        let mirror = PaneMirror::new();
         let mut first = vec![b'a'; REPLAY_CAP_BYTES];
         first.push(b'\n');
         first.extend_from_slice(b"tail");

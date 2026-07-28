@@ -1,13 +1,14 @@
 # Segment Management
 
-Toren discovers and manages segments (projects) via `~/.toren/config.toml`.
+Toren discovers and manages segments (projects) via `~/.toren/config.kdl`.
 
 ## Configuration
 
-```toml
-[ancillaries]
-# Segment globs: discover repos as segments
-segments = ["~/proj/*", "~/work/special-repo"]
+```kdl
+ancillaries {
+    // Segment globs: discover repos as segments
+    segments "~/proj/*" "~/work/special-repo"
+}
 ```
 
 Glob entries (containing `*`, `?`, or `[`) are expanded — each matched directory becomes a segment. Non-glob entries are treated as literal segment paths.

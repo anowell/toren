@@ -11,12 +11,12 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use crate::annotations::{self, Annotations};
 use crate::config::{toren_root, Config};
 use crate::place::PlaceRegistry;
 use crate::plugins::{PluginContext, PluginManager};
 use crate::rmux;
 use crate::scripts;
+use crate::state;
 
 /// What one check found and, if fixing, what it did about it.
 #[derive(Debug, Default)]
@@ -50,7 +50,33 @@ pub fn run(config: &Config, plugins: &PluginManager, fix: bool) -> Result<Vec<Ch
         check_shipped_scripts(fix)?,
         check_stale_sessions(config, fix)?,
         check_toren_excluded(config, fix)?,
+        check_retired_history()?,
     ])
+}
+
+/// `~/.toren/completion_history.jsonl` — the teardown record the rolling log replaced.
+///
+/// Reported, never read: it holds two incompatible schemas with no discriminator, and nothing
+/// ever consumed it. `--fix` deliberately leaves it alone — whatever it says about workspaces
+/// that no longer exist is not toren's to delete.
+fn check_retired_history() -> Result<CheckReport> {
+    let mut report = CheckReport::new("retired completion history");
+    let path = retired_history_path();
+    if !path.exists() {
+        return Ok(report);
+    }
+
+    let shown = crate::config::tilde_shorten(&path);
+    report
+        .findings
+        .push(format!("{} is no longer written or read", shown));
+    report.advice = Some(format!(
+        "teardowns now land in {}; delete {} once you are done with it",
+        crate::config::tilde_shorten(&crate::logging::log_dir()),
+        shown
+    ));
+
+    Ok(report)
 }
 
 /// The line this check keeps in each segment's local exclude.
@@ -117,11 +143,11 @@ fn exclude_covers_toren(exclude: &Path) -> bool {
     content.lines().any(|line| line.trim() == TOREN_EXCLUDE)
 }
 
-/// `~/.toren/assignments.json` — the global registry that the annotation store replaced.
+/// `~/.toren/assignments.json` — the global registry that per-workspace state replaced.
 ///
-/// Each record becomes annotations on the workspace it described: an instance uid, the task it
-/// was working, its title, and a base commit read from the working copy as it stands. Records
-/// whose workspace is already gone carry no state worth keeping.
+/// Each record becomes state on the workspace it described: an instance uid, the task it was
+/// working, its title, and a base commit read from the working copy as it stands. Records whose
+/// workspace is already gone carry no state worth keeping.
 fn check_legacy_assignments(
     config: &Config,
     plugins: &PluginManager,
@@ -147,6 +173,7 @@ fn check_legacy_assignments(
     }
 
     let registry = PlaceRegistry::new(config)?;
+    let mut kept = 0;
 
     for record in &records {
         let segment_name = record["segment"].as_str().unwrap_or_default().to_string();
@@ -174,28 +201,29 @@ fn check_legacy_assignments(
         };
 
         let mut place = registry.get(&segment, &ws_name);
-        let mut annotations = Annotations::load(&place.path).unwrap_or_default();
 
-        if annotations.get_str("uid").is_none() {
-            annotations.set_str("uid", annotations::mint_uid());
+        if place.state.uid.is_none() {
+            place.state.uid = Some(state::mint_uid());
         }
-        annotations.set_str("name", place.name.clone());
-        annotations.set_str("segment", segment.name.clone());
         if let Some(created) = record["created_at"].as_str() {
-            annotations.set_default("created_at", created);
+            place
+                .state
+                .created_at
+                .get_or_insert_with(|| created.to_string());
         }
         if let Some(title) = record["task_title"].as_str().filter(|t| !t.is_empty()) {
-            annotations.set_default("title", title);
+            place.state.title.get_or_insert_with(|| title.to_string());
         }
 
         // The base was a branch name before; re-read it as a commit from the working copy so
         // the change set means the same thing it will mean for new workspaces.
-        if annotations.get_str("base").is_none() {
+        if place.state.base.is_none() {
             if let Some(base) = registry
                 .workspaces
                 .base_revision(&segment.path, &place.path)
             {
-                annotations.set_str("base", base);
+                let vcs = place.vcs_label();
+                place.state.set_base(vcs, base);
             }
         }
 
@@ -216,7 +244,7 @@ fn check_legacy_assignments(
 
             match source {
                 Some(source) => {
-                    annotations.add_to_list("task", &crate::tasks::format_link(&source, task_id));
+                    place.state.add_task(&source, task_id);
                 }
                 None => report.fixed.push(format!(
                     "{}: kept title but dropped task '{}' — no resolver claims it",
@@ -225,11 +253,27 @@ fn check_legacy_assignments(
             }
         }
 
-        place.annotations = annotations;
-        place.save()?;
+        // A workspace that will not take the write keeps its record: dropping the legacy file
+        // is only safe once every record it holds has somewhere else to live.
+        if let Err(e) = place.save() {
+            report
+                .findings
+                .push(format!("could not migrate '{}': {:#}", ws_name, e));
+            kept += 1;
+            continue;
+        }
         report
             .fixed
             .push(format!("migrated '{}' into {}/.toren", ws_name, ws_name));
+    }
+
+    if kept > 0 {
+        report.advice = Some(format!(
+            "{} left in place: {} record(s) could not be migrated",
+            crate::config::tilde_shorten(&path),
+            kept
+        ));
+        return Ok(report);
     }
 
     std::fs::remove_file(&path)?;
@@ -321,6 +365,10 @@ fn check_stale_sessions(config: &Config, fix: bool) -> Result<CheckReport> {
 
 fn legacy_assignments_path() -> PathBuf {
     toren_root().join("assignments.json")
+}
+
+fn retired_history_path() -> PathBuf {
+    toren_root().join("completion_history.jsonl")
 }
 
 #[cfg(test)]

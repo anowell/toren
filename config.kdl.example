@@ -1,0 +1,51 @@
+// Toren's global config. Copy to ~/.toren/config.kdl and edit.
+//
+// Every node here is optional; the values shown are the defaults. Anything toren does not
+// recognise is warned about on load rather than silently ignored.
+//
+// Per-repo workspace hooks live in a `toren.kdl` at the repo root, not here.
+
+server {
+    // Where toren-daemon listens. Ignored by breq.
+    host "127.0.0.1"
+    port 8787
+}
+
+ancillaries {
+    // Segments are the repos breq manages workspaces for. Globs expand; literal paths are
+    // taken as-is. With none configured, breq infers the segment from the current repo.
+    segments "~/proj/*" "~/work/special-repo"
+
+    // Where ancillary workspaces are created: <workspace_root>/<segment>/<workspace>/
+    workspace_root "~/.toren/workspaces"
+
+    // Ceiling on concurrent workspaces per segment; also the pool of numbered names.
+    max_per_segment 10
+
+    // Coding agent for `breq do` (an agents/ plugin name). Auto-detected from PATH if unset.
+    // agent "claude"
+}
+
+proxy {
+    // Base domain for station routes: <workspace>.<repo>.<domain>. Only used by `toren.kdl`
+    // proxy directives.
+    domain "lvh.me"
+}
+
+tasks {
+    // Task sources tried, in order, when resolving an id with no `source:` prefix.
+    // Unset means auto-detect from the installed task plugins.
+    // sources "runes" "github"
+}
+
+delivery {
+    // Which delivery plugin reads PR/CI state. Unset means the only one installed, if there
+    // is exactly one. A workspace can override this for itself.
+    // source "github"
+}
+
+aliases {
+    // Shell templates dispatched as `breq <name>`, after breq-<name> scripts and real
+    // subcommands. Positional arguments are $1, $2, …
+    // show "breq get $1"
+}

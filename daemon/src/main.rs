@@ -2,6 +2,10 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::{info, Level};
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 
 mod ancillary;
 mod api;
@@ -15,19 +19,29 @@ use toren_lib::{Config, SegmentManager, WorkspaceManager};
 #[command(name = "toren-daemon")]
 #[command(about = "Toren daemon - API server for bead-driven development")]
 struct Cli {
-    /// Path to config file (default: auto-discovered toren.toml)
+    /// Path to config file (default: auto-discovered ~/.toren/config.kdl)
     #[arg(short, long)]
     config: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    // Terminal for whoever is watching, rolling JSON file for whoever asks later.
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(LevelFilter::from_level(Level::INFO)))
+        .with(toren_lib::logging::file_layer("toren-daemon"))
+        .init();
 
     let cli = Cli::parse();
 
-    info!("Toren initializing, version {}", env!("CARGO_PKG_VERSION"));
+    // The daemon is restartable by design — agents outlive it — so every start is worth a line.
+    info!(
+        event = "daemon.start",
+        version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
+        "Toren initializing, version {}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // Load configuration
     let config = Config::load_from(cli.config.as_deref())?;
@@ -78,7 +92,7 @@ async fn main() -> Result<()> {
     );
     let workspace_manager = Some(WorkspaceManager::new(workspace_root, local_domain));
 
-    // Agents run in rmux panes; transcript paths come from toren_lib::transcripts.
+    // Agents run in rmux panes, mirrored to whatever browsers attach.
     let pane_runner = services::pane_runner::PaneRunner::new();
     info!("Pane runner initialized");
 

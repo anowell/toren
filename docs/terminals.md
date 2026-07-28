@@ -79,28 +79,17 @@ the session outlives the terminal it was started from, and is reachable from a b
 A reasonable arrangement is one zellij tab per workspace, each holding one `rmux attach`. You keep
 zellij's tab ergonomics and rmux's persistence, and neither layer has to know about the other.
 
-## Transcripts
+## What is kept
 
-rmux keeps scrollback in daemon memory only, and a pane whose process has exited loses its screen
-entirely (`capture-pane` shows just `Pane is dead (status N, …)`). So the daemon also records every
-pane it mirrors to `~/.toren/transcripts/<segment>/<workspace>/<uid>/<window>.raw` — raw bytes,
-escape sequences and all. The uid in the path is the place's incarnation, so a slot reused three
-times keeps three separate records rather than overwriting.
+Toren records no raw terminal output of its own. Every layer already keeps the record that suits
+it: a coding agent keeps its own structured session, a shell keeps its command history, and rmux
+keeps scrollback. Attaching a browser seeds the terminal from whatever rmux still holds for the
+pane, then switches to the live stream.
 
-That file is the durable record, and it is what the browser replays. Attaching seeds the terminal
-from the transcript's last 2 MB, then switches to the live stream — so a finished agent, or one
-whose daemon has restarted since, still shows what it did instead of a blank screen. When output
-has aged out of that window, the terminal says so before the replay.
-
-You can also read it directly:
-
-```bash
-cat ~/.toren/transcripts/toren/one/aaa111/agent.raw
-```
-
-A `.raw.cursor` sidecar records how far the transcript has been written, so re-attaching to a pane
-appends only what is new rather than replaying its history into the file a second time. Aged-out
-transcripts are pruned by `breq cleanup --transcripts <days>`.
+What toren records instead is the link between those records: when a workspace is torn down, the
+teardown event in `~/.toren/logs/` carries the agent that worked there and that agent's own session
+id, so the incarnation can still be traced back to the agent's transcript of it long after the
+working copy is gone.
 
 ## Lifecycle notes
 

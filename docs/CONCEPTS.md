@@ -15,10 +15,10 @@ A place is the bundle of things that make a directory somewhere an agent can wor
 - a **working copy** — a git worktree or jj workspace on disk
 - **VCS state** — its branch/change, its commits, its base
 - an **rmux session** — `toren-<segment>-<workspace>-<uid>`, where agents and shells run
-- **annotations** — small facts you attach to it (a title, a linked task, the chosen agent)
+- **state** — small facts you attach to it (a title, a linked task, the chosen agent)
 - **env** — `TOREN_SEGMENT`, `TOREN_WORKSPACE`, `TOREN_WORKSPACE_PATH`, `TOREN_UID`
 
-Processes run *in* a place. Tasks and delivery (the PR, the CI run) are *annotations on* a place.
+Processes run *in* a place. Tasks and delivery (the PR, the CI run) are *facts about* a place.
 That distinction is the whole model. An earlier version of toren treated a workspace as an
 "assignment" — a workspace welded to one task, created when the task was claimed and destroyed
 when it closed. That conflated two things that are actually independent, and this rewrite pulls
@@ -28,7 +28,7 @@ them apart.
 |---------|-----------|
 | **Toren / Ship** | The daemon — a persistent view over every place |
 | **Segment** | A repository that places are created from (e.g. `toren`, `calculator`) |
-| **Workspace / Place** | A working copy + VCS state + rmux session + annotations, e.g. `toren/one` |
+| **Workspace / Place** | A working copy + VCS state + rmux session + its own state, e.g. `toren/one` |
 | **Ancillary** | The classic name for a workspace — a body Toren works through |
 | **Interface** | Your device (terminal, browser, phone) — just a viewport |
 
@@ -37,7 +37,7 @@ them apart.
 Workspaces within a segment are named with numbered words — `one`, `two`, `three` — following the
 books' convention ("One Esk Nineteen"). `breq setup` takes the next free slot; you can also name one
 explicitly. Each *incarnation* of a slot (setup, teardown, setup again) also gets a short **uid**,
-minted at setup, so the three lives of `toren/one` stay distinguishable in sessions and transcripts.
+minted at setup, so the three lives of `toren/one` stay distinguishable in sessions and history.
 
 ## Two orthogonal verb families
 
@@ -78,11 +78,11 @@ task you never mean to close. `breq list` is where the two axes are shown side b
 | `breq teardown <ws>` | Delete a workspace. Task-agnostic: no status changes, no push. `--kill` also stops live panes; `--no-delete` keeps the working copy and drops only breq's state. |
 | `breq do [task]` | Run a coding agent in a place. Needs a task or a `-p` prompt. Infers the workspace from your cwd, else makes a fresh one. Claiming a named task is its one tracker side effect. |
 | `breq sh [ws]` | Open a shell in a place, or `breq sh <ws> -- <cmd>` to run a command there. The composability workhorse. |
-| `breq get <ws> [key]` | Read a place: full detail, or one key for scripting. `task.*` keys pass through to the tracker. |
-| `breq set <ws> <key> <value>` | Write an annotation, or a `task.*` field (pass-through). List keys take `+`/`-`: `breq set one +task runes:tor-1`. |
-| `breq list` | One row per workspace, joining core state, annotations, derived VCS, and cached delivery. Never blocks on the network. |
+| `breq get <ws> [key]` | Read a place: full detail, or one key for scripting. `task.*` keys pass through to the tracker; `cache.*` keys read the workspace cache. |
+| `breq set <ws> <key> <value>` | Write a state field, or a `task.*` field (pass-through). List keys take `+`/`-`: `breq set one +task runes:tor-1`. |
+| `breq list` | One row per workspace, joining stored state, derived VCS, and cached delivery. Never blocks on the network. |
 | `breq doctor` | Detect known-bad state and, with `--fix`, repair it. Never runs implicitly. |
-| `breq cleanup` | Remove leftovers — orphaned workspace directories, aged-out transcripts. |
+| `breq cleanup` | Remove leftovers — orphaned workspace directories. |
 | `breq init` | Initialize `toren.kdl` in a repo and install the shipped workflow scripts. |
 | `breq plugin` | Manage the Rhai resolver plugins under `~/.toren/plugins`. |
 
@@ -96,17 +96,23 @@ There is **no global registry.** The old `~/.toren/assignments.json` is gone. In
 
 - **The VCS enumerates workspaces.** A place exists because its working copy exists and the VCS
   knows about it — `breq list` is a walk over that, not a lookup in a side file.
-- **Annotations live with the workspace.** Each place carries a git-excluded
-  `<ws>/.toren/annotations.json` (the facts you set) and `<ws>/.toren/cache.json` (derived values
-  with timestamps). Nothing about a place lives anywhere but the place.
+- **State lives with the workspace.** Each place carries a git-excluded
+  `<ws>/.toren/state.json` (the durable facts) and `<ws>/.toren/cache.json` (derived values with
+  timestamps). Both carry a schema `version` and are written atomically. Nothing about a place
+  lives anywhere but the place.
 - **A uid is minted at setup** and embedded in the rmux session name
-  (`toren-<segment>-<ws>-<uid>`) and in transcript paths.
-- **Transcripts** are recorded under `~/.toren/transcripts/<segment>/<ws>/<uid>/<window>.raw`, so
-  three incarnations of a slot keep three separate records.
-- **Delivery is cached, never blocking.** PR/CI state is written to `cache.json` with a timestamp;
-  `list` renders that cache and only reaches the network on `--refresh`. Task-source-owned fields
-  (status, assignee, title) are the opposite — always asked of the source, never cached, so breq
-  can never claim a status the tracker disagrees with.
+  (`toren-<segment>-<ws>-<uid>`), so three incarnations of a slot never conflate.
+- **Teardown leaves a line behind.** The teardown event in `~/.toren/logs/` records the uid, the
+  linked tasks, the final revision, and the agent session id — the link to the agent's own record
+  of the work, which outlives the workspace.
+- **Remote-derived values are write-through, never blocking.** Task status and title, PR state and
+  CI: whichever command already pays for the call (`breq do <task>`, `breq get`, the daemon's
+  single-workspace view) stamps the answer into `cache.json` on its way past. `breq list` renders
+  those stamps with their age and never calls out at all; `--refresh` is the explicit act of
+  paying. Freshness tracks attention, and staleness is visible rather than silent.
+- **Agent sessions are recorded per workspace.** Every agent start appends to `agent.sessions` in
+  `state.json` — id, agent, when, which task — and the session's title and exit status are
+  snapshotted when it ends. That list is what `breq do --resume=<id>` picks from.
 
 ### Stacking
 
@@ -119,7 +125,7 @@ forked — so you can copy-on-write the parent's runtime state rather than rebui
 
 Any working copy can become a place breq manages: `breq setup <name>` on an existing, undecorated
 directory **adopts** it in place rather than recreating it — a hand-made worktree, or one that
-outlived its annotations, joins the fold. `breq teardown --no-delete` is the inverse: it drops
+outlived its state, joins the fold. `breq teardown --no-delete` is the inverse: it drops
 breq's state but leaves the working copy on disk.
 
 ## The extension census: four layers

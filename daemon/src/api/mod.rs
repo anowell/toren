@@ -211,14 +211,7 @@ async fn adopt_current_pane(
         .unwrap_or_else(|| default_window(&session));
     let key = window_key(&session, &window);
 
-    let transcript =
-        toren_lib::transcripts::path(&place.segment, &place.name, place.uid().as_deref(), &window);
-
-    match state
-        .panes
-        .ensure_current(&key, &session, &window, &transcript)
-        .await
-    {
+    match state.panes.ensure_current(&key, &session, &window).await {
         Ok(s) => tracing::debug!("Mirroring window '{}' of rmux session {}", window, s),
         Err(e) => tracing::debug!("No live '{}' pane for {}/{}: {}", window, segment, name, e),
     }
@@ -289,13 +282,14 @@ fn workspace_view(
         "parent": place.parent(),
         "decorated": place.is_decorated(),
         "vcs_tracked": place.vcs_tracked,
-        "annotations": place.annotations.as_map(),
+        "state": place.state,
         "sets": sets,
     })
 }
 
-/// Collect a `WorkspaceView` for each place. Delivery is read from cache, never refreshed here,
-/// so listing never blocks on the network.
+/// Collect a `WorkspaceView` for each place. Remote-derived sets are read from the cache and
+/// never refreshed here, so listing never blocks on the network — the single-workspace view is
+/// the write-through point that keeps those entries current.
 fn collect_views(
     registry: &PlaceRegistry,
     config: &Config,
@@ -310,7 +304,7 @@ fn collect_views(
                 &registry.workspaces,
                 plugins,
                 config,
-                CollectOptions::default(),
+                CollectOptions::cached(),
             );
             workspace_view(&place, &sets, plugins)
         })
@@ -377,16 +371,22 @@ async fn workspace_get(
     let seg = registry
         .segment(Some(&segment))
         .map_err(|_| StatusCode::NOT_FOUND)?;
-    let place = registry
+    let mut place = registry
         .require(&seg, &name)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
+    // Looking at one workspace is also when a finished agent session gets its ending written
+    // down, since nothing watches the pane for it.
+    toren_lib::sessions::settle_saved(&mut place, &state.rhai_plugins);
+
+    // One workspace at a time: this is the daemon's write-through point, so the list endpoints
+    // (and `breq list`) render metadata this refreshed rather than paying for it themselves.
     let sets = Sets::collect(
         &place,
         &registry.workspaces,
         &state.rhai_plugins,
         &state.config,
-        CollectOptions::default(),
+        CollectOptions::live(),
     );
 
     Ok(Json(json!({
@@ -396,7 +396,7 @@ async fn workspace_get(
 
 #[derive(Debug, Deserialize)]
 struct StartRequest {
-    /// Agent override, e.g. "claude" or "codex:o3". Falls back to the workspace's annotation,
+    /// Agent override, e.g. "claude" or "codex:o3". Falls back to the workspace's own agent,
     /// then the configured default.
     #[serde(default)]
     agent: Option<String>,
@@ -409,6 +409,9 @@ struct StartRequest {
     /// Resume the workspace's previous session instead of starting fresh.
     #[serde(default)]
     resume: bool,
+    /// Resume one *named* session, out of the workspace's recorded list. Implies `resume`.
+    #[serde(default)]
+    session: Option<String>,
 }
 
 async fn workspace_start(
@@ -452,11 +455,12 @@ async fn workspace_start(
         ));
     }
 
-    // Resolve agent: per-request override → workspace annotation → configured default.
+    // Resolve agent: per-request override → the workspace's own → configured default.
+    let stored = place.agent();
     let resolved = AgentSpec::resolve(
         &state.rhai_plugins,
         request.agent.as_deref(),
-        place.annotations.get_str("agent").as_deref(),
+        stored.as_ref(),
         state.config.ancillaries.agent.as_deref(),
     )
     .map_err(|e| {
@@ -471,7 +475,7 @@ async fn workspace_start(
     };
 
     // Remember the choice so a later attach or resume uses the same agent.
-    place.annotations.set_str("agent", agent.annotation());
+    place.state.set_agent(&agent.name, agent.model.as_deref());
     place.save().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -479,11 +483,23 @@ async fn workspace_start(
         )
     })?;
 
+    let resuming = request.resume || request.session.is_some();
+    let session_id = resuming
+        .then(|| {
+            toren_lib::sessions::resume_target(
+                &place,
+                &state.rhai_plugins,
+                &agent.name,
+                request.session.as_deref(),
+            )
+        })
+        .flatten();
+
     // Nothing is watching this terminal to answer permission prompts.
-    let argv = if request.resume {
-        agent.resume_argv(
+    let argv = if resuming {
+        agent.resume_argv_for(
             &state.rhai_plugins,
-            &place.path,
+            session_id.as_deref(),
             request.prompt.as_deref(),
             true,
         )
@@ -497,23 +513,19 @@ async fn workspace_start(
         )
     })?;
 
-    let transcript = toren_lib::transcripts::path(
-        &place.segment,
-        &place.name,
-        place.uid().as_deref(),
-        toren_lib::rmux::AGENT_WINDOW,
-    );
+    // Same recorder `breq do` uses, so a session started from the browser is equally resumable.
+    if let Err(e) = toren_lib::sessions::record_start(
+        &mut place,
+        &state.rhai_plugins,
+        &agent.name,
+        session_id.as_deref(),
+    ) {
+        tracing::warn!("Failed to record the agent session: {:#}", e);
+    }
 
     let session = state
         .panes
-        .start_agent(
-            &agent_key,
-            &session,
-            &place.path,
-            &place.env(),
-            &argv,
-            &transcript,
-        )
+        .start_agent(&agent_key, &session, &place.path, &place.env(), &argv)
         .await
         .map_err(|e| {
             (
@@ -526,6 +538,7 @@ async fn workspace_start(
         "success": true,
         "session": session,
         "window": toren_lib::rmux::AGENT_WINDOW,
+        "agent_session": session_id,
     })))
 }
 
@@ -586,7 +599,7 @@ async fn workspace_stop(
     let seg = registry
         .segment(Some(&segment))
         .map_err(|_| StatusCode::NOT_FOUND)?;
-    let place = registry
+    let mut place = registry
         .require(&seg, &name)
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
@@ -600,6 +613,10 @@ async fn workspace_stop(
         .stop_agent(&agent_key, &session)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // The one moment a session's end is known exactly, so snapshot it here rather than waiting
+    // for something to notice later.
+    toren_lib::sessions::settle_saved(&mut place, &state.rhai_plugins);
 
     Ok(Json(json!({ "success": true })))
 }

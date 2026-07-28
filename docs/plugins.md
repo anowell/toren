@@ -102,8 +102,9 @@ full worked example (it reads Claude's per-directory JSONL logs).
 ## Delivery resolvers (`delivery/`)
 
 A delivery resolver reports on a branch after it has left the workspace — the PR and its CI. It is
-read-only and slow (network), so breq caches its result with a timestamp and **never calls it on the
-`breq list` hot path** — only on `--refresh` or from the daemon's poll.
+read-only and slow (network), so breq writes its result into `<ws>/.toren/cache.json` with a
+timestamp and **never calls it on the `breq list` hot path** — only from a command already
+rendering that one workspace, or on `--refresh`.
 
 ```rhai
 /// ctx: #{ path, branches }  — branches are VCS-derived (e.g. "feature@origin" or "origin/feature")
@@ -122,7 +123,7 @@ fn prs(ctx) {
 ```
 
 Which delivery resolver to use is chosen by `[delivery] source` in config, or a per-workspace
-`delivery` annotation; with exactly one installed, breq uses it. See
+`delivery` resolver; with exactly one installed, breq uses it. See
 [configuration.md](configuration.md).
 
 ## Managing plugins

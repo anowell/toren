@@ -35,13 +35,11 @@ pub fn list(rows: &[(Place, Sets)], plugins: &PluginManager, show_segment: bool)
             },
             delivery: sets.delivery_summary(),
             tasks: sets.task_summary(),
-            title: sets.title(place, plugins).unwrap_or_else(|| {
-                if !place.is_decorated() {
-                    "(undecorated — `breq setup <name>` adopts it)".to_string()
-                } else {
-                    String::new()
-                }
-            }),
+            title: if place.is_decorated() {
+                sets.title(place, plugins)
+            } else {
+                "(undecorated — `breq setup <name>` adopts it)".to_string()
+            },
         })
         .collect();
 
@@ -145,17 +143,15 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
     println!("{}", header.bold());
 
     field("path", &place.path.display().to_string());
-    if let Some(title) = sets.title(place, plugins) {
-        field("title", &title);
-    }
+    field("title", &sets.title(place, plugins));
     if let Some(base) = place.base() {
         field("base", &base);
     }
     if let Some(parent) = place.parent() {
         field("parent", &parent);
     }
-    if let Some(agent) = place.annotations.get_str("agent") {
-        field("agent", &agent);
+    if let Some(agent) = place.agent() {
+        field("agent", &agent.packed());
     }
     field("age", &place.age_label());
     field("session", &place.session_name());
@@ -207,24 +203,45 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
                 task.link,
                 format!("unreadable: {}", error).red()
             ),
-            None => println!(
-                "  {}  {:<12} {}",
-                task.link,
-                task.status.as_deref().unwrap_or("-"),
-                task.title.as_deref().unwrap_or("")
-            ),
+            None => {
+                let age = match &task.age {
+                    Some(age) => format!(" (cached {})", age),
+                    None => String::new(),
+                };
+                println!(
+                    "  {}  {:<12} {}{}",
+                    task.link,
+                    task.status.as_deref().unwrap_or("-"),
+                    task.title.as_deref().unwrap_or(""),
+                    age.dimmed()
+                );
+            }
         }
     }
 
-    let plugin_keys = place.annotations.plugin_keys();
-    if !plugin_keys.is_empty() {
-        section("annotations", plugin_keys.len());
-        for key in plugin_keys {
-            let value = place
-                .annotations
-                .get(key)
-                .and_then(toren_lib::annotations::value_to_string)
-                .unwrap_or_default();
+    // The provenance list `breq do --resume <id>` reads from.
+    let sessions = place.state.sessions();
+    section("agent sessions", sessions.len());
+    for session in sessions.iter().rev() {
+        let state = match (&session.ended_at, session.exit) {
+            (None, _) => "live".to_string(),
+            (Some(_), Some(code)) => format!("exited {}", code),
+            (Some(_), None) => "ended".to_string(),
+        };
+        println!(
+            "  {:<38} {:<8} {:<10} {}",
+            session.id.as_deref().unwrap_or("(pending)"),
+            session.agent,
+            state,
+            session.title.as_deref().unwrap_or("")
+        );
+    }
+
+    let extra_keys = place.state.extra_keys();
+    if !extra_keys.is_empty() {
+        section("extra", extra_keys.len());
+        for key in extra_keys {
+            let value = place.state.get_field(key).unwrap_or_default().join(", ");
             println!("  {:<20} {}", key, value);
         }
     }
@@ -242,7 +259,7 @@ pub fn detail_json(place: &Place, sets: &Sets, plugins: &PluginManager) -> Resul
         "parent": place.parent(),
         "decorated": place.is_decorated(),
         "vcs_tracked": place.vcs_tracked,
-        "annotations": place.annotations.as_map(),
+        "state": place.state,
         "sets": sets,
     });
     Ok(serde_json::to_string_pretty(&value)?)

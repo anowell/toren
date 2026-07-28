@@ -24,8 +24,8 @@ Bring your own work-tracking system (e.g. Linear, GH Issues, [runes](https://git
 
 **Mental Model**:
 
-A **workspace is a place** — a working copy + VCS state + an rmux session + annotations. Agents run
-*in* a place; tasks and delivery (a PR, a CI run) are *annotations on* a place.
+A **workspace is a place** — a working copy + VCS state + an rmux session + its own state. Agents
+run *in* a place; tasks and delivery (a PR, a CI run) are *facts about* a place.
 
 - A segment (e.g. `app`) is a repo; its places are named `one`, `two`, ... (branch/workspace `one`)
 - A place holds one or more agents (e.g. claude) and the shell alongside them
@@ -58,7 +58,7 @@ breq init --stealth
 
 `breq init` does the out-of-box setup:
 1. Creates `toren.kdl` in your repo with auto-discovered workspace hooks (e.g. copying `node_modules`)
-2. Offers to register the repo as a segment in `~/.toren/config.toml`
+2. Offers to register the repo as a segment in `~/.toren/config.kdl`
 3. Installs the shipped workflow scripts (`breq-complete`, `breq-abort`) into `~/.toren/bin`, plus
    `breq-submit` when it detects a GitHub remote with `gh` installed
 
@@ -83,7 +83,8 @@ breq do -p <prompt>                # New (or cwd-inferred) workspace, from a pro
 breq do -w <workspace> -p <prompt> # A specific workspace
 breq do <task-id>                  # Claim a task, compose its context into the prompt
 breq do <task-id> --agent codex    # Choose the agent; --model overrides the model
-breq do --resume                   # Resume the workspace's previous agent session
+breq do --resume                   # Resume the workspace's most recent agent session
+breq do --resume=<session-id>      # ...or a specific one (`breq get <ws> agent.sessions` lists them)
 runes show tor-123 | breq do       # Prompt from stdin
 breq do -w <workspace> --force     # Replace an agent already running there
 breq do -p <prompt> --no-rmux      # Skip rmux; exec the agent directly
@@ -98,10 +99,11 @@ breq teardown <workspace> --no-delete  # ...keep the working copy, drop only bre
 
 # Read and annotate
 breq list                          # One row per workspace: sessions, changes, delivery, tasks
-breq list --all --refresh          # Every segment; refresh delivery (the only networked path)
+breq list --all --refresh          # Every segment; refresh remote metadata (the only networked path)
 breq get <workspace>               # Full detail for one place (--json for scripts)
 breq get <workspace> <key>         # One value, e.g. workspace.path, session, task.status
-breq set <workspace> title "..."   # Write an annotation
+breq get <workspace> cache.<key>   # A cached read, with its age on stderr
+breq set <workspace> title "..."   # Write a state field
 breq set <workspace> +task runes:tor-1   # Link a task (+/- for list keys)
 breq set <workspace> task.status done    # Write a task field (pass-through to the tracker)
 
@@ -111,7 +113,7 @@ breq sh <workspace> -- <cmd>       # Run a command there
 
 # Housekeeping
 breq doctor --fix                  # Detect and repair known-bad state (migrates old assignments)
-breq cleanup --all                 # Remove orphaned dirs; --transcripts <days> prunes transcripts
+breq cleanup --all                 # Remove orphaned workspace directories
 ```
 
 With [rmux](https://rmux.io/) installed, `breq do` runs the agent inside a persistent session and
@@ -197,7 +199,7 @@ All string arguments support `{{ ... }}` template variables.
 - [docs/CONCEPTS.md](docs/CONCEPTS.md) - The model: places, the two verb families, the extension census
 - [Configuration](docs/configuration.md) - Global config, proxy, delivery, tasks, and aliases
 - [Plugins](docs/plugins.md) - The task / agent / delivery resolver families and the shipped scripts
-- [Terminals](docs/terminals.md) - rmux sessions, zellij interop, and transcripts
+- [Terminals](docs/terminals.md) - rmux sessions and zellij interop
 - [Toren Daemon](daemon/README.md) - REST + WebSocket API for programmatic workspace and agent management
 - [Station](station/README.md) - Reverse proxy management for per-workspace local domains
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Technical design
