@@ -1442,6 +1442,14 @@ fn cmd_set(
         if place.state.add_to_field(list_key, &value)? {
             place.save()?;
             eprintln!("{}: +{} {}", place.name, list_key, value);
+            // The link itself is local knowledge; its title and status live in the tracker, and
+            // this is the only moment anything asks. Failing to reach the tracker leaves the
+            // link — a workspace that knows what it is for beats one that knows nothing.
+            if matches!(list_key, "task" | "tasks") {
+                if let Err(e) = toren_lib::sets::refresh_task(&place, &plugins, &value) {
+                    eprintln!("warning: could not read {}: {:#}", value, e);
+                }
+            }
         }
         return Ok(());
     }

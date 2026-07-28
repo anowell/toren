@@ -18,6 +18,7 @@
 //!   as visibly stale rather than costing a round trip each.
 //! - `breq list` is the one command that must never write, and never calls out at all.
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -543,6 +544,23 @@ pub fn cache_task(place: &Place, task: &crate::tasks::ResolvedTask) {
     }
 }
 
+/// Read one task from its source and stamp it into the workspace cache.
+///
+/// Linking a task is a write-through point: `breq list` renders from the cache and calls
+/// nothing, so the moment a link is made is the moment its fields are worth paying for. A link
+/// with nothing behind it is a row that shows an id where the task's title belongs.
+pub fn refresh_task(place: &Place, plugins: &PluginManager, link: &str) -> Result<()> {
+    let (source, id) = crate::tasks::split_link(link)
+        .with_context(|| format!("Malformed task link '{}'", link))?;
+    let ctx = PluginContext::new(
+        Some(place.segment_path.clone()),
+        Some(place.segment.clone()),
+    );
+    let task = plugins.resolve_info(&source, &id, ctx)?;
+    cache_task(place, &task);
+    Ok(())
+}
+
 fn fetch_tasks(place: &Place, plugins: &PluginManager) -> Vec<TaskView> {
     let links = place.tasks();
     if links.is_empty() {
@@ -964,5 +982,206 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sets.session_summary(), "agent:exited");
+    }
+
+    // ── The shipped runes resolver, against a stub `runes` on PATH ───────────
+    //
+    // These pin the plugin↔CLI contract: `info(id)` shells out to a binary this repo does not
+    // own, so the only honest test is a stand-in that emits the shapes the real one can emit.
+
+    /// `PATH` is process-wide, so the tests that prepend to it take turns and put it back.
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct PathGuard {
+        original: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// A plugin root holding the resolver this repo ships, and a `bin/` holding a stub `runes`
+    /// whose whole behaviour is `body`. Returns the guard that keeps `PATH` ours until dropped.
+    fn with_stub_runes(dir: &Path, body: &str) -> (PluginManager, PathGuard) {
+        let tasks = dir.join("plugins/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join("runes.rhai"),
+            include_str!("../../contrib/plugins/tasks/runes.rhai"),
+        )
+        .unwrap();
+
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("runes");
+        std::fs::write(&stub, format!("#!/bin/sh\n{}\n", body)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let lock = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Prepending only ever shadows a real `runes`; nothing else on PATH moves.
+        let original = std::env::var("PATH").ok();
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", bin.display(), original.clone().unwrap_or_default()),
+        );
+
+        (
+            PluginManager::new(&dir.join("plugins")).unwrap(),
+            PathGuard {
+                original,
+                _lock: lock,
+            },
+        )
+    }
+
+    /// What `runes show <id> --json` actually prints, trimmed to the keys the resolver reads.
+    const RUNES_SHOW_JSON: &str = r##"{"assignee":null,"description":"# breq list not accurate\n\nbody","id":"tor-mt4","kind":"task","status":"todo","title":"breq list not accurate"}"##;
+
+    #[test]
+    fn the_runes_resolver_reads_what_the_cli_prints() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plugins, _guard) = with_stub_runes(
+            dir.path(),
+            &format!("cat <<'EOF'\n{}\nEOF", RUNES_SHOW_JSON),
+        );
+
+        let task = plugins
+            .resolve_info("runes", "tor-mt4", PluginContext::default())
+            .unwrap();
+        assert_eq!(task.title, "breq list not accurate");
+        assert_eq!(task.status.as_deref(), Some("todo"));
+        assert_eq!(task.kind.as_deref(), Some("task"));
+        // A null assignee is "nobody", not a missing field.
+        assert_eq!(task.assignee.as_deref(), Some(""));
+    }
+
+    /// `runes new` prints the id, then the path and status it wrote. Only the first line is the
+    /// id, and the description has to arrive on stdin rather than as an argument.
+    #[test]
+    fn the_runes_resolver_creates_a_task_and_returns_only_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let (plugins, _guard) = with_stub_runes(
+            dir.path(),
+            &format!(
+                "printf '%s\\n' \"$@\" > {log}; cat > {log}.stdin; \
+                 printf 'tor-abc\\n/store/tor/abc--x.md\\nstatus: todo\\n'",
+                log = log.display()
+            ),
+        );
+
+        let id = plugins
+            .resolve_create("runes", "a new task", Some("the body"), Default::default())
+            .unwrap();
+        assert_eq!(id, "tor-abc");
+
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert!(argv.contains("--commit"), "{}", argv);
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("stdin")).unwrap(),
+            "the body"
+        );
+    }
+
+    /// A source that reports no title at all must leave the row alone rather than blanking it:
+    /// the title chain falls to the next rung instead of rendering an empty string.
+    #[test]
+    fn a_task_with_no_title_falls_through_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plugins, _guard) = with_stub_runes(
+            dir.path(),
+            r#"echo '{"id":"tor-mt4","kind":"task","status":"todo","assignee":null}'"#,
+        );
+
+        let mut place = place(dir.path());
+        place.state.add_task("runes", "tor-mt4");
+        place.state.title = Some("stored".into());
+
+        refresh_task(&place, &plugins, "runes:tor-mt4").unwrap();
+
+        let views = cached_tasks(&place, &Cache::load(&place.path));
+        assert_eq!(views[0].title, None);
+        assert_eq!(views[0].status.as_deref(), Some("todo"));
+
+        let sets = Sets {
+            tasks: views,
+            ..Default::default()
+        };
+        assert_eq!(sets.title(&place, &plugins), "stored");
+    }
+
+    /// `runes` resolves its store from the calling process's directory, so a resolver run from
+    /// somewhere it cannot see one fails. The failure has to reach the row as an error — a
+    /// blank status would read as "the tracker says nothing", which is a different fact.
+    #[test]
+    fn a_source_that_cannot_be_reached_says_so_on_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plugins, _guard) = with_stub_runes(
+            dir.path(),
+            "[ -f ./.runes ] || { echo 'no runes store here' >&2; exit 1; }",
+        );
+
+        let mut place = place(dir.path());
+        place.state.add_task("runes", "tor-mt4");
+
+        let err = refresh_task(&place, &plugins, "runes:tor-mt4").unwrap_err();
+        assert!(err.to_string().contains("no runes store here"), "{}", err);
+
+        // Nothing was learned, so nothing was stamped — and the live path carries the reason.
+        assert!(Cache::load(&place.path)
+            .get(&task_cache_key("runes:tor-mt4"))
+            .is_none());
+        let views = fetch_tasks(&place, &plugins);
+        assert!(views[0].error.is_some());
+        assert_eq!(views[0].status, None);
+    }
+
+    /// D17 for linking: `breq set +task` pays for the read so `breq list`, which calls nothing,
+    /// has a title to show. Without the write-through the row renders as a bare id.
+    #[test]
+    fn linking_a_task_stamps_its_fields_into_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plugins, _guard) = with_stub_runes(
+            dir.path(),
+            &format!("cat <<'EOF'\n{}\nEOF", RUNES_SHOW_JSON),
+        );
+
+        let mut place = place(dir.path());
+        place.state.add_task("runes", "tor-mt4");
+        place.state.title = Some("Testing title".into());
+
+        // What `breq list` saw before: the link is local knowledge, its fields are not.
+        let stub = cached_tasks(&place, &Cache::load(&place.path));
+        assert_eq!(stub[0].title, None);
+        assert_eq!(stub[0].status, None);
+        let sets = Sets {
+            tasks: stub,
+            ..Default::default()
+        };
+        assert_eq!(sets.title(&place, &plugins), "Testing title");
+        assert_eq!(sets.task_summary(), "runes:tor-mt4");
+
+        refresh_task(&place, &plugins, "runes:tor-mt4").unwrap();
+
+        let views = cached_tasks(&place, &Cache::load(&place.path));
+        assert_eq!(views[0].title.as_deref(), Some("breq list not accurate"));
+        assert_eq!(views[0].status.as_deref(), Some("todo"));
+        let sets = Sets {
+            tasks: views,
+            ..Default::default()
+        };
+        // Rung 1 of the title chain now outranks the stored title, as it is meant to.
+        assert_eq!(sets.title(&place, &plugins), "breq list not accurate");
+        assert_eq!(sets.task_summary(), "runes:tor-mt4(todo now)");
     }
 }

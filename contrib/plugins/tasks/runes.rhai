@@ -21,9 +21,23 @@ fn abort(id) {
 }
 
 fn create(title, desc) {
-    let args = ["new", title, "--status", "todo"];
+    // --commit: automated creation has no human to edit-then-commit the draft
+    let args = ["new", title, "--status", "todo", "--commit"];
+    let opts = #{};
     if desc != () {
         args += ["-f", "-"];
+        opts.stdin = desc;
     }
-    shell("runes", args)
+    let result = shell("runes", args, opts);
+    if result.status != 0 {
+        throw "runes new failed: " + result.stderr;
+    }
+    // runes new prints the id on the first line; path and status lines may follow
+    let id = result.stdout;
+    let nl = id.index_of('\n');
+    if nl >= 0 {
+        id = id.sub_string(0, nl);
+    }
+    id.trim();
+    id
 }

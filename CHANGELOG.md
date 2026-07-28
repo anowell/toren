@@ -110,6 +110,12 @@ crash mid-write cannot truncate the `uid` that names a live rmux session.
 - **`cache.json` is write-through**: any command already making a live call refreshes the cached copy
   on its way past, and each entry's age is rendered so a stale value reads as stale. `breq list`
   reads the cache and writes nothing, even with `--refresh`.
+- **`breq doctor --fix` finishes the move off `~/.toren/assignments.json`.** An active record whose
+  workspace is undecorated now decorates it the way `breq setup` does — adoption, hooks and all —
+  then links `<task_source>:<task_id>`, writes the recorded title as the workspace's stored one, and
+  pays for the tracker read so `breq list` shows a title rather than an id. A tracker that cannot be
+  reached keeps the link and warns. One line per workspace either way; the registry file is dropped
+  only once every record it holds has somewhere else to live.
 
 ## [Unreleased] - 2026-07-24
 
