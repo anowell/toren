@@ -170,6 +170,28 @@ export interface ShellWorkspaceResponse {
 	window: string;
 }
 
+/** The agent sessions recorded for a workspace, oldest first. */
+export interface WorkspaceSessionsResponse {
+	sessions: AgentSession[];
+	/** The agent the workspace is set to, if it has one. */
+	agent?: string | null;
+}
+
+export interface CloseWindowResponse {
+	success: boolean;
+	/** Whether the window still had a live pane, as opposed to a held one being dismissed. */
+	was_live: boolean;
+}
+
+// ── Agents ─────────────────────────────────────────────────────────────────
+
+export interface AgentsResponse {
+	/** Every agent the daemon can start, by name. */
+	agents: string[];
+	/** The configured default, which is what a start with no agent named resolves to. */
+	default?: string | null;
+}
+
 // ── Segments ───────────────────────────────────────────────────────────────
 
 export interface Segment {
@@ -200,16 +222,23 @@ export type WsResponse =
 	| { type: 'VcsStatus'; status: VcsStatus }
 	| { type: 'Error'; message: string };
 
-// ── Terminal WebSocket (raw pane bytes both ways; JSON only for control) ─────
+// ── Terminal WebSocket ──────────────────────────────────────────────────────
+//
+// Pane bytes ride binary frames both ways; JSON is control only. Frames *from* the daemon open
+// with a big-endian u32 epoch (see `$lib/terminal/frames`); frames to it are keystrokes, plain.
 
 export type TerminalWsRequest =
 	| { type: 'data'; data: string }
 	| { type: 'resize'; cols: number; rows: number }
-	| { type: 'interrupt' };
+	| { type: 'interrupt' }
+	/** Repaint me: this terminal no longer matches the pane. */
+	| { type: 'resync' }
+	| { type: 'ping' };
 
 export type TerminalWsResponse =
 	| { type: 'status'; status: string; session: string }
-	| { type: 'error'; message: string };
+	| { type: 'error'; message: string }
+	| { type: 'pong' };
 
 // ── REST auth ──────────────────────────────────────────────────────────────
 

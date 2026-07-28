@@ -1,5 +1,5 @@
 [workspace]
-members = ["lib", "daemon", "breq", "station"]
+members = ["lib", "mirror", "daemon", "breq", "station"]
 resolver = "2"
 
 [workspace.package]

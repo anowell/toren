@@ -26,8 +26,8 @@
 └────────────────────────┼────────────────────────────────────┘
                          │ Unix socket
               ┌──────────▼───────────┐
-              │     rmux daemon      │  ← `breq` and `rmux attach`
-              │  sessions / panes    │    reach the same sessions
+              │     rmux daemon      │  ← `breq` and the toren daemon
+              │  sessions / panes    │    mirror the same panes
               └──────────────────────┘
 ```
 
@@ -85,16 +85,27 @@ Trackers, agents, and forges are Rhai resolver plugins under `~/.toren/plugins/`
 
 ### Workspace terminal (`ws://localhost:8787/ws/workspaces/:segment/:name`)
 Binary frames carry raw pane bytes; text frames carry JSON control messages. On connect the client
-receives everything the pane has produced so far, then live output, with no gap between the two.
+receives a paint of the pane's screen, then live output, with no gap between the two.
+
+Frames *from* the daemon open with a big-endian `u32` epoch. Re-seeding paints the whole screen, so
+bytes from before a paint are wrong rather than late: both ends discard anything from an earlier
+epoch, and a client seeing a new one clears before applying it. Frames *to* the daemon are
+keystrokes, unprefixed.
+
+The socket is kept alive from both sides: the daemon sends protocol pings (a browser answers those
+itself) and the browser sends `ping` as JSON, since its API cannot send a protocol one.
 ```typescript
 // Requests
 { type: 'data', data: string }              // keystrokes
 { type: 'resize', cols: number, rows: number }
 { type: 'interrupt' }
+{ type: 'resync' }                          // repaint me: this terminal looks wrong
+{ type: 'ping' }
 
 // Responses
 { type: 'status', status: string, session: string }
 { type: 'error', message: string }
+{ type: 'pong' }
 ```
 
 ### REST Endpoints
@@ -104,8 +115,12 @@ receives everything the pane has produced so far, then live output, with no gap 
 - `GET /api/workspaces` - List every workspace (all segments)
 - `GET /api/workspaces/:segment` - List a segment's workspaces
 - `GET /api/workspaces/:segment/:name` - One workspace's full `WorkspaceView`
-- `POST /api/workspaces/:segment/:name/start` - Start an agent (`{ agent?, prompt?, model?, resume? }`)
+- `POST /api/workspaces/:segment/:name/start` - Start an agent (`{ agent?, prompt?, model?, resume?, session? }`)
 - `POST /api/workspaces/:segment/:name/stop` - Stop the agent
+- `POST /api/workspaces/:segment/:name/shell` - Open a new shell window
+- `GET /api/workspaces/:segment/:name/sessions` - The workspace's recorded agent sessions
+- `POST /api/workspaces/:segment/:name/windows/:window/close` - Dismiss one window (a held pane)
+- `GET /api/agents` - Agents this daemon can start, and the configured default
 
 ## Security
 

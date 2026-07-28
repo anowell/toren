@@ -2,6 +2,45 @@
 
 ## [Unreleased] - 2026-07-28
 
+### The terminal mirrors a pane instead of attaching a multiplexer
+rmux is now used **only as a server**. Nothing runs `rmux attach`: `breq do` and `breq sh` render
+one pane in the terminal they were run from — bytes out, keystrokes in, `SIGWINCH` to a resize —
+which is the same mirror the browser reads, from the same shared crate.
+
+- **No multiplexer chrome.** No prefix key, no status bar, no window list, and `exit` returns you to
+  the shell you came from with the pane's exit code. Closing the terminal leaves the pane running in
+  rmux; there is no detach chord, because every key belongs to the pane.
+- **Panes hold or close by how they were made** (not by anything inferred afterwards): a shell
+  closes when you exit it, an agent or a `breq sh <ws> -- <cmd>` command holds. A held pane grows a
+  line — `[exited 3 — <ENTER> re-run, <ESC> drop to shell, <Ctrl-c> close]` — and answers those
+  keys; on an agent pane `<ENTER>` *resumes* the session that ran there. `breq sh --hold` /
+  `--no-hold` override it in either direction, and `--no-hold` keeps `breq sh <ws> -- <cmd>` usable
+  in a pipeline, as does anything without a terminal.
+- **`breq sh <ws> --window <name>`** mirrors an existing window of the workspace's session, which is
+  how a running agent (`--window agent`) is watched from a terminal.
+
+### The web terminal is kept, and hardened
+The browser reads the same mirror the local terminal does — nothing about the streaming path was
+rebuilt — but it now recovers instead of asking you to reload.
+
+- **Resync is a repaint.** A client that fell behind used to be told "reload to resync" while the
+  daemon streamed on into a corrupted terminal; it now gets a paint of the pane's screen. Every
+  frame carries an epoch, and both ends discard anything from before the paint — which is what makes
+  that a fix rather than a race with the frames already in flight.
+- **Backpressure is counted in bytes**, not in chunks: a chunk is anywhere between a keystroke's echo
+  and a megabyte, so "512 chunks behind" measured nothing. A client more than 256 KiB behind is
+  repainted rather than sent everything it missed.
+- **Keepalive in both directions.** The daemon pings idle sockets and hangs up on a client gone
+  silent; the browser sends its own ping as JSON, since its API cannot send a protocol one. A pane
+  can go hours without a byte, so nothing else told a quiet agent apart from a connection a proxy or
+  a sleeping phone had dropped.
+- **Held panes render and act in the browser**: the exit line is drawn into the pane's bytes, so it
+  is the same line, and its three keys work there too — with buttons beside them, and a one-click
+  dismissal in the window list, since every resume leaves another held pane behind.
+- **Starting an agent names it.** "New agent" becomes one action per configured agent, and "Resume
+  Previous Session" lists what the workspace recorded — each resume opening a new pane on an old
+  session.
+
 ### State gets a schema (breaking)
 Every file toren persists now carries a `version` as its first key and is written atomically, so a
 crash mid-write cannot truncate the `uid` that names a live rmux session.

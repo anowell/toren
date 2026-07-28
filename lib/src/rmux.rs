@@ -10,7 +10,7 @@
 //! attaching to a dead one's panes.
 //!
 //! Uses the tmux-compatible CLI rather than `rmux-sdk` so `breq` works with the toren daemon down.
-//! The daemon uses the SDK where it needs byte streams; see `daemon/src/services/pane_runner.rs`.
+//! Byte streams go through the SDK instead, in `toren-mirror`, which both surfaces share.
 
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
@@ -21,6 +21,8 @@ use std::process::{Command, Stdio};
 pub const AGENT_WINDOW: &str = "agent";
 /// Window running a plain login shell in the workspace.
 pub const SHELL_WINDOW: &str = "shell";
+/// Window running a one-shot command — `breq sh <ws> -- <cmd>` and its web equivalent.
+pub const COMMAND_WINDOW: &str = "cmd";
 
 fn rmux_bin() -> String {
     std::env::var("TOREN_RMUX_BIN").unwrap_or_else(|_| "rmux".to_string())
@@ -142,8 +144,8 @@ pub fn session_exists(session: &str) -> bool {
 /// context and an in-pane `breq` needs no `-w`.
 ///
 /// The session default is `remain-on-exit off`: a shell you `exit` closes its window like any
-/// terminal. Only the agent window overrides this to `on` (see [`spawn_agent`]), because a
-/// finished or crashed agent should linger as an observable dead pane rather than vanish.
+/// terminal. Windows made from a *command* override it to `on` (see [`set_hold`]), because the
+/// output of something that ran and finished has to stay readable until it is dismissed.
 pub fn ensure_session(session: &str, cwd: &Path, env: &[(String, String)]) -> Result<()> {
     if session_exists(session) {
         return Ok(());
@@ -162,7 +164,7 @@ pub fn ensure_session(session: &str, cwd: &Path, env: &[(String, String)]) -> Re
     ])
     .with_context(|| format!("Failed to create rmux session '{}'", session))?;
 
-    // Shells close on exit; the agent window opts back into remain-on-exit for observability.
+    // Shells close on exit; agent and command windows opt back into remain-on-exit per window.
     rmux(["set-option", "-t", session, "remain-on-exit", "off"])
         .with_context(|| format!("Failed to configure rmux session '{}'", session))?;
 
@@ -240,30 +242,80 @@ pub fn run_in_window(session: &str, window: &str, cwd: &Path, argv: &[String]) -
     spawned.map(|_| ())
 }
 
-/// Run the coding agent in the session's `agent` window. Sugar over [`run_in_window`].
+/// Whether a window's pane survives the process that made it.
 ///
-/// Unlike a shell, the agent window keeps `remain-on-exit on`: a finished or crashed agent stays
-/// as a dead pane so the `exited` status is observable and the browser can still show what it did.
-/// Continuing an agent is a separate act — `breq do --resume` starts a fresh process from the
-/// agent's session id. The option is re-applied on every spawn because `run_in_window` recreates
-/// the window, which would otherwise inherit the session's `off` default.
-pub fn spawn_agent(session: &str, cwd: &Path, argv: &[String]) -> Result<()> {
-    run_in_window(session, AGENT_WINDOW, cwd, argv)?;
-    let _ = rmux([
+/// The one knob behind the hold policy: a window created from a *command* holds, so its exit
+/// status is readable and its output stays on screen until someone dismisses it; a window that is
+/// just a shell closes when you `exit` it, like any terminal. Set per window and re-applied on
+/// every spawn, because [`run_in_window`] recreates the window and a fresh one inherits the
+/// session's `off` default.
+pub fn set_hold(session: &str, window: &str, hold: bool) -> Result<()> {
+    rmux([
         "set-option",
         "-w",
         "-t",
-        &window_target(session, AGENT_WINDOW),
+        &window_target(session, window),
         "remain-on-exit",
-        "on",
-    ]);
+        if hold { "on" } else { "off" },
+    ])
+    .with_context(|| format!("Failed to set the hold policy on rmux window '{}'", window))?;
     Ok(())
 }
 
-/// Make `window` the active window of `session`, so a subsequent attach lands there.
-pub fn select_window(session: &str, window: &str) -> Result<()> {
-    rmux(["select-window", "-t", &window_target(session, window)])
-        .with_context(|| format!("Failed to select rmux window '{}'", window))?;
+/// Run the coding agent in the session's `agent` window. Sugar over [`run_in_window`].
+///
+/// Agent windows always hold: a finished or crashed agent stays as a dead pane so the `exited`
+/// status is observable, the browser can still show what it did, and its session is there to
+/// resume. Continuing an agent is a separate act — `breq do --resume`, or `<ENTER>` on the held
+/// pane — starting a fresh process from the agent's session id.
+pub fn spawn_agent(session: &str, cwd: &Path, argv: &[String]) -> Result<()> {
+    run_in_window(session, AGENT_WINDOW, cwd, argv)?;
+    let _ = set_hold(session, AGENT_WINDOW, true);
+    Ok(())
+}
+
+/// Run a one-shot command in a window of its own, returning that window's name.
+///
+/// `hold` is the caller's policy, not an inference: an interactive invocation keeps the finished
+/// command's output until it is dismissed, while a scripted one wants the pane gone with the
+/// process.
+pub fn spawn_command(session: &str, cwd: &Path, argv: &[String], hold: bool) -> Result<String> {
+    let window = next_window(session, COMMAND_WINDOW);
+    run_in_window(session, &window, cwd, argv)?;
+    let _ = set_hold(session, &window, hold);
+    Ok(window)
+}
+
+/// Whether a window is currently set to keep its pane after the process exits.
+///
+/// Read rather than inferred from the window's name: the policy was decided when the window was
+/// created, and a client adopting a window it did not create has no other way to know it.
+pub fn holds(session: &str, window: &str) -> bool {
+    rmux([
+        "show-options",
+        "-w",
+        "-t",
+        &window_target(session, window),
+        "remain-on-exit",
+    ])
+    .is_ok_and(|out| out.split_whitespace().nth(1) == Some("on"))
+}
+
+/// Run a held pane's original command again, in the pane it already has.
+///
+/// The `<ENTER>` of a held pane whose command breq does not know — one it adopted rather than
+/// spawned. rmux remembers what the pane was created with, which is the only place that survives.
+pub fn respawn_window(session: &str, window: &str, cwd: &Path) -> Result<()> {
+    let cwd = cwd.to_string_lossy().into_owned();
+    rmux([
+        "respawn-pane",
+        "-k",
+        "-t",
+        &window_target(session, window),
+        "-c",
+        &cwd,
+    ])
+    .with_context(|| format!("Failed to run rmux window '{}' again", window))?;
     Ok(())
 }
 
@@ -428,23 +480,28 @@ pub fn window_exists(session: &str, window: &str) -> bool {
         .any(|w| w == window)
 }
 
-/// The next free shell window name: `shell`, then `shell-2`, `shell-3`, …
+/// The next free window name of a kind: `shell`, then `shell-2`, `shell-3`, …
 ///
-/// Shell windows are a set, not a slot — you can have several open at once (a dev server, a log
-/// tail, a scratch prompt). Only the first keeps the bare `shell` name so existing tooling and
-/// `breq sh`'s default attach still find it.
-pub fn next_shell_window(session: &str) -> String {
+/// Shells and commands are sets, not slots — you can have several open at once (a dev server, a
+/// log tail, a scratch prompt). Only the first keeps the bare name so existing tooling and the
+/// default attach still find it.
+pub fn next_window(session: &str, base: &str) -> String {
     let existing = list_windows(session).unwrap_or_default();
-    if !existing.iter().any(|w| w == SHELL_WINDOW) {
-        return SHELL_WINDOW.to_string();
+    if !existing.iter().any(|w| w == base) {
+        return base.to_string();
     }
     for n in 2.. {
-        let candidate = format!("{}-{}", SHELL_WINDOW, n);
+        let candidate = format!("{}-{}", base, n);
         if !existing.contains(&candidate) {
             return candidate;
         }
     }
     unreachable!("the loop always returns")
+}
+
+/// The next free shell window name. See [`next_window`].
+pub fn next_shell_window(session: &str) -> String {
+    next_window(session, SHELL_WINDOW)
 }
 
 /// Open a new window running a plain login shell, returning its name.
@@ -484,13 +541,6 @@ pub fn kill_session(session: &str) -> Result<()> {
 pub fn kill_agent(session: &str) -> Result<()> {
     let _ = rmux(["kill-window", "-t", &window_target(session, AGENT_WINDOW)]);
     Ok(())
-}
-
-/// The `rmux attach` command for a session; callers `exec()` it so the TUI owns the terminal.
-pub fn attach_command(session: &str) -> Command {
-    let mut cmd = Command::new(rmux_bin());
-    cmd.args(["attach-session", "-t", session]);
-    cmd
 }
 
 fn window_target(session: &str, window: &str) -> String {
@@ -542,7 +592,7 @@ mod tests {
         );
     }
 
-    /// The sequence `breq do` performs before it execs `rmux attach`. Needs rmux installed.
+    /// The sequence `breq do` performs before it mirrors the agent's pane. Needs rmux installed.
     #[test]
     fn ensure_and_spawn_produce_the_expected_session() {
         if !is_available() {
@@ -707,6 +757,66 @@ mod tests {
         ensure_shell(&session, dir.path()).unwrap();
         assert!(window_exists(&session, SHELL_WINDOW));
         assert!(!shell_is_dead(&session), "the recreated shell is live");
+
+        kill_session(&session).unwrap();
+    }
+
+    /// The D10 policy at the level rmux enforces it: the same command holds or closes purely by
+    /// how its window was created. Needs rmux installed.
+    #[test]
+    fn a_command_window_holds_only_when_it_was_made_to() {
+        if !is_available() {
+            eprintln!("skipping: rmux not on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_name(&format!("holdtest{}", std::process::id()), "one", None);
+        ensure_session(&session, dir.path(), &[]).unwrap();
+
+        // Every run appends a line, so re-running one is observable rather than inferred.
+        let log = dir.path().join("runs");
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo ran >> {}; exit 7", log.display()),
+        ];
+        let ran = || {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+
+        // Held: the finished command stays as a dead pane, exit status and all.
+        let held = spawn_command(&session, dir.path(), &argv, true).unwrap();
+        assert_eq!(held, COMMAND_WINDOW);
+        wait_until(|| {
+            list_panes(&session)
+                .unwrap_or_default()
+                .iter()
+                .any(|p| p.window == held && p.dead)
+        });
+        let pane = list_panes(&session)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.window == held)
+            .unwrap();
+        assert_eq!(pane.exit, Some(7));
+        assert!(holds(&session, &held), "the window itself says it holds");
+
+        // `<ENTER>` on a held pane breq did not spawn: rmux remembers what the pane was made with.
+        respawn_window(&session, &held, dir.path()).unwrap();
+        wait_until(|| ran() == 2);
+
+        // Not held: the window goes with the process, and the next command gets its own.
+        let closing = spawn_command(&session, dir.path(), &argv, false).unwrap();
+        assert_eq!(closing, format!("{}-2", COMMAND_WINDOW));
+        wait_until(|| !window_exists(&session, &closing));
+        assert!(
+            window_exists(&session, &held),
+            "the held window survives it"
+        );
 
         kill_session(&session).unwrap();
     }

@@ -4,6 +4,7 @@ import { goto } from '$app/navigation';
 import { page } from '$app/stores';
 import AgentTerminal from '$lib/components/AgentTerminal.svelte';
 import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
+import SessionsModal from '$lib/components/SessionsModal.svelte';
 import TaskStatusIcon from '$lib/components/TaskStatusIcon.svelte';
 import { connectionStore } from '$lib/stores/connection';
 import {
@@ -15,17 +16,27 @@ import {
 	stripTaskPrefix,
 	torenStore,
 } from '$lib/stores/toren';
-import type { SessionInfo, WorkspaceView } from '$lib/types/toren';
+import type { HeldAction } from '$lib/terminal/held';
+import type {
+	AgentSession,
+	SessionInfo,
+	StartWorkspaceRequest,
+	WorkspaceView,
+} from '$lib/types/toren';
 
 let messageInput = '';
 let showMobilePanel = false;
 let showDetails = false;
 
 /** Typed structurally so biome doesn't see the import as type-only. */
-let terminal: { sendLine(text: string): void; interrupt(): void } | null = null;
+let terminal: { sendLine(text: string): void; interrupt(): void; resync(): void } | null = null;
 let paneStatus = 'connecting';
 let paneSession: string | null = null;
 let wsError: string | null = null;
+// Bumped whenever the pane behind an unchanged window name has been replaced — a resume, another
+// agent, or a retry after the terminal gave up. The url is the same either way, so this is the
+// only thing that can tell the terminal to leave the pane it is on.
+let attachNonce = 0;
 
 function goToSegmentSelector() {
 	torenStore.selectSegment(null);
@@ -85,6 +96,14 @@ $: if (terminalUrl) {
 	wsError = null;
 }
 
+/** Attach to whatever is in the selected window now, forgetting what was there before. */
+function reattachPane() {
+	attachNonce += 1;
+	paneStatus = 'connecting';
+	paneSession = null;
+	wsError = null;
+}
+
 $: displayStatus = currentWorkspace ? getWorkspaceDisplayStatus(currentWorkspace) : 'ready';
 $: task = currentWorkspace ? primaryTask(currentWorkspace) : null;
 $: sets = currentWorkspace?.sets;
@@ -118,6 +137,37 @@ function handleInterrupt() {
 let lifecycleLoading = false;
 let lifecycleError: string | null = null;
 let shellLoading = false;
+let dismissing: string | null = null;
+
+// The agents this daemon can start, so "New agent" names them rather than hiding the choice.
+let agents: string[] = [];
+let agentsRequested = false;
+let showAgentMenu = false;
+let agentMenu: HTMLDivElement;
+
+// The workspace's recorded sessions, loaded when the modal opens rather than with the page.
+let showSessions = false;
+let recordedSessions: AgentSession[] = [];
+let sessionsLoading = false;
+let sessionsError: string | null = null;
+let resumingId: string | null = null;
+
+$: if ($torenStore.authenticated && !agentsRequested) loadAgents();
+
+async function loadAgents() {
+	agentsRequested = true;
+	try {
+		const response = await torenStore.loadAgents($torenStore.shipUrl);
+		agents = response.agents ?? [];
+	} catch {
+		// A daemon that cannot list its agents can still start the configured default.
+		agents = [];
+	}
+}
+
+function closeAgentMenu(event: MouseEvent) {
+	if (agentMenu && !agentMenu.contains(event.target as Node)) showAgentMenu = false;
+}
 
 async function refreshCurrent(): Promise<WorkspaceView | null> {
 	if (!currentWorkspace) return null;
@@ -128,8 +178,9 @@ async function refreshCurrent(): Promise<WorkspaceView | null> {
 	);
 }
 
-async function handleStart(resume: boolean) {
-	if (!currentWorkspace || lifecycleLoading) return;
+/** Start an agent and attach to it. Returns whether it started. */
+async function startAgent(request: StartWorkspaceRequest): Promise<boolean> {
+	if (!currentWorkspace || lifecycleLoading) return false;
 	lifecycleLoading = true;
 	lifecycleError = null;
 	try {
@@ -137,15 +188,57 @@ async function handleStart(resume: boolean) {
 			$torenStore.shipUrl,
 			currentWorkspace.segment,
 			currentWorkspace.name,
-			{ resume },
+			request,
 		);
 		await refreshCurrent();
-		// The agent window now exists; attach to it.
+		// The agent window now exists; attach to it. Resuming reuses the window it held, so the
+		// terminal is told the pane changed as well — nothing about the url would say so.
 		selectWindow('agent');
+		reattachPane();
+		return true;
 	} catch (err) {
 		lifecycleError = err instanceof Error ? err.message : 'Failed to start';
+		return false;
 	} finally {
 		lifecycleLoading = false;
+	}
+}
+
+/** "New <agent> agent": a fresh session, with the agent named unless the default will do. */
+function handleNewAgent(agent?: string) {
+	showAgentMenu = false;
+	startAgent(agent ? { agent } : {});
+}
+
+async function openSessions() {
+	if (!currentWorkspace) return;
+	showSessions = true;
+	sessionsLoading = true;
+	sessionsError = null;
+	try {
+		recordedSessions = await torenStore.loadSessions(
+			$torenStore.shipUrl,
+			currentWorkspace.segment,
+			currentWorkspace.name,
+		);
+	} catch (err) {
+		sessionsError = err instanceof Error ? err.message : 'Failed to load sessions';
+	} finally {
+		sessionsLoading = false;
+	}
+}
+
+/** Resuming is a new pane on an old session, so the pane it came from stays where it was. */
+async function handleResumeSession(event: CustomEvent<{ session: AgentSession }>) {
+	const session = event.detail.session;
+	if (!session.id) return;
+	resumingId = session.id;
+	const started = await startAgent({ session: session.id, agent: session.agent });
+	resumingId = null;
+	if (started) {
+		showSessions = false;
+	} else {
+		sessionsError = lifecycleError;
 	}
 }
 
@@ -190,6 +283,70 @@ async function handleNewShell() {
 	}
 }
 
+/**
+ * The three things a held pane's status line offers, from the browser side. The line itself is
+ * drawn into the pane's bytes by the mirror, so it reads the same here as in a terminal.
+ */
+function handleHeld(event: CustomEvent<{ action: HeldAction }>) {
+	if (event.detail.action === 'primary') {
+		handleHeldPrimary();
+	} else if (event.detail.action === 'shell') {
+		dropToShell();
+	} else {
+		dismissWindow(selectedWindow);
+	}
+}
+
+/**
+ * `<ENTER>`: an agent pane resumes the session it was working — the daemon knows which. A shell
+ * pane has no command recorded anywhere the browser can reach, so it gets a fresh shell instead
+ * of a blind re-run.
+ */
+function handleHeldPrimary() {
+	if (selectedWindow === 'agent') {
+		startAgent({ resume: true });
+		return;
+	}
+	handleNewShell();
+}
+
+/** `<ESC>`: leave the dead pane for a live one, opening a shell if there is none. */
+async function dropToShell() {
+	const live = sessions.find((s) => s.window !== selectedWindow && s.status !== 'exited');
+	if (live) {
+		selectWindow(live.window);
+		return;
+	}
+	await handleNewShell();
+}
+
+/**
+ * Dismiss a window. Every resume is a new pane and a held one outlives its process on purpose, so
+ * these accumulate; getting rid of one is a click from the window list or `<Ctrl-c>` in the pane.
+ */
+async function dismissWindow(window: string | null) {
+	if (!currentWorkspace || !window || dismissing) return;
+	dismissing = window;
+	lifecycleError = null;
+	try {
+		await torenStore.closeWorkspaceWindow(
+			$torenStore.shipUrl,
+			currentWorkspace.segment,
+			currentWorkspace.name,
+			window,
+		);
+		const ws = await refreshCurrent();
+		if (selectedWindow === window) {
+			const left = (ws?.sets.sessions ?? []).filter((s) => s.window !== window);
+			selectedWindow = defaultWindowName(left);
+		}
+	} catch (err) {
+		lifecycleError = err instanceof Error ? err.message : 'Failed to dismiss';
+	} finally {
+		dismissing = null;
+	}
+}
+
 function toggleMobilePanel() {
 	showMobilePanel = !showMobilePanel;
 }
@@ -204,9 +361,25 @@ function navigateToWorkspace(ws: WorkspaceView) {
 }
 
 $: attached = paneStatus === 'attached';
+// Only the daemon's own verdict holds a pane: a socket that gave up says nothing about the process
+// behind it, and treating that as held would rebind the keys over a pane that is still running.
 $: paneEnded = paneStatus === 'ended';
+$: paneUnreachable = paneStatus === 'unreachable';
 $: isWorking = displayStatus === 'busy';
 </script>
+
+<svelte:window on:click={closeAgentMenu} />
+
+{#if showSessions}
+	<SessionsModal
+		sessions={recordedSessions}
+		loading={sessionsLoading}
+		error={sessionsError}
+		busyId={resumingId}
+		on:resume={handleResumeSession}
+		on:close={() => (showSessions = false)}
+	/>
+{/if}
 
 <div class="workspace-view">
 	<!-- Header -->
@@ -259,8 +432,40 @@ $: isWorking = displayStatus === 'busy';
 				{#if isWorking}
 					<button class="action-btn stop" on:click={handleStop} disabled={lifecycleLoading} title="Stop agent">Stop</button>
 				{:else}
-					<button class="action-btn start" on:click={() => handleStart(false)} disabled={lifecycleLoading} title="Start agent">Start</button>
-					<button class="action-btn resume" on:click={() => handleStart(true)} disabled={lifecycleLoading} title="Resume agent">Resume</button>
+					<div class="agent-menu" bind:this={agentMenu}>
+						{#if agents.length > 1}
+							<button
+								class="action-btn start"
+								on:click={() => (showAgentMenu = !showAgentMenu)}
+								disabled={lifecycleLoading}
+								aria-expanded={showAgentMenu}
+								title="Start a new agent session"
+							>New agent ▾</button>
+							{#if showAgentMenu}
+								<div class="agent-menu-list">
+									{#each agents as agent (agent)}
+										<button class="agent-menu-item" on:click={() => handleNewAgent(agent)}>
+											New {agent} agent
+										</button>
+									{/each}
+								</div>
+							{/if}
+						{:else}
+							<!-- One agent, or a daemon that could not list them: the default is the choice. -->
+							<button
+								class="action-btn start"
+								on:click={() => handleNewAgent(agents[0])}
+								disabled={lifecycleLoading}
+								title="Start a new agent session"
+							>{agents.length === 1 ? `New ${agents[0]} agent` : 'New agent'}</button>
+						{/if}
+					</div>
+					<button
+						class="action-btn resume"
+						on:click={openSessions}
+						disabled={lifecycleLoading}
+						title="Resume one of this workspace's recorded sessions"
+					>Resume Previous Session</button>
 				{/if}
 				{#if lifecycleError}
 					<span class="lifecycle-error">{lifecycleError}</span>
@@ -271,17 +476,22 @@ $: isWorking = displayStatus === 'busy';
 		<!-- Sessions (rmux windows): click to attach the terminal to that window -->
 		<div class="sessions-bar">
 			{#each sessions as s (s.window)}
-				<button
-					class="session-chip"
-					class:active={s.window === selectedWindow}
-					on:click={() => selectWindow(s.window)}
-					title={s.command}
-				>
-					<span class="chip-dot status-{s.status}"></span>
-					<span class="chip-name mono">{s.window}</span>
-					<span class="chip-status">{sessionLabel(s)}</span>
-					<span class="chip-cmd mono">{s.command}</span>
-				</button>
+				<div class="session-chip" class:active={s.window === selectedWindow} class:held={s.status === 'exited'}>
+					<button class="chip-main" on:click={() => selectWindow(s.window)} title={s.command}>
+						<span class="chip-dot status-{s.status}"></span>
+						<span class="chip-name mono">{s.window}</span>
+						<span class="chip-status">{sessionLabel(s)}</span>
+						<span class="chip-cmd mono">{s.command}</span>
+					</button>
+					<!-- Held panes accumulate — every resume leaves one — so dismissal is one click. -->
+					<button
+						class="chip-close"
+						on:click={() => dismissWindow(s.window)}
+						disabled={dismissing === s.window}
+						title="Dismiss {s.window}"
+						aria-label="Dismiss {s.window}"
+					>×</button>
+				</div>
 			{/each}
 			<button
 				class="session-chip new-shell"
@@ -387,24 +597,42 @@ $: isWorking = displayStatus === 'busy';
 				<p>No workspace named "{nameParam}" in this segment.</p>
 			</div>
 		{:else}
-			{#if wsError}
-				<div class="terminal-banner error">{wsError}</div>
+			{#if paneUnreachable}
+				<!-- The pane is very likely fine; it is the daemon between here and it that is not. -->
+				<div class="terminal-banner error">
+					Lost contact with this pane.
+					<button class="banner-btn" on:click={reattachPane}>Retry</button>
+				</div>
+			{:else if wsError}
+				<div class="terminal-banner error">
+					{wsError}
+					<button class="banner-btn" on:click={() => terminal?.resync()}>Resync</button>
+				</div>
 			{:else if paneEnded}
+				<!-- The pane draws its own exit line; these are the same three keys, for a mouse. -->
 				<div class="terminal-banner">
-					Agent session ended. Start or resume to launch a new one; the transcript above is what it left behind.
+					This pane has exited and is being held.
+					<button class="banner-btn" on:click={handleHeldPrimary}>
+						{selectedWindow === 'agent' ? 'Resume session' : 'New shell'}
+					</button>
+					<button class="banner-btn" on:click={dropToShell}>Drop to shell</button>
+					<button class="banner-btn" on:click={() => dismissWindow(selectedWindow)} disabled={dismissing !== null}>Dismiss</button>
 				</div>
 			{:else if !attached}
 				<div class="terminal-banner">Attaching to {currentWorkspace.name}{selectedWindow ? ` · ${selectedWindow}` : ''}...</div>
 			{:else if paneSession}
 				<div class="terminal-banner">
-					Attached to <code>{paneSession}</code> — <code>rmux attach -t {paneSession}</code> for the same pane in a terminal
+					Attached to <code>{paneSession}</code>{#if selectedWindow} · <code>{selectedWindow}</code>{/if} — the same pane a local mirror shows
 				</div>
 			{/if}
 			<AgentTerminal
 				bind:this={terminal}
 				url={terminalUrl}
+				{attachNonce}
+				held={paneEnded}
 				on:status={handleTerminalStatus}
 				on:error={handleTerminalError}
+				on:held={handleHeld}
 			/>
 		{/if}
 	</div>
@@ -687,6 +915,39 @@ $: isWorking = displayStatus === 'busy';
 		opacity: 0.85;
 	}
 
+	.agent-menu {
+		position: relative;
+	}
+
+	.agent-menu-list {
+		position: absolute;
+		top: calc(100% + 4px);
+		right: 0;
+		min-width: 180px;
+		background: var(--color-bg-secondary);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+		z-index: 100;
+		overflow: hidden;
+	}
+
+	.agent-menu-item {
+		display: block;
+		width: 100%;
+		padding: var(--spacing-sm) var(--spacing-md);
+		background: none;
+		border: none;
+		color: var(--color-text);
+		font-size: 0.85rem;
+		text-align: left;
+		cursor: pointer;
+	}
+
+	.agent-menu-item:hover {
+		background: var(--color-bg-tertiary);
+	}
+
 	.lifecycle-error {
 		font-size: 0.7rem;
 		color: var(--color-error);
@@ -830,6 +1091,41 @@ $: isWorking = displayStatus === 'busy';
 		color: var(--color-text);
 	}
 
+	.session-chip.held {
+		border-style: dashed;
+	}
+
+	.chip-main {
+		display: flex;
+		align-items: center;
+		gap: var(--spacing-xs);
+		background: none;
+		border: none;
+		padding: 0;
+		color: inherit;
+		font-size: inherit;
+		cursor: pointer;
+	}
+
+	.chip-close {
+		background: none;
+		border: none;
+		padding: 0 2px;
+		color: var(--color-text-secondary);
+		font-size: 0.9rem;
+		line-height: 1;
+		cursor: pointer;
+	}
+
+	.chip-close:hover:not(:disabled) {
+		color: var(--color-error);
+	}
+
+	.chip-close:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
 	.session-chip.active {
 		border-color: var(--color-primary);
 		background: var(--color-bg-tertiary);
@@ -905,6 +1201,26 @@ $: isWorking = displayStatus === 'busy';
 
 	.terminal-banner.error {
 		color: var(--color-error);
+	}
+
+	.banner-btn {
+		margin-left: var(--spacing-xs);
+		padding: 1px 8px;
+		background: var(--color-bg-tertiary);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-sm);
+		color: var(--color-text);
+		font-size: 0.7rem;
+		cursor: pointer;
+	}
+
+	.banner-btn:hover:not(:disabled) {
+		border-color: var(--color-primary);
+	}
+
+	.banner-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
 	.terminal-banner code {

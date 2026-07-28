@@ -14,7 +14,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::ancillary::AncillaryManager;
 use crate::security::SecurityContext;
-use crate::services::pane_runner::{PaneRunner, PaneStatus};
+use crate::services::pane_runner::PaneRunner;
 use crate::services::Services;
 use toren_lib::{
     AgentSpec, CollectOptions, Config, Place, PlaceRegistry, SegmentManager, Sets, WorkspaceManager,
@@ -76,6 +76,7 @@ pub async fn serve(
         .route("/api/fs/list", post(handlers::fs_list))
         .route("/api/vcs/status", post(handlers::vcs_status))
         .route("/api/vcs/diff", post(handlers::vcs_diff))
+        .route("/api/agents", get(agents_list))
         .route("/api/ancillaries/list", get(ancillaries_list))
         .route("/api/segments/list", get(segments_list))
         .route("/api/segments/create", post(segments_create))
@@ -90,6 +91,14 @@ pub async fn serve(
         .route(
             "/api/workspaces/:segment/:name/shell",
             post(workspace_open_shell),
+        )
+        .route(
+            "/api/workspaces/:segment/:name/sessions",
+            get(workspace_sessions),
+        )
+        .route(
+            "/api/workspaces/:segment/:name/windows/:window/close",
+            post(workspace_close_window),
         )
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -217,6 +226,15 @@ async fn adopt_current_pane(
     }
 
     key
+}
+
+/// The agents this daemon can start, so the browser offers one action per agent ("New Claude
+/// agent") rather than a single button that hides which one it means.
+async fn agents_list(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "agents": state.rhai_plugins.list_agents(),
+        "default": state.config.ancillaries.agent,
+    }))
 }
 
 async fn ancillaries_list(State(state): State<AppState>) -> impl IntoResponse {
@@ -447,7 +465,7 @@ async fn workspace_start(
         .panes
         .status(&session, toren_lib::rmux::AGENT_WINDOW)
         .await
-        == PaneStatus::Working
+        == toren_mirror::PaneLiveness::Running
     {
         return Err((
             StatusCode::CONFLICT,
@@ -585,6 +603,68 @@ async fn workspace_open_shell(
         "session": session,
         "window": window,
     })))
+}
+
+/// The agent sessions recorded for a workspace, oldest first, straight out of `state.json`.
+///
+/// Separate from the workspace view because picking a session to resume should not pay for the
+/// task and PR round trips that view makes: this is a file read.
+async fn workspace_sessions(
+    State(state): State<AppState>,
+    Path((segment, name)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let registry = PlaceRegistry::new(&state.config).map_err(|e| {
+        tracing::error!("Failed to build place registry: {:#}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let seg = registry
+        .segment(Some(&segment))
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let place = registry
+        .require(&seg, &name)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    Ok(Json(json!({
+        "sessions": place.state.sessions(),
+        "agent": place.state.agent.as_ref().map(|a| a.name.clone()),
+    })))
+}
+
+/// Dismiss one window of a workspace's session — the browser's `<Ctrl-c>` on a held pane.
+///
+/// Every resume is a new pane and a held one outlives its process on purpose, so a workspace
+/// accumulates them; getting rid of one has to cost a single click.
+async fn workspace_close_window(
+    State(state): State<AppState>,
+    Path((segment, name, window)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let registry = PlaceRegistry::new(&state.config).map_err(|e| {
+        tracing::error!("Failed to build place registry: {:#}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let seg = registry
+        .segment(Some(&segment))
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let mut place = registry
+        .require(&seg, &name)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let session = place.session_name();
+    let key = window_key(&session, &window);
+    let was_live = state
+        .panes
+        .close_window(&key, &session, &window)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Dismissing the agent's pane is the last chance to read what its session ended as.
+    if window == toren_lib::rmux::AGENT_WINDOW {
+        toren_lib::sessions::settle_saved(&mut place, &state.rhai_plugins);
+    }
+
+    Ok(Json(json!({ "success": true, "was_live": was_live })))
 }
 
 async fn workspace_stop(

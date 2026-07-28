@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 toren-lib = { path = "../lib" }
+# The pane mirror the browser terminals read; `breq` reads the same one locally.
+toren-mirror = { path = "../mirror" }
 
 # Terminal multiplexer backing the agent panes the web UI mirrors
 rmux-sdk = "0.9"

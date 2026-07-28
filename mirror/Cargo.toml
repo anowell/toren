@@ -1,0 +1,14 @@
+[package]
+name = "toren-mirror"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# The pane host. Every byte in and out of a mirror crosses this SDK.
+rmux-sdk = "0.9"
+
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

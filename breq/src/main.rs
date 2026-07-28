@@ -21,12 +21,14 @@ use toren_lib::{
     AgentSpec, CollectOptions, Config, Family, Place, PlaceRegistry, PluginContext, PluginManager,
     Segment, Sets,
 };
+use toren_mirror::PaneRole;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
+mod mirror;
 mod render;
 
 /// Custom time formatter that displays only HH:MM:SS (UTC)
@@ -133,13 +135,26 @@ enum Commands {
         #[arg(long)]
         hook: Option<HookArg>,
 
+        /// Mirror an existing window of the workspace's session instead of a shell
+        /// (`agent`, `shell-2`, `cmd`, …)
+        #[arg(long, conflicts_with = "cmd")]
+        window: Option<String>,
+
         /// Segment to use
         #[arg(short, long)]
         segment: Option<String>,
 
-        /// Exec directly instead of attaching to the workspace's rmux session
+        /// Exec directly instead of mirroring a pane of the workspace's rmux session
         #[arg(long = "no-rmux")]
         no_rmux: bool,
+
+        /// Keep the pane after the process exits, waiting for a key
+        #[arg(long, overrides_with = "no_hold")]
+        hold: bool,
+
+        /// Let the pane close with the process, the way a shell does
+        #[arg(long = "no-hold", overrides_with = "hold")]
+        no_hold: bool,
 
         /// Command to run in the workspace directory (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -316,6 +331,8 @@ fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
+                // Stdout belongs to the pane mirror, which paints a raw-mode screen onto it.
+                .with_writer(std::io::stderr)
                 .with_target(false)
                 .with_timer(ShortTime)
                 .with_filter(LevelFilter::from_level(log_level)),
@@ -355,10 +372,24 @@ fn main() -> Result<()> {
         Commands::Shell {
             workspace,
             hook,
+            window,
             segment,
             no_rmux,
+            hold,
+            no_hold,
             cmd,
-        } => cmd_shell(&config, workspace, hook, segment.as_deref(), no_rmux, cmd),
+        } => cmd_shell(
+            &config,
+            ShellArgs {
+                workspace,
+                hook,
+                window,
+                segment,
+                no_rmux,
+                hold: resolve_hold(hold, no_hold),
+                cmd,
+            },
+        ),
         Commands::Setup {
             workspace,
             from,
@@ -621,7 +652,14 @@ fn cmd_do(config: &Config, args: DoArgs) -> Result<()> {
         ),
         None => eprintln!("Starting {} in {}\n", agent, place.path.display()),
     }
-    launch(&place, &argv, args.no_rmux, args.force, &args.passthrough)
+    launch(
+        &place,
+        &agent,
+        &argv,
+        args.no_rmux,
+        args.force,
+        &args.passthrough,
+    )
 }
 
 /// Resolve a `task-id` or `source:task-id` through the task resolvers.
@@ -686,11 +724,13 @@ fn read_piped_prompt() -> Result<Option<String>> {
 
 /// Hand the terminal to the agent.
 ///
-/// Inside rmux the agent runs in the session's `agent` window and we exec `rmux attach`, so
-/// the TUI experience is unchanged but detaching leaves it running and the browser can attach
-/// to the same pane.
+/// Inside rmux the agent runs in the session's `agent` window and this terminal becomes a mirror
+/// of that pane — no multiplexer chrome, but the agent survives closing the terminal and the
+/// browser shows the same pane. Without a terminal to draw in there is nothing to mirror, so the
+/// agent is left running and where to find it is reported instead.
 fn launch(
     place: &Place,
+    agent: &AgentSpec,
     argv: &[String],
     no_rmux: bool,
     force: bool,
@@ -703,7 +743,7 @@ fn launch(
         let session = place.session_name();
 
         // Sessions from a previous incarnation of this slot point at a directory that no
-        // longer exists; never attach to one.
+        // longer exists; never mirror one.
         let killed =
             toren_lib::rmux::reconcile(&place.segment, &place.name, place.uid().as_deref());
         if killed > 0 {
@@ -714,8 +754,8 @@ fn launch(
         if !force && toren_lib::rmux::agent_is_running(&session) {
             anyhow::bail!(
                 "An agent is already running in workspace '{}'.\n  \
-                 Attach to it:  breq sh {}\n  \
-                 Replace it:    breq do -w {} --force ...",
+                 Watch it:    breq sh {} --window agent\n  \
+                 Replace it:  breq do -w {} --force ...",
                 place.name,
                 place.name,
                 place.name,
@@ -725,12 +765,36 @@ fn launch(
         toren_lib::rmux::ensure_session(&session, &place.path, &place.env())?;
         toren_lib::rmux::spawn_agent(&session, &place.path, &argv)?;
 
+        if !mirror::owns_terminal() {
+            eprintln!(
+                "rmux session: {} (no terminal here to mirror it in)",
+                session
+            );
+            return Ok(());
+        }
+
         eprintln!(
-            "rmux session: {} (detach leaves the agent running)\n",
+            "rmux session: {} (closing this terminal leaves the agent running)\n",
             session
         );
-        let err = toren_lib::rmux::attach_command(&session).exec();
-        return Err(err).context(format!("Failed to attach to rmux session '{}'", session));
+
+        // `<ENTER>` on the held pane resumes the session the agent leaves behind rather than
+        // starting it cold — the one place toren's held pane beats a blind re-run.
+        let spec = agent.clone();
+        let passthrough = passthrough.to_vec();
+        let rerun: mirror::Rerun =
+            Box::new(move |place: &Place| resume_agent(place, &spec, &passthrough));
+
+        let code = mirror::run(
+            place,
+            mirror::Pane {
+                window: toren_lib::rmux::AGENT_WINDOW.to_string(),
+                role: PaneRole::Agent,
+                hold: true,
+            },
+            rerun,
+        )?;
+        std::process::exit(code);
     }
 
     let mut cmd = Command::new(&argv[0]);
@@ -742,46 +806,81 @@ fn launch(
     Err(err).context(format!("Failed to exec {}", argv[0]))
 }
 
+/// Start the agent again on the session that just ended, in the same window.
+///
+/// The held pane is what makes this reachable, and the session record is what makes it a *resume*
+/// rather than a fresh start: the run that just finished is settled first, so the id it wrote is
+/// the one continued.
+fn resume_agent(place: &Place, agent: &AgentSpec, passthrough: &[String]) -> Result<()> {
+    let plugins = plugins()?;
+    let mut place = place.clone();
+    toren_lib::sessions::settle_saved(&mut place, &plugins);
+
+    let session_id = toren_lib::sessions::resume_target(&place, &plugins, &agent.name, None);
+    let mut argv = agent.resume_argv_for(&plugins, session_id.as_deref(), None, false)?;
+    argv.extend(passthrough.iter().cloned());
+
+    toren_lib::sessions::record_start(&mut place, &plugins, &agent.name, session_id.as_deref())?;
+    toren_lib::rmux::spawn_agent(&place.session_name(), &place.path, &argv)
+}
+
 // ─── shell ──────────────────────────────────────────────────────────────────
 
-fn cmd_shell(
-    config: &Config,
+struct ShellArgs {
     workspace: Option<String>,
     hook: Option<HookArg>,
-    segment_name: Option<&str>,
+    /// An existing window to mirror, rather than a shell of one's own.
+    window: Option<String>,
+    segment: Option<String>,
     no_rmux: bool,
+    /// `None` — decide by context; `Some` — what the flags said (D18).
+    hold: Option<bool>,
     cmd: Vec<String>,
-) -> Result<()> {
-    let registry = PlaceRegistry::new(config)?;
+}
 
-    if let Some(hook_type) = hook {
+fn cmd_shell(config: &Config, args: ShellArgs) -> Result<()> {
+    let registry = PlaceRegistry::new(config)?;
+    let segment_name = args.segment.as_deref();
+
+    if let Some(hook_type) = args.hook {
         return run_hook(&registry, hook_type);
     }
 
     // No workspace and no command: make one and drop into it.
-    if workspace.is_none() && cmd.is_empty() && registry.resolve_from_env().is_none() {
+    if args.workspace.is_none()
+        && args.cmd.is_empty()
+        && args.window.is_none()
+        && registry.resolve_from_env().is_none()
+    {
         let segment = registry.segment(segment_name)?;
         let place = registry.create(&segment, None, None, config.ancillaries.max_per_segment)?;
         eprintln!("Created workspace: {}", place.path.display());
         println!("{}", place.path.display());
-        return launch_shell(&place, no_rmux);
+        return launch_shell(&place, args.no_rmux, args.hold);
     }
 
-    let place = require_place(&registry, workspace.as_deref(), segment_name)?;
+    let place = require_place(&registry, args.workspace.as_deref(), segment_name)?;
 
-    if cmd.is_empty() {
+    if let Some(window) = args.window {
+        return watch_window(&place, &window, args.hold);
+    }
+
+    if args.cmd.is_empty() {
         println!("{}", place.path.display());
-        return launch_shell(&place, no_rmux);
+        return launch_shell(&place, args.no_rmux, args.hold);
     }
 
-    let (program, args) = (cmd[0].clone(), cmd[1..].to_vec());
-    let mut command = Command::new(&program);
-    command.args(&args).current_dir(&place.path);
-    for (key, value) in place.env() {
-        command.env(key, value);
+    launch_command(&place, &args.cmd, args.no_rmux, args.hold)
+}
+
+/// `--hold` / `--no-hold` as the overriding pair D18 describes: `None` is "decide by context",
+/// which is what makes the context-sensitive default expressible instead of hidden.
+fn resolve_hold(hold: bool, no_hold: bool) -> Option<bool> {
+    match (hold, no_hold) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
     }
-    let err = command.exec();
-    Err(err).with_context(|| format!("Failed to exec: {}", program))
 }
 
 fn run_hook(registry: &PlaceRegistry, hook: HookArg) -> Result<()> {
@@ -813,18 +912,40 @@ fn run_hook(registry: &PlaceRegistry, hook: HookArg) -> Result<()> {
     Ok(())
 }
 
-/// Attach to the session's `shell` window, so the shell sits alongside the agent rather than
-/// being an unrelated subprocess.
-fn launch_shell(place: &Place, no_rmux: bool) -> Result<()> {
-    if !no_rmux && toren_lib::rmux::is_available() {
+/// Mirror the session's `shell` window, so the shell sits alongside the agent rather than being
+/// an unrelated subprocess.
+///
+/// This is the "feels exactly like `zsh`" case: no chrome, and `exit` closes the pane and returns
+/// you to the shell you came from. `--hold` opts into keeping the finished pane, which is only
+/// worth doing when you want to see how the shell ended.
+fn launch_shell(place: &Place, no_rmux: bool, hold: Option<bool>) -> Result<()> {
+    if !no_rmux && toren_lib::rmux::is_available() && mirror::owns_terminal() {
         let session = place.session_name();
         toren_lib::rmux::reconcile(&place.segment, &place.name, place.uid().as_deref());
         toren_lib::rmux::ensure_session(&session, &place.path, &place.env())?;
         toren_lib::rmux::ensure_shell(&session, &place.path)?;
-        toren_lib::rmux::select_window(&session, toren_lib::rmux::SHELL_WINDOW)?;
 
-        let err = toren_lib::rmux::attach_command(&session).exec();
-        return Err(err).context(format!("Failed to attach to rmux session '{}'", session));
+        let hold = hold.unwrap_or(false);
+        let window = toren_lib::rmux::SHELL_WINDOW.to_string();
+        toren_lib::rmux::set_hold(&session, &window, hold)?;
+
+        // A window recreated by a re-run inherits the session's default, so the policy is applied
+        // again rather than assumed to have survived.
+        let rerun: mirror::Rerun = Box::new(move |place: &Place| {
+            let session = place.session_name();
+            toren_lib::rmux::ensure_shell(&session, &place.path)?;
+            toren_lib::rmux::set_hold(&session, toren_lib::rmux::SHELL_WINDOW, hold)
+        });
+        let code = mirror::run(
+            place,
+            mirror::Pane {
+                window,
+                role: PaneRole::Shell,
+                hold,
+            },
+            rerun,
+        )?;
+        std::process::exit(code);
     }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -835,6 +956,111 @@ fn launch_shell(place: &Place, no_rmux: bool) -> Result<()> {
     }
     let err = cmd.exec();
     Err(err).context("Failed to exec shell")
+}
+
+/// Mirror a window of the workspace's session that something else created.
+///
+/// How a running agent is reached from a terminal: `breq do` mirrors the agent it spawns, and this
+/// mirrors the one already there — started from another terminal, or from the browser. The hold
+/// policy is read from the window rather than guessed from its name, because it was decided when
+/// the window was created and nothing here is entitled to a second opinion.
+fn watch_window(place: &Place, window: &str, hold: Option<bool>) -> Result<()> {
+    let session = place.session_name();
+    if !toren_lib::rmux::is_available() || !toren_lib::rmux::window_exists(&session, window) {
+        let open = toren_lib::rmux::list_windows(&session).unwrap_or_default();
+        anyhow::bail!(
+            "Workspace '{}' has no '{}' window running.{}",
+            place.name,
+            window,
+            match open.is_empty() {
+                true => String::new(),
+                false => format!("\n  Open windows: {}", open.join(", ")),
+            }
+        );
+    }
+    if !mirror::owns_terminal() {
+        anyhow::bail!("There is no terminal here to mirror '{}' in", window);
+    }
+
+    let role = match window == toren_lib::rmux::AGENT_WINDOW {
+        true => PaneRole::Agent,
+        false => PaneRole::Shell,
+    };
+    let rerun: mirror::Rerun = match place.agent().filter(|_| role == PaneRole::Agent) {
+        // A held agent pane knows which session ran in it, so `<ENTER>` continues that one.
+        Some(agent) => Box::new(move |place: &Place| resume_agent(place, &agent, &[])),
+        // Anything else: rmux remembers what the pane was created with, which is the only record
+        // of it that exists — breq did not spawn this window and has no argv of its own.
+        None => {
+            let window = window.to_string();
+            Box::new(move |place: &Place| {
+                toren_lib::rmux::respawn_window(&place.session_name(), &window, &place.path)
+            })
+        }
+    };
+
+    let code = mirror::run(
+        place,
+        mirror::Pane {
+            window: window.to_string(),
+            role,
+            hold: hold.unwrap_or_else(|| toren_lib::rmux::holds(&session, window)),
+        },
+        rerun,
+    )?;
+    std::process::exit(code);
+}
+
+/// Run a command in the workspace, either as a pane of its own or as a direct child.
+///
+/// A command that finished is worth keeping on screen until it is dismissed, so with a terminal
+/// to draw in it gets a held pane of its own (D10). `--no-hold` — and anything without a terminal,
+/// which is every pipeline — runs it as a direct child instead, so `breq sh <ws> -- <cmd>` still
+/// composes: real stdout, real exit code, nothing to dismiss.
+fn launch_command(place: &Place, cmd: &[String], no_rmux: bool, hold: Option<bool>) -> Result<()> {
+    let mirrored = !no_rmux
+        && hold != Some(false)
+        && toren_lib::rmux::is_available()
+        && mirror::owns_terminal();
+
+    if mirrored {
+        let session = place.session_name();
+        toren_lib::rmux::reconcile(&place.segment, &place.name, place.uid().as_deref());
+        toren_lib::rmux::ensure_session(&session, &place.path, &place.env())?;
+        let window = toren_lib::rmux::spawn_command(&session, &place.path, cmd, true)?;
+
+        // The re-run mints a new pane rather than respawning this one, so a browser mirroring the
+        // window is handed over to it — and the fresh window is told to hold, which it would
+        // otherwise inherit from the session as `off`.
+        let rerun: mirror::Rerun = {
+            let window = window.clone();
+            let cmd = cmd.to_vec();
+            Box::new(move |place: &Place| {
+                let session = place.session_name();
+                toren_lib::rmux::run_in_window(&session, &window, &place.path, &cmd)?;
+                toren_lib::rmux::set_hold(&session, &window, true)
+            })
+        };
+        let code = mirror::run(
+            place,
+            mirror::Pane {
+                window,
+                role: PaneRole::Shell,
+                hold: true,
+            },
+            rerun,
+        )?;
+        std::process::exit(code);
+    }
+
+    let (program, args) = (cmd[0].clone(), cmd[1..].to_vec());
+    let mut command = Command::new(&program);
+    command.args(&args).current_dir(&place.path);
+    for (key, value) in place.env() {
+        command.env(key, value);
+    }
+    let err = command.exec();
+    Err(err).with_context(|| format!("Failed to exec: {}", program))
 }
 
 // ─── setup ──────────────────────────────────────────────────────────────────
@@ -1832,6 +2058,53 @@ fn http_agent() -> ureq::Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hold_of(args: &[&str]) -> Option<bool> {
+        match Cli::try_parse_from(args).expect("parses").command {
+            Commands::Shell { hold, no_hold, .. } => resolve_hold(hold, no_hold),
+            _ => panic!("expected `sh`"),
+        }
+    }
+
+    #[test]
+    fn hold_is_left_to_context_until_it_is_asked_for() {
+        assert_eq!(hold_of(&["breq", "sh", "one"]), None);
+        assert_eq!(hold_of(&["breq", "sh", "one", "--", "make", "test"]), None);
+    }
+
+    #[test]
+    fn an_explicit_hold_flag_wins_in_both_directions() {
+        assert_eq!(hold_of(&["breq", "sh", "one", "--hold"]), Some(true));
+        assert_eq!(
+            hold_of(&["breq", "sh", "one", "--no-hold", "--", "make", "test"]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn the_last_hold_flag_wins_rather_than_the_parse_failing() {
+        assert_eq!(
+            hold_of(&["breq", "sh", "one", "--hold", "--no-hold"]),
+            Some(false)
+        );
+        assert_eq!(
+            hold_of(&["breq", "sh", "one", "--no-hold", "--hold"]),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_command_still_reaches_the_workspace_whole() {
+        let Commands::Shell { workspace, cmd, .. } =
+            Cli::try_parse_from(["breq", "sh", "one", "--", "grep", "-rn", "--color", "x"])
+                .expect("parses")
+                .command
+        else {
+            panic!("expected `sh`");
+        };
+        assert_eq!(workspace.as_deref(), Some("one"));
+        assert_eq!(cmd, vec!["grep", "-rn", "--color", "x"]);
+    }
 
     #[test]
     fn adding_a_segment_keeps_the_rest_of_the_file() {

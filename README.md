@@ -43,8 +43,8 @@ cargo install --git https://github.com/anowell/toren breq
 ```
 
 Optionally install [rmux](https://rmux.io/) as well. Agents then run inside persistent rmux
-sessions, so detaching leaves them running and the same session is attachable from the toren web
-UI. Without rmux, `breq` execs the agent directly as before. See
+sessions, so closing the terminal leaves them running and the same pane is mirrored in the toren
+web UI. Without rmux, `breq` execs the agent directly as before. See
 [docs/terminals.md](docs/terminals.md).
 
 ## Getting Started
@@ -117,8 +117,9 @@ breq cleanup --all                 # Remove orphaned workspace directories
 ```
 
 With [rmux](https://rmux.io/) installed, `breq do` runs the agent inside a persistent session and
-attaches you to it — detaching leaves the agent running, and the same session is attachable from
-the toren web UI. See [docs/terminals.md](docs/terminals.md).
+mirrors that pane in your terminal — no multiplexer chrome, and closing the terminal leaves the
+agent running, showing the same pane in the toren web UI. See
+[docs/terminals.md](docs/terminals.md).
 
 ### Workflow verbs are scripts
 

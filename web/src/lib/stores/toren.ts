@@ -1,5 +1,7 @@
 import { derived, get, writable } from 'svelte/store';
 import type {
+	AgentSession,
+	AgentsResponse,
 	CommandOutput,
 	Segment,
 	SessionInfo,
@@ -7,6 +9,7 @@ import type {
 	TaskDisplayStatus,
 	TaskView,
 	WorkspaceDisplayStatus,
+	WorkspaceSessionsResponse,
 	WorkspaceView,
 	WsRequest,
 	WsResponse,
@@ -398,6 +401,44 @@ function createTorenStore() {
 			}
 			const data = await response.json();
 			return data.window;
+		},
+		/** Every agent the daemon can start, so "New agent" can name them one by one. */
+		async loadAgents(shipUrl: string): Promise<AgentsResponse> {
+			const response = await fetch(`${shipUrl}/api/agents`);
+			if (!response.ok) throw new Error('Failed to load agents');
+			return response.json();
+		},
+		/**
+		 * The workspace's recorded agent sessions, newest first.
+		 *
+		 * Its own endpoint rather than the workspace view's copy: picking a session to resume is
+		 * not worth the task and PR round trips that view makes.
+		 */
+		async loadSessions(shipUrl: string, segment: string, name: string): Promise<AgentSession[]> {
+			const seg = encodeURIComponent(segment);
+			const ws = encodeURIComponent(name);
+			const response = await fetch(`${shipUrl}/api/workspaces/${seg}/${ws}/sessions`);
+			if (!response.ok) throw new Error('Failed to load sessions');
+			const data: WorkspaceSessionsResponse = await response.json();
+			return [...(data.sessions ?? [])].reverse();
+		},
+		/** Dismiss one window of the workspace's session — a held pane, usually. */
+		async closeWorkspaceWindow(
+			shipUrl: string,
+			segment: string,
+			name: string,
+			window: string,
+		): Promise<void> {
+			const seg = encodeURIComponent(segment);
+			const ws = encodeURIComponent(name);
+			const win = encodeURIComponent(window);
+			const response = await fetch(`${shipUrl}/api/workspaces/${seg}/${ws}/windows/${win}/close`, {
+				method: 'POST',
+			});
+			if (!response.ok) {
+				const data = await response.json().catch(() => ({}));
+				throw new Error(data.error || 'Failed to close window');
+			}
 		},
 		async stopWorkspace(shipUrl: string, segment: string, name: string): Promise<void> {
 			const seg = encodeURIComponent(segment);

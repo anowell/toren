@@ -232,12 +232,14 @@ dependencies = [
  "colored",
  "dirs",
  "kdl",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",
  "terminal_size",
  "tokio",
  "toren-lib",
+ "toren-mirror",
  "tracing",
  "tracing-subscriber",
  "ureq",
@@ -2642,6 +2644,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml",
  "toren-lib",
+ "toren-mirror",
  "tower",
  "tower-http",
  "tracing",
@@ -2677,6 +2680,16 @@ dependencies = [
  "ureq",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "toren-mirror"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rmux-sdk",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

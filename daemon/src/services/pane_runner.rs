@@ -3,114 +3,29 @@
 //! Agents are spawned into the same sessions `breq do` uses, so either side can attach to the
 //! other's agent without re-spawning it.
 //!
-//! A mirror's history is what rmux still holds for the pane plus what this process has seen since
-//! it started following it; nothing is written to disk.
+//! The mirroring itself lives in `toren-mirror`, which the local `breq` client uses too; what is
+//! here is the daemon's bookkeeping — which pane each browser-facing key is following, and the
+//! window-level lifecycle (spawn, open a shell, kill) that browsers drive.
 
-use anyhow::{anyhow, Context, Result};
-use rmux_sdk::{PaneId, PaneOutputChunk, PaneOutputStart, PaneProcessState, Rmux, SessionName};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, OnceCell, RwLock};
-use tracing::{debug, info, warn};
+use tokio::sync::{OnceCell, RwLock};
+use toren_mirror::{
+    connect, find_window_pane, MirroredPane, PaneLiveness, PaneMirror, PaneRole, Rmux,
+};
+use tracing::info;
 
 use toren_lib::rmux as rmux_conv;
 
-/// How much output a newly connected browser replays.
-const REPLAY_CAP_BYTES: usize = 2 * 1024 * 1024;
-
-/// Fan-out depth; a client further behind than this gets a lag notice rather than back-pressuring
-/// the recorder.
-const BROADCAST_CAPACITY: usize = 512;
-
-/// Liveness of an ancillary's agent pane, as far as rmux is concerned.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PaneStatus {
-    /// No session, or no agent window in it.
-    Idle,
-    Working,
-    Exited {
-        code: Option<i32>,
-    },
-}
-
-/// A live mirror of one pane: the bytes seen so far, plus a subscription to what comes next.
-pub struct PaneMirror {
-    state: Mutex<MirrorState>,
-    tx: broadcast::Sender<Arc<Vec<u8>>>,
-    /// Set when the pane's stream ends, so clients hear about it instead of staring at a frame
-    /// that will never update.
-    ended: tokio::sync::watch::Sender<bool>,
-}
-
-struct MirrorState {
-    /// Trailing window of output, for replay to newly connected clients.
-    replay: Vec<u8>,
-}
-
-impl PaneMirror {
-    fn new() -> Arc<Self> {
-        let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let (ended, _) = tokio::sync::watch::channel(false);
-        Arc::new(Self {
-            state: Mutex::new(MirrorState { replay: Vec::new() }),
-            tx,
-            ended,
-        })
-    }
-
-    pub fn ended(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.ended.subscribe()
-    }
-
-    pub fn has_ended(&self) -> bool {
-        *self.ended.borrow()
-    }
-
-    fn mark_ended(&self) {
-        let _ = self.ended.send(true);
-    }
-
-    /// Backfill plus a live subscription, taken under the lock the writer holds while appending
-    /// and broadcasting — so a client can neither miss a chunk nor see one twice.
-    pub async fn attach(&self) -> (Vec<u8>, broadcast::Receiver<Arc<Vec<u8>>>) {
-        let state = self.state.lock().await;
-        let rx = self.tx.subscribe();
-        (state.replay.clone(), rx)
-    }
-
-    async fn push(&self, bytes: Arc<Vec<u8>>) {
-        let mut state = self.state.lock().await;
-        state.replay.extend_from_slice(&bytes);
-        if state.replay.len() > REPLAY_CAP_BYTES {
-            let drop_to = state.replay.len() - REPLAY_CAP_BYTES;
-            // Cut on a line boundary so clients don't start mid-escape-sequence.
-            let cut = state.replay[drop_to..]
-                .iter()
-                .position(|b| *b == b'\n')
-                .map_or(drop_to, |offset| drop_to + offset + 1);
-            state.replay.drain(..cut);
-        }
-        // Send while holding the lock so `attach` cannot interleave.
-        let _ = self.tx.send(bytes);
-    }
-}
-
-/// Everything the daemon tracks for one ancillary's rmux session.
+/// Everything the daemon tracks for one window of one rmux session.
 struct TrackedPane {
     session: String,
-    /// Which window's pane this mirror follows.
-    window: String,
-    /// A different id from the window's live pane means this mirror is stale.
-    pane_id: PaneId,
-    mirror: Arc<PaneMirror>,
-    recorder: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for TrackedPane {
-    fn drop(&mut self) {
-        self.recorder.abort();
-    }
+    /// Keyed by `PaneId`, not by the window name it was adopted from: rmux recompresses indices
+    /// and a resume replaces the pane behind the name, but the id a mirror holds is either the
+    /// pane it started with or gone.
+    pane: MirroredPane,
 }
 
 /// Owns the daemon's rmux connection and the set of panes it is mirroring.
@@ -131,16 +46,7 @@ impl PaneRunner {
     ///
     /// Deferred so a machine without rmux still boots the toren daemon.
     async fn rmux(&self) -> Result<Arc<Rmux>> {
-        self.rmux
-            .get_or_try_init(|| async {
-                Rmux::builder()
-                    .connect_or_start()
-                    .await
-                    .map(Arc::new)
-                    .context("Failed to reach the rmux daemon. Is `rmux` installed and on PATH?")
-            })
-            .await
-            .cloned()
+        self.rmux.get_or_try_init(connect).await.cloned()
     }
 
     /// Start (or restart) an agent in a workspace's session and begin mirroring its pane.
@@ -183,22 +89,24 @@ impl PaneRunner {
 
     /// Point a mirror at the pane running right now in `window`.
     ///
-    /// Adopts a session this process never started, and replaces a mirror left following a pane
-    /// that `breq do` or a resume has since swapped out. `key` scopes the mirror to one window,
-    /// so a workspace can have its agent and several shells mirrored at once.
+    /// Adopts a session this process never started — which is all re-adoption after a restart
+    /// amounts to, since the daemon persists nothing — and replaces a mirror left following a pane
+    /// that `breq do` or a resume has since swapped out. `key` scopes the mirror to one window, so
+    /// a workspace can have its agent and several shells mirrored at once.
     pub async fn ensure_current(&self, key: &str, session: &str, window: &str) -> Result<String> {
         if !rmux_conv::session_exists(session) {
             return Err(anyhow!("No rmux session '{}'", session));
         }
 
-        let live_pane_id = self.find_window(session, window).await?.pane_id;
+        let rmux = self.rmux().await?;
+        let live = find_window_pane(&rmux, session, window).await?;
 
         let is_current = self
             .tracked
             .read()
             .await
             .get(key)
-            .is_some_and(|t| t.pane_id == live_pane_id && !t.recorder.is_finished());
+            .is_some_and(|t| t.pane.pane_id() == live && t.pane.is_current());
         if is_current {
             return Ok(session.to_string());
         }
@@ -207,107 +115,84 @@ impl PaneRunner {
         Ok(session.to_string())
     }
 
-    /// Attach a recorder to `window`'s pane, replacing any previous one under `key`.
+    /// Mirror `window`'s current pane, replacing any mirror already under `key`.
     async fn track(&self, key: &str, session: &str, window: &str) -> Result<()> {
-        let discovered = self.find_window(session, window).await?;
-        let pane = discovered.pane;
-        let pane_id = discovered.pane_id;
+        let rmux = self.rmux().await?;
+        let pane_id = find_window_pane(&rmux, session, window).await?;
+        let pane = MirroredPane::attach(rmux, session, pane_id, role_of(window)).await?;
 
-        let mirror = PaneMirror::new();
-        let recorder = tokio::spawn(record_pane(pane, mirror.clone()));
-
-        // Clients on the outgoing mirror would otherwise hang on a subscription nothing feeds.
-        let previous = self.tracked.write().await.insert(
+        // Dropping the outgoing mirror releases the clients still attached to it.
+        self.tracked.write().await.insert(
             key.to_string(),
             TrackedPane {
                 session: session.to_string(),
-                window: window.to_string(),
-                pane_id,
-                mirror,
-                recorder,
+                pane,
             },
         );
-        if let Some(previous) = previous {
-            previous.mirror.mark_ended();
-        }
         Ok(())
     }
 
-    pub async fn mirror(&self, ancillary_id: &str) -> Option<Arc<PaneMirror>> {
-        self.tracked
-            .read()
-            .await
-            .get(ancillary_id)
-            .map(|t| t.mirror.clone())
+    pub async fn mirror(&self, key: &str) -> Option<Arc<PaneMirror>> {
+        self.tracked.read().await.get(key).map(|t| t.pane.mirror())
     }
 
-    pub async fn session_of(&self, ancillary_id: &str) -> Option<String> {
-        self.tracked
-            .read()
-            .await
-            .get(ancillary_id)
-            .map(|t| t.session.clone())
-    }
-
-    /// The (session, window) a mirror is following.
-    async fn tracked_target(&self, key: &str) -> Option<(String, String)> {
+    pub async fn session_of(&self, key: &str) -> Option<String> {
         self.tracked
             .read()
             .await
             .get(key)
-            .map(|t| (t.session.clone(), t.window.clone()))
+            .map(|t| t.session.clone())
     }
 
     /// Forward browser keystrokes to the mirrored pane, verbatim.
     pub async fn send_input(&self, key: &str, text: &str) -> Result<()> {
-        let (session, window) = self
-            .tracked_target(key)
-            .await
-            .ok_or_else(|| anyhow!("No tracked pane for {}", key))?;
-        self.window_pane(&session, &window)
-            .await?
-            .send_text(text)
-            .await?;
-        Ok(())
+        let tracked = self.tracked.read().await;
+        self.require(&tracked, key)?.pane.send_text(text).await
     }
 
-    /// Match the mirrored window's geometry to the browser terminal's.
+    /// Repaint a mirrored pane from its screen, returning the epoch the paint opens.
     ///
-    /// Resizes the window, not the pane: a pane can't exceed its window, and a detached window
-    /// sits at rmux's 80x24 default, so resizing the pane alone is a silent no-op. `window-size`
-    /// is left at its default so an attached human isn't fighting a browser tab for geometry.
-    pub async fn resize(&self, key: &str, cols: u16, rows: u16) -> Result<()> {
-        let (session, window) = self
-            .tracked_target(key)
-            .await
-            .ok_or_else(|| anyhow!("No tracked pane for {}", key))?;
-
-        self.window_handle(&session, &window)
-            .await?
-            .resize(Some(cols), Some(rows))
-            .await?;
-        Ok(())
+    /// What a browser asks for when its terminal has gone out of step — because it fell behind, or
+    /// because rmux dropped output on the way here. The paint reaches every client attached to the
+    /// pane, not just the one that asked; a fresh screen is never wrong for any of them.
+    pub async fn resync(&self, key: &str) -> Result<u32> {
+        let tracked = self.tracked.read().await;
+        self.require(&tracked, key)?.pane.repaint().await
     }
 
-    /// Liveness of a specific window's pane, derived from rmux rather than tracked separately.
-    pub async fn status(&self, session: &str, window: &str) -> PaneStatus {
-        let Ok(pane) = self.window_pane(session, window).await else {
-            return PaneStatus::Idle;
-        };
-        let Ok(info) = pane.info().await else {
-            return PaneStatus::Idle;
-        };
-        let Some(pane_info) = info.panes.first() else {
-            return PaneStatus::Idle;
-        };
+    /// Match the mirrored pane's geometry to the browser terminal's.
+    ///
+    /// `window-size` is left at its default so an attached human isn't fighting a browser tab for
+    /// geometry.
+    pub async fn resize(&self, key: &str, cols: u16, rows: u16) -> Result<()> {
+        let tracked = self.tracked.read().await;
+        self.require(&tracked, key)?.pane.resize(cols, rows).await
+    }
 
-        match pane_info.process {
-            PaneProcessState::Running { .. } => PaneStatus::Working,
-            PaneProcessState::Exited => PaneStatus::Exited {
-                code: pane_info.exit_state.as_ref().and_then(|e| e.code),
-            },
-            _ => PaneStatus::Idle,
-        }
+    fn require<'a>(
+        &self,
+        tracked: &'a HashMap<String, TrackedPane>,
+        key: &str,
+    ) -> Result<&'a TrackedPane> {
+        tracked
+            .get(key)
+            .ok_or_else(|| anyhow!("No tracked pane for {}", key))
+    }
+
+    /// Liveness of a window's current pane, derived from rmux rather than tracked separately.
+    ///
+    /// Works off the window name because callers ask before anything is mirrored; the name is
+    /// resolved to a pane id and the answer is that pane's, not whichever pane rmux lists first.
+    pub async fn status(&self, session: &str, window: &str) -> PaneLiveness {
+        let Ok(rmux) = self.rmux().await else {
+            return PaneLiveness::Unknown;
+        };
+        let Ok(pane_id) = find_window_pane(&rmux, session, window).await else {
+            return PaneLiveness::Unknown;
+        };
+        toren_mirror::liveness(&rmux, session, pane_id)
+            .await
+            .unwrap_or(PaneLiveness::Unknown)
     }
 
     /// Kill the agent window and stop mirroring, leaving the session's shells alive.
@@ -324,10 +209,9 @@ impl PaneRunner {
     /// A workspace's session is a set of windows; closing one (an agent, a finished dev-server
     /// shell) is not the same as tearing the whole session down.
     pub async fn close_window(&self, key: &str, session: &str, window: &str) -> Result<bool> {
-        if let Some(tracked) = self.tracked.write().await.remove(key) {
-            // Attached browsers are following a pane that is about to die.
-            tracked.mirror.mark_ended();
-        }
+        // Attached browsers are following a pane that is about to die; dropping the mirror is what
+        // tells them so.
+        self.tracked.write().await.remove(key);
 
         let was_live = rmux_conv::window_exists(session, window);
         // Kill even a dead window so the next spawn of that name starts clean.
@@ -338,134 +222,28 @@ impl PaneRunner {
         Ok(was_live)
     }
 
-    /// Resolve a session window to a pane handle.
-    ///
-    /// Matched by window name: indices shift as windows come and go, and pane titles are
-    /// unreliable because agents set them via OSC escapes.
-    async fn window_pane(&self, session: &str, window: &str) -> Result<rmux_sdk::Pane> {
-        Ok(self.find_window(session, window).await?.pane)
-    }
-
-    /// The window handle for a named window.
-    async fn window_handle(&self, session: &str, window: &str) -> Result<rmux_sdk::Window> {
-        let window_index = self.find_window(session, window).await?.window_index;
-        let rmux = self.rmux().await?;
-        let name = SessionName::new(session).map_err(|e| anyhow!("{}", e))?;
-        Ok(rmux.session(name).await?.window(window_index))
-    }
-
-    /// Find the live pane of a named window in a session.
-    async fn find_window(&self, session: &str, window: &str) -> Result<rmux_sdk::DiscoveredPane> {
-        let rmux = self.rmux().await?;
-        let panes = rmux
-            .find_panes()
-            .session(session)
-            .all()
-            .await
-            .with_context(|| format!("Failed to list panes in rmux session '{}'", session))?;
-
-        for discovered in panes {
-            let info = discovered.pane.info().await?;
-            let matches = info
-                .windows
-                .iter()
-                .any(|w| w.index == discovered.window_index && w.name.as_deref() == Some(window));
-            if matches {
-                return Ok(discovered);
-            }
-        }
-
-        Err(anyhow!(
-            "rmux session '{}' has no '{}' window",
-            session,
-            window
-        ))
+    /// The pane a mirror is following.
+    #[cfg(test)]
+    async fn tracked_pane_id(&self, key: &str) -> Option<toren_mirror::PaneId> {
+        self.tracked.read().await.get(key).map(|t| t.pane.pane_id())
     }
 }
 
-/// Pump one pane's output into its mirror until the stream ends.
-///
-/// Starts from rmux's oldest retained output, so a mirror attached long after the pane started
-/// still opens with whatever rmux has kept rather than a blank screen.
-async fn record_pane(pane: rmux_sdk::Pane, mirror: Arc<PaneMirror>) {
-    let mut stream = match pane
-        .output_stream_starting_at(PaneOutputStart::Oldest)
-        .await
-    {
-        Ok(stream) => stream,
-        Err(e) => {
-            warn!("Failed to subscribe to pane output: {}", e);
-            mirror.mark_ended();
-            return;
-        }
-    };
-
-    loop {
-        match stream.next().await {
-            Ok(Some(PaneOutputChunk::Bytes { bytes, .. })) => {
-                mirror.push(Arc::new(bytes)).await;
-            }
-            Ok(Some(PaneOutputChunk::Lag(notice))) => {
-                debug!("rmux reported pane output lag: {:?}", notice);
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(e) => {
-                debug!("Pane output stream ended: {}", e);
-                break;
-            }
-        }
+/// An agent pane offers to resume its session where a shell offers to re-run; that is the only
+/// thing the mirror needs to know about what a window was created for.
+fn role_of(window: &str) -> PaneRole {
+    if window == rmux_conv::AGENT_WINDOW {
+        PaneRole::Agent
+    } else {
+        PaneRole::Shell
     }
-
-    mirror.mark_ended();
-}
-
-/// The workspace directory name, which is the ancillary's word-name (`one`, `two`, ...).
-#[allow(dead_code)]
-fn workspace_name(workspace_path: &Path) -> Result<String> {
-    workspace_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.to_string())
-        .ok_or_else(|| {
-            anyhow!(
-                "Workspace path has no directory name: {}",
-                workspace_path.display()
-            )
-        })
-}
-
-/// Make a string safe to use as a single path component.
-#[allow(dead_code)]
-fn sanitize_component(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn workspace_name_is_the_directory_name() {
-        let name = workspace_name(Path::new("/ws/toren/one")).unwrap();
-        assert_eq!(name, "one");
-    }
-
-    #[test]
-    fn sanitize_component_replaces_separators() {
-        assert_eq!(sanitize_component("Toren One"), "Toren-One");
-        assert_eq!(sanitize_component("a/b"), "a-b");
-    }
-
-    /// A session created the way `breq do` creates one is mirrored here: backfill, live stream,
+    /// A session created the way `breq do` creates one is mirrored here: seed, live stream,
     /// input, status, geometry. Needs rmux installed.
     #[tokio::test]
     async fn mirrors_a_session_created_the_breq_way() {
@@ -504,8 +282,8 @@ mod tests {
 
         let mirror = runner.mirror(&session).await.expect("pane is tracked");
 
-        // Backfill: output produced before we attached.
-        wait_for(|| async { contains(&mirror.attach().await.0, "BEFORE-ATTACH") }).await;
+        // The seed is a paint of the pane's screen, so output from before the attach is there.
+        wait_for(|| async { contains(&mirror.attach().await.0.bytes, "BEFORE-ATTACH") }).await;
 
         // Live: output produced after, delivered on the subscription taken with the backfill.
         let (_, mut live) = mirror.attach().await;
@@ -513,22 +291,54 @@ mod tests {
 
         let mut seen = Vec::new();
         while !contains(&seen, "AFTER-ATTACH") {
-            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), live.recv())
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), live.recv())
                 .await
                 .expect("live output arrives")
                 .expect("subscription stays open");
-            seen.extend_from_slice(&chunk);
+            seen.extend_from_slice(&frame.bytes);
         }
+
+        // A resync paints the pane's screen under a new epoch, which is what lets an attached
+        // client throw away the frames it had queued from the old one.
+        let before = mirror.epoch();
+        let epoch = runner.resync(&session).await.unwrap();
+        assert!(epoch > before, "a paint opens an epoch of its own");
+
+        // Frames left over from the screen the paint replaces are the ones a client discards; the
+        // paint is what it applies instead.
+        let painted = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), live.recv())
+                .await
+                .expect("the paint reaches clients already attached")
+                .expect("subscription stays open");
+            if frame.epoch == epoch {
+                break frame;
+            }
+            assert!(frame.epoch < epoch, "nothing outranks the newest paint");
+        };
+        assert!(
+            contains(&painted.bytes, "AFTER-ATTACH"),
+            "the paint describes the pane's screen, not the bytes that built it"
+        );
 
         assert_eq!(
             runner.status(&session, rmux_conv::AGENT_WINDOW).await,
-            PaneStatus::Working
+            PaneLiveness::Running
+        );
+        let rmux = runner.rmux().await.unwrap();
+        let pane_id = find_window_pane(&rmux, &session, rmux_conv::AGENT_WINDOW)
+            .await
+            .unwrap();
+        assert_eq!(
+            runner.tracked_pane_id(&session).await,
+            Some(pane_id),
+            "the mirror is keyed by the window's live pane id"
         );
 
         // A detached window sits at 80x24, so this guards the window-vs-pane distinction.
         runner.resize(&session, 100, 30).await.unwrap();
-        let snapshot = runner
-            .window_pane(&session, rmux_conv::AGENT_WINDOW)
+        let snapshot = rmux
+            .pane_by_id(toren_mirror::SessionName::new(&session).unwrap(), pane_id)
             .await
             .unwrap()
             .snapshot()
@@ -570,7 +380,7 @@ mod tests {
             .unwrap();
 
         let first_mirror = runner.mirror(&session).await.unwrap();
-        wait_for(|| async { contains(&first_mirror.attach().await.0, "FIRST-AGENT") }).await;
+        wait_for(|| async { contains(&first_mirror.attach().await.0.bytes, "FIRST-AGENT") }).await;
 
         runner
             .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW)
@@ -582,7 +392,7 @@ mod tests {
         );
 
         // Replace the agent the way `breq do` does, behind the daemon's back.
-        let mut ended = first_mirror.ended();
+        let mut state = first_mirror.state();
         rmux_conv::spawn_agent(
             &session,
             &workspace,
@@ -605,18 +415,20 @@ mod tests {
             "a replaced pane must get a fresh mirror"
         );
         assert!(
-            *ended.borrow_and_update(),
+            state.borrow_and_update().is_ended(),
             "clients attached to the old pane must be told it ended"
         );
-        wait_for(|| async { contains(&second_mirror.attach().await.0, "SECOND-AGENT") }).await;
+        wait_for(|| async { contains(&second_mirror.attach().await.0.bytes, "SECOND-AGENT") })
+            .await;
 
         runner.stop_agent(&session, &session).await.unwrap();
         rmux_conv::kill_session(&session).unwrap();
     }
 
-    /// A mirror built after the fact still opens on what rmux retained. Needs rmux installed.
+    /// A mirror built after the fact opens on a paint of the pane's screen, which is what makes a
+    /// restarted daemon's reattach look like nothing happened. Needs rmux installed.
     #[tokio::test]
-    async fn a_fresh_mirror_seeds_from_rmux_retained_output() {
+    async fn a_fresh_mirror_seeds_from_the_panes_screen() {
         if !rmux_conv::is_available() {
             eprintln!("skipping: rmux not on PATH");
             return;
@@ -647,7 +459,8 @@ mod tests {
                 .unwrap();
 
             let mirror = runner.mirror(&session).await.unwrap();
-            wait_for(|| async { contains(&mirror.attach().await.0, "WORK-THAT-HAPPENED") }).await;
+            wait_for(|| async { contains(&mirror.attach().await.0.bytes, "WORK-THAT-HAPPENED") })
+                .await;
         }
 
         // A fresh PaneRunner stands in for a daemon restart: no in-memory replay buffer left.
@@ -658,7 +471,57 @@ mod tests {
             .unwrap();
 
         let mirror = restarted.mirror(&session).await.unwrap();
-        wait_for(|| async { contains(&mirror.attach().await.0, "WORK-THAT-HAPPENED") }).await;
+        wait_for(|| async { contains(&mirror.attach().await.0.bytes, "WORK-THAT-HAPPENED") }).await;
+
+        rmux_conv::kill_session(&session).unwrap();
+    }
+
+    /// A held pane renders its exit status into the stream, so every surface shows it without
+    /// implementing anything. Needs rmux installed.
+    #[tokio::test]
+    async fn a_held_pane_renders_its_exit_status() {
+        if !rmux_conv::is_available() {
+            eprintln!("skipping: rmux not on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("one");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let segment = format!("held{}", std::process::id());
+        let session = rmux_conv::session_name(&segment, "one", None);
+        let runner = PaneRunner::new();
+
+        // `spawn_agent` is the path that sets `remain-on-exit`, which is what holds the pane; the
+        // sleep gives it time to land before the process is gone.
+        runner
+            .start_agent(
+                &session,
+                &session,
+                &workspace,
+                &[],
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 1; exit 3".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let mirror = runner.mirror(&session).await.unwrap();
+        wait_for(|| async { contains(&mirror.attach().await.0.bytes, "[exited 3") }).await;
+
+        let held = String::from_utf8_lossy(&mirror.attach().await.0.bytes).into_owned();
+        assert!(
+            held.contains("<ENTER> resume"),
+            "an agent pane resumes rather than re-runs: {:?}",
+            held
+        );
+        // The status line lands first, so clients see it before they are told it is over.
+        wait_for(|| async { mirror.has_ended() }).await;
+        assert_eq!(mirror.state().borrow().exit_code(), Some(3));
 
         rmux_conv::kill_session(&session).unwrap();
     }
@@ -680,40 +543,5 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         panic!("condition never became true");
-    }
-
-    #[tokio::test]
-    async fn mirror_replays_then_streams() {
-        let mirror = PaneMirror::new();
-        mirror.push(Arc::new(b"hello ".to_vec())).await;
-
-        let (replay, mut rx) = mirror.attach().await;
-        assert_eq!(replay, b"hello ");
-
-        mirror.push(Arc::new(b"world".to_vec())).await;
-        assert_eq!(rx.recv().await.unwrap().as_slice(), b"world");
-    }
-
-    #[tokio::test]
-    async fn mirror_caps_its_replay_buffer() {
-        let mirror = PaneMirror::new();
-        let chunk = vec![b'x'; REPLAY_CAP_BYTES / 2 + 1];
-        mirror.push(Arc::new(chunk.clone())).await;
-        mirror.push(Arc::new(chunk)).await;
-
-        let state = mirror.state.lock().await;
-        assert!(state.replay.len() <= REPLAY_CAP_BYTES);
-    }
-
-    #[tokio::test]
-    async fn mirror_trims_on_a_line_boundary_when_it_can() {
-        let mirror = PaneMirror::new();
-        let mut first = vec![b'a'; REPLAY_CAP_BYTES];
-        first.push(b'\n');
-        first.extend_from_slice(b"tail");
-        mirror.push(Arc::new(first)).await;
-
-        let replay = mirror.state.lock().await.replay.clone();
-        assert_eq!(replay, b"tail", "trim should cut just past the newline");
     }
 }
