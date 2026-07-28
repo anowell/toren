@@ -7,7 +7,9 @@ use rmux_sdk::{
 };
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::buffer::PaneMirror;
@@ -21,6 +23,12 @@ use crate::seed::screen_paint;
 /// say it is over. The subscription itself long-polls an order of magnitude more often than this.
 const LIVENESS_POLL: Duration = Duration::from_secs(2);
 
+/// The pump's own polling cadence, matching what the SDK's `next()` would use. `poll_once` is
+/// driven directly instead because the SDK is not cancel-safe (below), so the backoff has to live
+/// where the cancellation point is.
+const POLL_FLOOR: Duration = Duration::from_millis(2);
+const POLL_CEILING: Duration = Duration::from_millis(50);
+
 /// Connect to the rmux daemon, starting one if needed.
 pub async fn connect() -> Result<Arc<Rmux>> {
     Rmux::builder()
@@ -28,6 +36,26 @@ pub async fn connect() -> Result<Arc<Rmux>> {
         .await
         .map(Arc::new)
         .context("Failed to reach the rmux daemon. Is `rmux` installed and on PATH?")
+}
+
+/// Whether an error means the client's transport is gone for good.
+///
+/// The SDK's responses are ordered on one connection, so dropping any request future mid-flight
+/// aborts the whole client, and every later call on it fails with `BrokenPipe`. Nothing in this
+/// crate cancels a request, but anything can — a browser closing an HTTP connection drops the
+/// handler mid-await — so holders of a shared client use this to know when to throw it away and
+/// connect again.
+pub fn transport_is_dead(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rmux_sdk::RmuxError>(),
+            Some(rmux_sdk::RmuxError::Transport { source, .. })
+                if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                )
+        )
+    })
 }
 
 /// What rmux says about a pane's process right now.
@@ -89,11 +117,15 @@ pub struct MirroredPane {
     pane: Pane,
     mirror: Arc<PaneMirror>,
     pump: JoinHandle<()>,
+    /// Cooperative shutdown for the pump. Aborting the task instead would cancel whatever SDK
+    /// request it had in flight, and a cancelled request kills the whole shared client (see
+    /// [`transport_is_dead`]); the pump only ever stops between completed requests.
+    stop: watch::Sender<bool>,
 }
 
 impl Drop for MirroredPane {
     fn drop(&mut self) {
-        self.pump.abort();
+        let _ = self.stop.send(true);
         // Clients would otherwise wait on a subscription nothing feeds.
         if !self.mirror.has_ended() {
             self.mirror.mark_ended(None);
@@ -112,7 +144,14 @@ impl MirroredPane {
         let session = session_name(session)?;
         let pane = pane_handle(&rmux, session.clone(), pane_id).await?;
         let mirror = PaneMirror::new(role);
-        let pump = tokio::spawn(pump(rmux.clone(), pane.clone(), pane_id, mirror.clone()));
+        let (stop, stopped) = watch::channel(false);
+        let pump = tokio::spawn(pump(
+            rmux.clone(),
+            pane.clone(),
+            pane_id,
+            mirror.clone(),
+            stopped,
+        ));
 
         Ok(Self {
             rmux,
@@ -121,7 +160,13 @@ impl MirroredPane {
             pane,
             mirror,
             pump,
+            stop,
         })
+    }
+
+    /// The client this mirror runs on, for holders deciding whether to keep sharing it.
+    pub fn client(&self) -> Arc<Rmux> {
+        self.rmux.clone()
     }
 
     pub fn mirror(&self) -> Arc<PaneMirror> {
@@ -208,7 +253,19 @@ impl MirroredPane {
 }
 
 /// Pump one pane's output into its mirror until the process is gone.
-async fn pump(rmux: Arc<Rmux>, pane: Pane, pane_id: PaneId, mirror: Arc<PaneMirror>) {
+///
+/// Every SDK call here runs to completion before anything else is awaited. The SDK's responses
+/// are ordered on the shared connection and a request future dropped mid-flight aborts the whole
+/// client, so nothing cancellable — the stop signal, the backoff sleep — may ever race a request.
+/// That is why the stream is driven with `poll_once` and an explicit backoff rather than `next()`,
+/// whose internal await could not be raced against the liveness clock safely.
+async fn pump(
+    rmux: Arc<Rmux>,
+    pane: Pane,
+    pane_id: PaneId,
+    mirror: Arc<PaneMirror>,
+    mut stopped: watch::Receiver<bool>,
+) {
     // Subscribe before painting: a chunk landing between the two is applied twice at worst, where
     // the other order would lose it outright.
     let mut stream = match pane.output_stream_starting_at(PaneOutputStart::Now).await {
@@ -222,40 +279,72 @@ async fn pump(rmux: Arc<Rmux>, pane: Pane, pane_id: PaneId, mirror: Arc<PaneMirr
     reseed(&rmux, &pane, pane_id, &mirror).await;
 
     let mut filter = QueryFilter::new();
-    let exit = match exited(&pane, pane_id).await {
-        // Adopted after it was already over.
-        Some(exit) => Some(exit),
-        None => loop {
-            tokio::select! {
-                chunk = stream.next() => match chunk {
-                    Ok(Some(PaneOutputChunk::Bytes { bytes, .. })) => {
-                        let visible = filter.push(&bytes);
-                        if !visible.is_empty() {
-                            mirror.push(Arc::new(visible)).await;
-                        }
-                    }
-                    // A gap means the mirror's idea of the screen is wrong, and the bytes that
-                    // would fix it are the ones that were dropped. Paint it again instead.
-                    Ok(Some(PaneOutputChunk::Lag(notice))) => {
-                        debug!("rmux dropped pane {} output: {:?}", pane_id, notice);
-                        filter.reset();
-                        reseed(&rmux, &pane, pane_id, &mirror).await;
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => break exited(&pane, pane_id).await,
-                    Err(e) => {
-                        debug!("Pane {} output stream ended: {}", pane_id, e);
-                        break exited(&pane, pane_id).await;
-                    }
-                },
-                // A held pane's stream stays open after its process exits, so ask.
-                _ = tokio::time::sleep(LIVENESS_POLL) => {
-                    if let Some(exit) = exited(&pane, pane_id).await {
-                        break Some(exit);
+    let mut delay = POLL_FLOOR;
+    // Due immediately: the pane may have been adopted after it was already over.
+    let mut liveness_due = Instant::now();
+
+    let exit = loop {
+        if *stopped.borrow() {
+            // The owner is being dropped and marks the mirror ended itself.
+            return;
+        }
+
+        let chunks = match stream.poll_once().await {
+            Ok(chunks) => chunks,
+            Err(e) => {
+                debug!("Pane {} output stream ended: {}", pane_id, e);
+                break exited(&pane, pane_id).await;
+            }
+        };
+
+        let mut streamed = false;
+        let mut eof = false;
+        for chunk in chunks {
+            match chunk {
+                // An empty chunk is how the subscription says the pane's output is over.
+                PaneOutputChunk::Bytes { bytes, .. } if bytes.is_empty() => eof = true,
+                PaneOutputChunk::Bytes { bytes, .. } => {
+                    streamed = true;
+                    let visible = filter.push(&bytes);
+                    if !visible.is_empty() {
+                        mirror.push(Arc::new(visible)).await;
                     }
                 }
+                // A gap means the mirror's idea of the screen is wrong, and the bytes that
+                // would fix it are the ones that were dropped. Paint it again instead.
+                PaneOutputChunk::Lag(notice) => {
+                    debug!("rmux dropped pane {} output: {:?}", pane_id, notice);
+                    filter.reset();
+                    reseed(&rmux, &pane, pane_id, &mirror).await;
+                }
+                _ => {}
             }
-        },
+        }
+        if eof {
+            break exited(&pane, pane_id).await;
+        }
+        delay = if streamed {
+            POLL_FLOOR
+        } else {
+            (delay * 2).min(POLL_CEILING)
+        };
+
+        // A held pane's stream stays open after its process exits, so ask; a pane that is gone
+        // altogether keeps its subscription silent, so this is also what notices that.
+        if Instant::now() >= liveness_due {
+            liveness_due = Instant::now() + LIVENESS_POLL;
+            match followed(&pane, pane_id).await {
+                Ok(Followed::Exited(exit)) => break Some(exit),
+                Ok(Followed::Gone) => break None,
+                Ok(Followed::Running | Followed::Indeterminate) => {}
+                Err(e) => debug!("Failed to read pane {} liveness: {}", pane_id, e),
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = stopped.changed() => return,
+        }
     };
 
     if let Some(exit) = &exit {
@@ -264,6 +353,28 @@ async fn pump(rmux: Arc<Rmux>, pane: Pane, pane_id: PaneId, mirror: Arc<PaneMirr
             .await;
     }
     mirror.mark_ended(exit);
+}
+
+/// What following the pane turned up, distinguishing "the pane no longer exists" from a snapshot
+/// that just cannot say yet — a mirror must end on the former and shrug at the latter.
+enum Followed {
+    Running,
+    Exited(PaneExitState),
+    Gone,
+    Indeterminate,
+}
+
+async fn followed(pane: &Pane, pane_id: PaneId) -> Result<Followed> {
+    let info = pane.info().await?;
+    // By id, never `.first()`: a window can hold panes that are not ours.
+    let Some(info) = info.panes.iter().find(|p| p.id == pane_id) else {
+        return Ok(Followed::Gone);
+    };
+    Ok(match info.process {
+        PaneProcessState::Running { .. } => Followed::Running,
+        PaneProcessState::Exited => Followed::Exited(info.exit_state.clone().unwrap_or_default()),
+        _ => Followed::Indeterminate,
+    })
 }
 
 async fn reseed(rmux: &Rmux, pane: &Pane, pane_id: PaneId, mirror: &PaneMirror) {
@@ -277,8 +388,8 @@ async fn reseed(rmux: &Rmux, pane: &Pane, pane_id: PaneId, mirror: &PaneMirror) 
 
 /// The pane's exit status, which rmux only fills in once the process is actually gone.
 async fn exited(pane: &Pane, pane_id: PaneId) -> Option<PaneExitState> {
-    match pane_liveness(pane, pane_id).await {
-        Ok(PaneLiveness::Exited(exit)) => Some(exit),
+    match followed(pane, pane_id).await {
+        Ok(Followed::Exited(exit)) => Some(exit),
         Ok(_) => None,
         Err(e) => {
             debug!("Failed to read pane {} liveness: {}", pane_id, e);
@@ -288,17 +399,10 @@ async fn exited(pane: &Pane, pane_id: PaneId) -> Option<PaneExitState> {
 }
 
 async fn pane_liveness(pane: &Pane, pane_id: PaneId) -> Result<PaneLiveness> {
-    let info = pane.info().await?;
-    // By id, never `.first()`: a window can hold panes that are not ours.
-    let Some(info) = info.panes.iter().find(|p| p.id == pane_id) else {
-        return Ok(PaneLiveness::Unknown);
-    };
-    Ok(match info.process {
-        PaneProcessState::Running { .. } => PaneLiveness::Running,
-        PaneProcessState::Exited => {
-            PaneLiveness::Exited(info.exit_state.clone().unwrap_or_default())
-        }
-        _ => PaneLiveness::Unknown,
+    Ok(match followed(pane, pane_id).await? {
+        Followed::Running => PaneLiveness::Running,
+        Followed::Exited(exit) => PaneLiveness::Exited(exit),
+        Followed::Gone | Followed::Indeterminate => PaneLiveness::Unknown,
     })
 }
 

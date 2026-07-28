@@ -459,16 +459,26 @@ pub fn ensure_shell(session: &str, cwd: &Path) -> Result<()> {
         .iter()
         .any(|p| p.window == SHELL_WINDOW && p.dead);
     if shell_is_dead {
-        rmux([
-            "respawn-pane",
-            "-k",
-            "-t",
-            &window_target(session, SHELL_WINDOW),
-            "-c",
-            &cwd,
-        ])
-        .with_context(|| format!("Failed to restart the shell in rmux session '{}'", session))?;
+        respawn_shell(session, SHELL_WINDOW, Path::new(&cwd))?;
     }
+    Ok(())
+}
+
+/// Restart a plain shell in an existing window, keeping the window's scrollback.
+///
+/// For a held shell window whose process has exited: `<ENTER>` on the held pane puts a live shell
+/// back where the dead one was.
+pub fn respawn_shell(session: &str, window: &str, cwd: &Path) -> Result<()> {
+    let cwd = cwd.to_string_lossy().into_owned();
+    rmux([
+        "respawn-pane",
+        "-k",
+        "-t",
+        &window_target(session, window),
+        "-c",
+        &cwd,
+    ])
+    .with_context(|| format!("Failed to restart the shell in rmux session '{}'", session))?;
     Ok(())
 }
 

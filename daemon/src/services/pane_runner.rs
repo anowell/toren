@@ -11,9 +11,10 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::{OnceCell, RwLock};
+use tokio::sync::{Mutex, RwLock};
 use toren_mirror::{
-    connect, find_window_pane, MirroredPane, PaneLiveness, PaneMirror, PaneRole, Rmux,
+    connect, find_window_pane, transport_is_dead, MirroredPane, PaneLiveness, PaneMirror, PaneRole,
+    Rmux,
 };
 use tracing::info;
 
@@ -30,23 +31,52 @@ struct TrackedPane {
 
 /// Owns the daemon's rmux connection and the set of panes it is mirroring.
 pub struct PaneRunner {
-    rmux: OnceCell<Arc<Rmux>>,
+    rmux: Mutex<Option<Arc<Rmux>>>,
     tracked: RwLock<HashMap<String, TrackedPane>>,
 }
 
 impl PaneRunner {
     pub fn new() -> Self {
         Self {
-            rmux: OnceCell::new(),
+            rmux: Mutex::new(None),
             tracked: RwLock::new(HashMap::new()),
         }
     }
 
     /// Connect to the rmux daemon, starting one if needed.
     ///
-    /// Deferred so a machine without rmux still boots the toren daemon.
+    /// Deferred so a machine without rmux still boots the toren daemon. Not a `OnceCell`: the
+    /// SDK's client dies for good when any request on it is cancelled mid-flight (an HTTP handler
+    /// dropped by a disconnecting browser is enough), and it does not survive an rmux-server
+    /// restart either — so a client found dead is thrown away and the next call reconnects.
     async fn rmux(&self) -> Result<Arc<Rmux>> {
-        self.rmux.get_or_try_init(connect).await.cloned()
+        let mut slot = self.rmux.lock().await;
+        if let Some(client) = slot.as_ref() {
+            return Ok(client.clone());
+        }
+        let client = connect().await?;
+        *slot = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Forget `client` if it is still the shared one, so the next call reconnects.
+    async fn forget(&self, client: &Arc<Rmux>) {
+        let mut slot = self.rmux.lock().await;
+        if slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, client)) {
+            info!("rmux client transport is gone; reconnecting on next use");
+            *slot = None;
+        }
+    }
+
+    /// Pass an SDK result through, discarding the shared client when the error says its transport
+    /// is dead — the one failure a retry on the same client can never recover from.
+    async fn healing<T>(&self, client: &Arc<Rmux>, result: Result<T>) -> Result<T> {
+        if let Err(e) = &result {
+            if transport_is_dead(e) {
+                self.forget(client).await;
+            }
+        }
+        result
     }
 
     /// Start (or restart) an agent in a workspace's session and begin mirroring its pane.
@@ -99,7 +129,9 @@ impl PaneRunner {
         }
 
         let rmux = self.rmux().await?;
-        let live = find_window_pane(&rmux, session, window).await?;
+        let live = self
+            .healing(&rmux, find_window_pane(&rmux, session, window).await)
+            .await?;
 
         let is_current = self
             .tracked
@@ -118,8 +150,15 @@ impl PaneRunner {
     /// Mirror `window`'s current pane, replacing any mirror already under `key`.
     async fn track(&self, key: &str, session: &str, window: &str) -> Result<()> {
         let rmux = self.rmux().await?;
-        let pane_id = find_window_pane(&rmux, session, window).await?;
-        let pane = MirroredPane::attach(rmux, session, pane_id, role_of(window)).await?;
+        let pane_id = self
+            .healing(&rmux, find_window_pane(&rmux, session, window).await)
+            .await?;
+        let pane = self
+            .healing(
+                &rmux,
+                MirroredPane::attach(rmux.clone(), session, pane_id, role_of(window)).await,
+            )
+            .await?;
 
         // Dropping the outgoing mirror releases the clients still attached to it.
         self.tracked.write().await.insert(
@@ -146,8 +185,12 @@ impl PaneRunner {
 
     /// Forward browser keystrokes to the mirrored pane, verbatim.
     pub async fn send_input(&self, key: &str, text: &str) -> Result<()> {
-        let tracked = self.tracked.read().await;
-        self.require(&tracked, key)?.pane.send_text(text).await
+        let (client, result) = {
+            let tracked = self.tracked.read().await;
+            let pane = &self.require(&tracked, key)?.pane;
+            (pane.client(), pane.send_text(text).await)
+        };
+        self.healing(&client, result).await
     }
 
     /// Repaint a mirrored pane from its screen, returning the epoch the paint opens.
@@ -156,8 +199,12 @@ impl PaneRunner {
     /// because rmux dropped output on the way here. The paint reaches every client attached to the
     /// pane, not just the one that asked; a fresh screen is never wrong for any of them.
     pub async fn resync(&self, key: &str) -> Result<u32> {
-        let tracked = self.tracked.read().await;
-        self.require(&tracked, key)?.pane.repaint().await
+        let (client, result) = {
+            let tracked = self.tracked.read().await;
+            let pane = &self.require(&tracked, key)?.pane;
+            (pane.client(), pane.repaint().await)
+        };
+        self.healing(&client, result).await
     }
 
     /// Match the mirrored pane's geometry to the browser terminal's.
@@ -165,8 +212,12 @@ impl PaneRunner {
     /// `window-size` is left at its default so an attached human isn't fighting a browser tab for
     /// geometry.
     pub async fn resize(&self, key: &str, cols: u16, rows: u16) -> Result<()> {
-        let tracked = self.tracked.read().await;
-        self.require(&tracked, key)?.pane.resize(cols, rows).await
+        let (client, result) = {
+            let tracked = self.tracked.read().await;
+            let pane = &self.require(&tracked, key)?.pane;
+            (pane.client(), pane.resize(cols, rows).await)
+        };
+        self.healing(&client, result).await
     }
 
     fn require<'a>(
@@ -187,10 +238,13 @@ impl PaneRunner {
         let Ok(rmux) = self.rmux().await else {
             return PaneLiveness::Unknown;
         };
-        let Ok(pane_id) = find_window_pane(&rmux, session, window).await else {
+        let found = self
+            .healing(&rmux, find_window_pane(&rmux, session, window).await)
+            .await;
+        let Ok(pane_id) = found else {
             return PaneLiveness::Unknown;
         };
-        toren_mirror::liveness(&rmux, session, pane_id)
+        self.healing(&rmux, toren_mirror::liveness(&rmux, session, pane_id).await)
             .await
             .unwrap_or(PaneLiveness::Unknown)
     }
@@ -524,6 +578,103 @@ mod tests {
         assert_eq!(mirror.state().borrow().exit_code(), Some(3));
 
         rmux_conv::kill_session(&session).unwrap();
+    }
+
+    /// Dropping a mirror must not take the shared rmux client down with it. The SDK kills the
+    /// whole client when a request future is dropped mid-flight, and a firehose pane keeps the
+    /// pump's requests in flight almost continuously — so an aborted (rather than cooperatively
+    /// stopped) pump would poison the client here almost every iteration. Needs rmux installed.
+    #[tokio::test]
+    async fn dropping_a_mirror_leaves_the_shared_client_usable() {
+        if !rmux_conv::is_available() {
+            eprintln!("skipping: rmux not on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("one");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let segment = format!("mirrordrop{}", std::process::id());
+        let session = rmux_conv::session_name(&segment, "one", None);
+        let runner = PaneRunner::new();
+        runner
+            .start_agent(
+                &session,
+                &session,
+                &workspace,
+                &[],
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "while :; do echo FIREHOSE; done".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let client = runner.rmux().await.unwrap();
+        let pane_id = find_window_pane(&client, &session, rmux_conv::AGENT_WINDOW)
+            .await
+            .unwrap();
+
+        for _ in 0..10 {
+            let mirrored = MirroredPane::attach(client.clone(), &session, pane_id, PaneRole::Agent)
+                .await
+                .unwrap();
+            // Dropping before the pump has issued a request proves nothing.
+            wait_for(|| async { contains(&mirrored.mirror().attach().await.0.bytes, "FIREHOSE") })
+                .await;
+        }
+
+        find_window_pane(&client, &session, rmux_conv::AGENT_WINDOW)
+            .await
+            .expect("the shared client survives every dropped mirror");
+
+        // Now poison the shared client the way anything outside this crate can — by cancelling a
+        // request mid-flight — and check the runner heals: the poisoned call fails and discards
+        // the client, the next one reconnects.
+        poison(&client, &session).await;
+        runner
+            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW)
+            .await
+            .expect_err("a poisoned client fails the call that finds it dead");
+        runner
+            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW)
+            .await
+            .expect("the call after a dead client runs on a fresh connection");
+
+        runner.stop_agent(&session, &session).await.unwrap();
+        rmux_conv::kill_session(&session).unwrap();
+    }
+
+    /// Kill a client's transport by dropping a request future while its ordered response is
+    /// pending — the SDK aborts the whole client when that happens.
+    async fn poison(client: &Arc<Rmux>, session: &str) {
+        for _ in 0..100 {
+            let cancelled = tokio::time::timeout(
+                std::time::Duration::from_micros(50),
+                client.find_panes().session(session).all(),
+            )
+            .await;
+            if cancelled.is_ok() {
+                continue;
+            }
+            let probe: anyhow::Result<_> = client
+                .find_panes()
+                .session(session)
+                .all()
+                .await
+                .map_err(Into::into);
+            if probe
+                .as_ref()
+                .err()
+                .is_some_and(toren_mirror::transport_is_dead)
+            {
+                return;
+            }
+        }
+        panic!("cancelling requests mid-flight never killed the client");
     }
 
     fn contains(haystack: &[u8], needle: &str) -> bool {

@@ -912,8 +912,11 @@ fn run_hook(registry: &PlaceRegistry, hook: HookArg) -> Result<()> {
     Ok(())
 }
 
-/// Mirror the session's `shell` window, so the shell sits alongside the agent rather than being
-/// an unrelated subprocess.
+/// Open a fresh shell window in the workspace's session and mirror it.
+///
+/// Every invocation is its own shell: two terminals running `breq sh` on one workspace are two
+/// shells side by side, not two mirrors of one pane. The shell still lives in the session, so it
+/// sits alongside the agent and shows up in the browser's window list.
 ///
 /// This is the "feels exactly like `zsh`" case: no chrome, and `exit` closes the pane and returns
 /// you to the shell you came from. `--hold` opts into keeping the finished pane, which is only
@@ -923,18 +926,17 @@ fn launch_shell(place: &Place, no_rmux: bool, hold: Option<bool>) -> Result<()> 
         let session = place.session_name();
         toren_lib::rmux::reconcile(&place.segment, &place.name, place.uid().as_deref());
         toren_lib::rmux::ensure_session(&session, &place.path, &place.env())?;
-        toren_lib::rmux::ensure_shell(&session, &place.path)?;
+        let window = toren_lib::rmux::open_shell(&session, &place.path)?;
 
         let hold = hold.unwrap_or(false);
-        let window = toren_lib::rmux::SHELL_WINDOW.to_string();
         toren_lib::rmux::set_hold(&session, &window, hold)?;
 
-        // A window recreated by a re-run inherits the session's default, so the policy is applied
-        // again rather than assumed to have survived.
+        // A re-run restarts a shell in the same window rather than opening yet another one.
+        let rerun_window = window.clone();
         let rerun: mirror::Rerun = Box::new(move |place: &Place| {
             let session = place.session_name();
-            toren_lib::rmux::ensure_shell(&session, &place.path)?;
-            toren_lib::rmux::set_hold(&session, toren_lib::rmux::SHELL_WINDOW, hold)
+            toren_lib::rmux::respawn_shell(&session, &rerun_window, &place.path)?;
+            toren_lib::rmux::set_hold(&session, &rerun_window, hold)
         });
         let code = mirror::run(
             place,

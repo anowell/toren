@@ -27,7 +27,9 @@ mod seed;
 pub use buffer::{Backfill, Frame, MirrorState, PaneMirror, LAG_BUDGET_BYTES};
 pub use filter::QueryFilter;
 pub use held::{held_status_line, PaneRole};
-pub use pane::{connect, find_window_pane, liveness, MirroredPane, PaneLiveness};
+pub use pane::{
+    connect, find_window_pane, liveness, transport_is_dead, MirroredPane, PaneLiveness,
+};
 pub use seed::{paint, screen_paint, PaneModes};
 
 pub use rmux_sdk::{PaneExitState, PaneId, Rmux, SessionName};

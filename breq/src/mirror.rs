@@ -64,17 +64,35 @@ pub fn run(place: &Place, pane: Pane, rerun: Rerun<'_>) -> Result<i32> {
 }
 
 async fn mirror(place: &Place, mut pane: Pane, mut rerun: Rerun<'_>) -> Result<i32> {
-    let rmux_client = toren_mirror::connect().await?;
+    let mut rmux_client = toren_mirror::connect().await?;
     let session = place.session_name();
     let mut input = read_stdin();
     let mut winch = signal(SignalKind::window_change())
         .context("Failed to listen for terminal resizes (SIGWINCH)")?;
     let mut out = std::io::stdout();
+    let mut reconnected = false;
 
     loop {
-        let pane_id = toren_mirror::find_window_pane(&rmux_client, &session, &pane.window).await?;
-        let mirrored =
-            MirroredPane::attach(rmux_client.clone(), &session, pane_id, pane.role).await?;
+        let attached = async {
+            let pane_id =
+                toren_mirror::find_window_pane(&rmux_client, &session, &pane.window).await?;
+            MirroredPane::attach(rmux_client.clone(), &session, pane_id, pane.role).await
+        }
+        .await;
+        let mirrored = match attached {
+            Ok(mirrored) => {
+                reconnected = false;
+                mirrored
+            }
+            // A dead client stays dead (any request cancelled mid-flight kills it); one fresh
+            // connection is the fix, and a second failure on it is a real error.
+            Err(e) if toren_mirror::transport_is_dead(&e) && !reconnected => {
+                rmux_client = toren_mirror::connect().await?;
+                reconnected = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if let Some((cols, rows)) = terminal_size() {
             let _ = mirrored.resize(cols, rows).await;
         }
@@ -97,15 +115,16 @@ async fn mirror(place: &Place, mut pane: Pane, mut rerun: Rerun<'_>) -> Result<i
                     paint(&mut out, format!("\r\n{:#}\r\n", e).as_bytes())?;
                 }
             }
-            // A shell is the one thing a workspace always has, so dropping to one leaves the held
-            // pane where it is rather than trading it away: it is still in the browser's window
-            // list, and `<Ctrl-c>` is the way to be rid of it.
+            // Dropping to a shell leaves the held pane where it is rather than trading it away: it
+            // is still in the browser's window list, and `<Ctrl-c>` is the way to be rid of it.
+            // The shell is a fresh one — every shell here is its own, never a mirror of somebody
+            // else's.
             Next::Shell => {
                 drop(mirrored);
-                rmux::ensure_shell(&session, &place.path)?;
-                let _ = rmux::set_hold(&session, rmux::SHELL_WINDOW, false);
+                let window = rmux::open_shell(&session, &place.path)?;
+                let _ = rmux::set_hold(&session, &window, false);
                 pane = Pane {
-                    window: rmux::SHELL_WINDOW.to_string(),
+                    window,
                     role: PaneRole::Shell,
                     hold: false,
                 };

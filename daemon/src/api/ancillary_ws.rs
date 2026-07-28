@@ -260,7 +260,7 @@ where
             send_json(
                 sender,
                 &WsResponse::Error {
-                    message: format!("Failed to resync: {}", e),
+                    message: format!("Failed to resync: {:#}", e),
                 },
             )
             .await;

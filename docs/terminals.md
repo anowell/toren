@@ -19,8 +19,10 @@ toren-toren-one-aaa111
 ```
 
 A workspace's session holds a *set* of windows: one or more shells, any commands you have run, and,
-when an agent is running, an `agent` window. Shells are opened on demand (`breq sh` ensures one; the
-web UI can open more) and each closes when you `exit` it, like any terminal.
+when an agent is running, an `agent` window. Every `breq sh` (and the web UI's "New shell") opens a
+shell window of its own — two terminals running `breq sh` on one workspace are two shells, never two
+mirrors of one pane — and each closes when you `exit` it, like any terminal. To watch a window that
+already exists instead, name it: `breq sh <ws> --window <name>`.
 
 **Whether a pane closes with its process is decided when the window is created**, not inferred
 afterwards. A window that is just a shell closes; a window made from a *command* — `breq sh <ws> --
@@ -73,12 +75,14 @@ pty being rendered in two places at once.
 breq do -p "fix the flaky test"     # creates the workspace, spawns the agent, mirrors its pane
 # ... work ...
 # close the terminal — the pane, and the agent in it, keep running in rmux
-breq sh one                        # mirror the same session's shell window
+breq sh one                        # open a shell of your own in the same session
+breq sh one --window agent         # watch the agent that is already running there
 ```
 
 There is no detach *chord*: keystrokes all belong to the pane, so leaving is closing the terminal
-(or killing `breq`), and coming back is running the same command again — it mirrors the pane that is
-there rather than starting a second one.
+(or killing `breq`). Coming back to an *agent* is `breq do` / `breq sh <ws> --window agent`, which
+mirrors the pane that is there rather than starting a second one; a bare `breq sh` always opens a
+fresh shell.
 
 Open `https://<your-toren>/a/<segment>/one` in a browser and you get the same pane, live, in an
 xterm.js terminal: same scrollback, same keystrokes, no second agent process. Close the tab; the
