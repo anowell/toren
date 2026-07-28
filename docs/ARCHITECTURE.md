@@ -55,7 +55,8 @@ A short **uid**, minted at `breq setup`, distinguishes incarnations of a slot an
 rmux session name (`toren-<segment>-<ws>-<uid>`). Task-source-owned fields
 (status, assignee) are never cached — they are read live through task resolvers. The daemon and
 `breq` build the same `WorkspaceView` join over this, so `breq get <ws> --json` and
-`GET /api/workspaces/:segment/:name` return the same shape.
+`GET /api/workspaces/:segment/:name` return the same shape — the API adding the `session` name a
+browser cannot derive.
 
 ### Pane Runner (Rust, `rmux-sdk`)
 - Spawns the agent CLI into an rmux pane, the same process `breq do` would exec
@@ -120,7 +121,9 @@ itself) and the browser sends `ping` as JSON, since its API cannot send a protoc
 - `POST /api/workspaces/:segment/:name/shell` - Open a new shell window
 - `GET /api/workspaces/:segment/:name/sessions` - The workspace's recorded agent sessions
 - `POST /api/workspaces/:segment/:name/windows/:window/close` - Dismiss one window (a held pane)
-- `GET /api/agents` - Agents this daemon can start, and the configured default
+- `POST /api/workspaces/:segment/:name/workflow` - Run `breq complete|abort <ws>` (`{ verb }`, a
+  fixed enum) in a held `cmd` window, returning its name; the output lives in that pane
+- `GET /api/agents` - Every agent this daemon has a plugin for (`{ name, installed, default }`)
 
 ## Security
 

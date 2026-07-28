@@ -7,9 +7,21 @@
 //! Adding an agent is one `.rhai` file, no release.
 
 use anyhow::{Context, Result};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 
 use crate::plugins::PluginManager;
+
+/// The `PATH` a command spawned from this process would be looked up in.
+fn current_path() -> Option<OsString> {
+    std::env::var_os("PATH")
+}
+
+/// Whether `binary` resolves as an executable in `path`, ignoring the working directory: a name
+/// that only works because of where the daemon happens to be running is not installed.
+fn resolves_in(binary: &str, path: Option<&OsStr>) -> bool {
+    which::which_in_global(binary, path).is_ok_and(|mut found| found.next().is_some())
+}
 
 /// An agent plus an optional model override, e.g. `claude:opus` or `codex:o3`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +96,7 @@ impl AgentSpec {
         for name in plugins.list_agents() {
             let spec = Self::parse(name);
             if let Ok(binary) = spec.binary(plugins) {
-                if which::which(&binary).is_ok() {
+                if resolves_in(&binary, current_path().as_deref()) {
                     return Ok(spec);
                 }
             }
@@ -93,6 +105,23 @@ impl AgentSpec {
             "No coding agent found on PATH. Installed agent plugins: {}",
             plugins.list_agents().join(", ")
         )
+    }
+
+    /// Whether this agent's launch binary resolves on `path`, a `PATH`-shaped list of directories.
+    ///
+    /// An agent that cannot say what it launches counts as installed: a plugin whose `argv` is
+    /// broken belongs in the list, failing loudly when someone starts it, rather than quietly
+    /// missing from it.
+    pub fn installed_in(&self, plugins: &PluginManager, path: Option<&OsStr>) -> bool {
+        match self.binary(plugins) {
+            Ok(binary) => resolves_in(&binary, path),
+            Err(_) => true,
+        }
+    }
+
+    /// [`Self::installed_in`] against this process's own `PATH` — what a spawn would use.
+    pub fn installed(&self, plugins: &PluginManager) -> bool {
+        self.installed_in(plugins, current_path().as_deref())
     }
 
     /// The program an agent launches, taken from its own argv contract.
@@ -239,5 +268,46 @@ mod tests {
         );
         assert_eq!(spec.binary(&plugins).unwrap(), "claude");
         assert_eq!(spec.packed(), "claude:opus");
+    }
+
+    /// A directory holding an executable named `binary`, to stand in for a PATH entry.
+    fn path_with(binary: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(binary);
+        std::fs::write(&file, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn installed_follows_the_agents_own_launch_binary() {
+        let plugins = plugins();
+        let dir = path_with("claude");
+        let path = Some(dir.path().as_os_str());
+
+        assert!(AgentSpec::parse("claude:opus").installed_in(&plugins, path));
+        assert!(!AgentSpec::parse("codex").installed_in(&plugins, path));
+        assert!(!AgentSpec::parse("claude").installed_in(&plugins, None));
+    }
+
+    #[test]
+    fn an_agent_that_cannot_build_argv_still_counts_as_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("broken.rhai"),
+            r#"fn argv(ctx) { throw "nope" }"#,
+        )
+        .unwrap();
+        let plugins = PluginManager::new(dir.path()).unwrap();
+
+        let spec = AgentSpec::parse("broken");
+        assert!(spec.binary(&plugins).is_err());
+        assert!(spec.installed_in(&plugins, None));
     }
 }

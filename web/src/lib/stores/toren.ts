@@ -1,5 +1,6 @@
 import { derived, get, writable } from 'svelte/store';
 import type {
+	AgentInfo,
 	AgentSession,
 	AgentsResponse,
 	CommandOutput,
@@ -8,6 +9,9 @@ import type {
 	StartWorkspaceRequest,
 	TaskDisplayStatus,
 	TaskView,
+	WorkflowRequest,
+	WorkflowResponse,
+	WorkflowVerb,
 	WorkspaceDisplayStatus,
 	WorkspaceSessionsResponse,
 	WorkspaceView,
@@ -402,11 +406,17 @@ function createTorenStore() {
 			const data = await response.json();
 			return data.window;
 		},
-		/** Every agent the daemon can start, so "New agent" can name them one by one. */
-		async loadAgents(shipUrl: string): Promise<AgentsResponse> {
+		/**
+		 * The agents the daemon can actually start, so "New agent" names them one by one.
+		 *
+		 * The daemon reports every agent it has a plugin for; the ones whose binary is not on its
+		 * host are dropped here, because offering to start them is offering a failure.
+		 */
+		async loadAgents(shipUrl: string): Promise<AgentInfo[]> {
 			const response = await fetch(`${shipUrl}/api/agents`);
 			if (!response.ok) throw new Error('Failed to load agents');
-			return response.json();
+			const data: AgentsResponse = await response.json();
+			return (data.agents ?? []).filter((agent) => agent.installed);
 		},
 		/**
 		 * The workspace's recorded agent sessions, newest first.
@@ -421,6 +431,32 @@ function createTorenStore() {
 			if (!response.ok) throw new Error('Failed to load sessions');
 			const data: WorkspaceSessionsResponse = await response.json();
 			return [...(data.sessions ?? [])].reverse();
+		},
+		/**
+		 * Run `breq complete` / `breq abort` for a workspace; resolves to the window it runs in.
+		 *
+		 * The daemon holds the pane rather than answering with the script's output, so the caller's
+		 * job after this is to go and look at that window.
+		 */
+		async runWorkflow(
+			shipUrl: string,
+			segment: string,
+			name: string,
+			verb: WorkflowVerb,
+		): Promise<string> {
+			const seg = encodeURIComponent(segment);
+			const ws = encodeURIComponent(name);
+			const response = await fetch(`${shipUrl}/api/workspaces/${seg}/${ws}/workflow`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ verb } satisfies WorkflowRequest),
+			});
+			if (!response.ok) {
+				const data = await response.json().catch(() => ({}));
+				throw new Error(data.error || `Failed to run ${verb}`);
+			}
+			const data: WorkflowResponse = await response.json();
+			return data.window;
 		},
 		/** Dismiss one window of the workspace's session — a held pane, usually. */
 		async closeWorkspaceWindow(

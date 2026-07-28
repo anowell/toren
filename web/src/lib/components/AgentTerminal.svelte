@@ -1,8 +1,8 @@
 <script lang="ts">
-import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import { createEventDispatcher, onDestroy, onMount } from 'svelte';
+import { fitTerminal } from '$lib/terminal/fit';
 import { decodeFrame, EpochFilter } from '$lib/terminal/frames';
 import { type HeldAction, heldAction } from '$lib/terminal/held';
 
@@ -29,9 +29,9 @@ const dispatch = createEventDispatcher<{
 
 let host: HTMLDivElement;
 let term: Terminal | null = null;
-let fit: FitAddon | null = null;
 let socket: WebSocket | null = null;
 let resizeObserver: ResizeObserver | null = null;
+let fitFrame: number | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempts = 0;
 let pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -73,10 +73,11 @@ onMount(() => {
 		},
 	});
 
-	fit = new FitAddon();
-	term.loadAddon(fit);
 	term.open(host);
-	fit.fit();
+	refit();
+	// The grid is measured in cells, and a cell is measured from the font: until it has loaded,
+	// every row count derived from it is provisional and nothing about the layout says so.
+	document.fonts?.ready.then(scheduleFit);
 
 	term.onData((data) => {
 		if (held) {
@@ -88,20 +89,37 @@ onMount(() => {
 		send({ type: 'data', data });
 	});
 
-	resizeObserver = new ResizeObserver(() => {
-		if (!fit || !term) return;
-		fit.fit();
-		send({ type: 'resize', cols: term.cols, rows: term.rows });
-	});
+	// The host is the box the rows are laid out in, so it is the box to measure: every bar above
+	// the terminal changes its height, and none of them is worth knowing about individually.
+	resizeObserver = new ResizeObserver(scheduleFit);
 	resizeObserver.observe(host);
 });
 
 onDestroy(() => {
 	resizeObserver?.disconnect();
+	if (fitFrame !== null) cancelAnimationFrame(fitFrame);
+	fitFrame = null;
 	disconnect();
 	term?.dispose();
 	term = null;
 });
+
+/** Coalesce the fits a single layout change can ask for into one, after that layout has settled. */
+function scheduleFit() {
+	if (fitFrame !== null) return;
+	fitFrame = requestAnimationFrame(() => {
+		fitFrame = null;
+		refit();
+	});
+}
+
+/** Size the grid to the host, and tell the pane what it now is. */
+function refit() {
+	if (!term || !host) return;
+	const geometry = fitTerminal(term, host);
+	if (!geometry) return;
+	send({ type: 'resize', cols: geometry.cols, rows: geometry.rows });
+}
 
 function scheduleReconnect(target: string) {
 	if (reconnectTimer) return;
@@ -250,34 +268,34 @@ function send(message: Record<string, unknown>) {
 	}
 }
 
-/** Type a line into the pane and submit it. Used by the on-screen input, chiefly for mobile. */
-export function sendLine(text: string) {
-	send({ type: 'data', data: `${text}\r` });
-}
-
-export function interrupt() {
-	send({ type: 'interrupt' });
-}
-
 /** Ask the daemon to repaint this pane, for a terminal that looks wrong. */
 export function resync() {
 	send({ type: 'resync' });
 }
 </script>
 
-<div class="terminal-host" bind:this={host}></div>
+<div class="terminal-frame">
+	<div class="terminal-host" bind:this={host}></div>
+</div>
 
 <style>
-.terminal-host {
-	width: 100%;
-	height: 100%;
+/*
+ * The frame holds the breathing room, and the host holds nothing but the grid: the fit measures
+ * the host, so any padding on it would be counted as room for rows that are then drawn outside it.
+ */
+.terminal-frame {
+	flex: 1;
 	min-height: 0;
+	display: flex;
+	flex-direction: column;
 	padding: 0.5rem;
 	background: #0d0f12;
-	overflow: hidden;
 }
 
-.terminal-host :global(.xterm) {
-	height: 100%;
+.terminal-host {
+	flex: 1;
+	min-height: 0;
+	min-width: 0;
+	overflow: hidden;
 }
 </style>

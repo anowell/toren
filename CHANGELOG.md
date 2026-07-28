@@ -41,6 +41,49 @@ rebuilt — but it now recovers instead of asking you to reload.
   Previous Session" lists what the workspace recorded — each resume opening a new pane on an old
   session.
 
+### The workspace page is rebuilt around the terminal
+Vertical position is scope — app bar, sidebar, ancillary bar, facts, panes, terminal — and the
+terminal gets every pixel the bars do not need. The daemon side of that lands first:
+
+- **`GET /api/agents` reports what is installed.** Each agent comes back as
+  `{name, installed, default}`, where `installed` is whether the binary the agent's own plugin says
+  it launches resolves on the daemon's PATH — so the browser stops offering "New codex agent" on a
+  machine without codex. An agent whose plugin cannot say what it launches is listed anyway, since a
+  misconfigured agent should fail loudly rather than vanish.
+- **A workspace view carries its rmux `session`**, so session identity and attach commands are read
+  from the daemon rather than rebuilt in the browser out of segment, name and uid.
+- **`POST /api/workspaces/:segment/:name/workflow`** runs the same `breq-complete` / `breq-abort`
+  scripts the CLI does, in a held `cmd` pane where the output is read like any other command's — no
+  streaming over HTTP. The body is `{"verb": "complete" | "abort"}`, an enum rather than a command
+  line: nothing else can be spawned through it.
+- **The input row is gone.** Typing happens in the terminal, which takes keystrokes directly; a
+  textarea that retyped them into it was a second, worse keyboard. The app bar's interrupt button
+  goes with it — `Ctrl-C` reaches the pane, and interrupting is pane scope, not app scope — and the
+  workspaces toggle it used to sit beside moves up into the app bar on a phone.
+- **Every control sits in the bar whose scope it affects.** `Complete` and `Abort` are workspace
+  lifecycle, so they are on the workspace's own bar, each confirming by naming the script it runs
+  and then selecting the pane it runs in. `+ Shell` and `+ Agent` make panes, so they are on the
+  panes bar, together, with resume folded into the agent menu and only installed agents listed.
+  Stopping an agent is on that agent's chip, where `agent_activity` is also shown.
+- **The terminal's bottom line is no longer clipped.** The fit measured the box the grid is drawn
+  in *plus* its padding — `getComputedStyle().height` reports the border box for a
+  `box-sizing: border-box` element — so the terminal was told it had room for a row that then hung
+  below the box and was cut off by its `overflow: hidden`. Padding now lives on a frame outside the
+  measured element, the grid is re-fit whenever that element resizes or the font finishes loading,
+  and the pixels left over below the last whole row stay slack.
+- **Banners are for exceptions only.** "Attached to `<session>` — the same pane a local mirror
+  shows" is deleted (its content belongs on a chip, not in a sentence), and "Attaching…" appears
+  only when attaching takes longer than 300ms. Errors and held panes still announce themselves.
+- **What is true of a workspace is a strip of chips.** Task, changes, pull requests, `▣ N runs` and
+  the rmux session each show a glyph and a count on one line, and clicking gives the fastest useful
+  dive: a popover of rows, or — for a single PR, which has one obvious destination — its url. This
+  replaces the sets summary and the panel that unfolded below it, so no detail is a standing panel
+  taking height from the terminal; an empty fact does not render at all, except the task chip, whose
+  dimmed "no task" is itself a fact. The session chip is where the deleted banner's content went:
+  the full session name and the `breq sh <ws>` / `breq sh <ws> --window <w>` commands to attach a
+  terminal of your own, copyable — including from a phone on plain http, where the browser hands out
+  no clipboard — and still never an `rmux attach`.
+
 ### State gets a schema (breaking)
 Every file toren persists now carries a `version` as its first key and is written atomically, so a
 crash mid-write cannot truncate the `uid` that names a live rmux session.

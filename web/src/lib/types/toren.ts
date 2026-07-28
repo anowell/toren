@@ -129,6 +129,8 @@ export interface WorkspaceView {
 	vcs_tracked: boolean;
 	state: WorkspaceState;
 	sets: Sets;
+	/** The rmux session this workspace's panes live in — what every attach command names. */
+	session?: string;
 }
 
 export interface WorkspacesResponse {
@@ -177,6 +179,20 @@ export interface WorkspaceSessionsResponse {
 	agent?: string | null;
 }
 
+/** The workflow scripts a browser may run for a workspace. The daemon takes no other verb. */
+export type WorkflowVerb = 'complete' | 'abort';
+
+export interface WorkflowRequest {
+	verb: WorkflowVerb;
+}
+
+export interface WorkflowResponse {
+	success: boolean;
+	session: string;
+	/** The held `cmd` window the script is running in. */
+	window: string;
+}
+
 export interface CloseWindowResponse {
 	success: boolean;
 	/** Whether the window still had a live pane, as opposed to a held one being dismissed. */
@@ -185,11 +201,18 @@ export interface CloseWindowResponse {
 
 // ── Agents ─────────────────────────────────────────────────────────────────
 
+/** One agent the daemon knows about, installed on its host or not. */
+export interface AgentInfo {
+	name: string;
+	/** Whether the agent's launch binary resolves on the daemon's PATH. */
+	installed: boolean;
+	/** Whether a start with no agent named resolves to this one. */
+	default: boolean;
+}
+
 export interface AgentsResponse {
-	/** Every agent the daemon can start, by name. */
-	agents: string[];
-	/** The configured default, which is what a start with no agent named resolves to. */
-	default?: string | null;
+	/** Every agent the daemon has a plugin for, installed or not. */
+	agents: AgentInfo[];
 }
 
 // ── Segments ───────────────────────────────────────────────────────────────

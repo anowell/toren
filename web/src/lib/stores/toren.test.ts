@@ -113,6 +113,42 @@ describe('Toren Store', () => {
 		});
 	});
 
+	describe('runWorkflow', () => {
+		afterEach(() => {
+			vi.unstubAllGlobals();
+		});
+
+		it('sends the verb as a verb and returns the window it runs in', async () => {
+			const fetchMock = vi.fn().mockResolvedValue({
+				ok: true,
+				json: async () => ({ success: true, session: 'toren-one', window: 'cmd' }),
+			});
+			vi.stubGlobal('fetch', fetchMock);
+
+			const window = await torenStore.runWorkflow('http://ship.local', 'toren', 'one', 'complete');
+
+			expect(window).toBe('cmd');
+			expect(fetchMock).toHaveBeenCalledWith(
+				'http://ship.local/api/workspaces/toren/one/workflow',
+				expect.objectContaining({ method: 'POST', body: '{"verb":"complete"}' }),
+			);
+		});
+
+		it('throws with the server error message on failure', async () => {
+			vi.stubGlobal(
+				'fetch',
+				vi.fn().mockResolvedValue({
+					ok: false,
+					json: async () => ({ error: 'rmux is not installed' }),
+				}),
+			);
+
+			await expect(
+				torenStore.runWorkflow('http://ship.local', 'toren', 'one', 'abort'),
+			).rejects.toThrow('rmux is not installed');
+		});
+	});
+
 	it('should reset to initial state', () => {
 		// Modify state
 		torenStore.update((state) => ({

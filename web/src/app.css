@@ -68,6 +68,39 @@ button:focus {
 	outline-offset: 2px;
 }
 
+/* A fact on the workspace strip: a glyph and a count, whatever element carries it. */
+.fact-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--spacing-xs);
+	flex-shrink: 0;
+	padding: 2px 8px;
+	background: var(--color-bg);
+	border: 1px solid var(--color-border);
+	border-radius: var(--radius-md);
+	color: var(--color-text-secondary);
+	font-size: 0.75rem;
+	line-height: 1.4;
+	white-space: nowrap;
+	text-decoration: none;
+}
+
+.fact-chip:hover {
+	border-color: var(--color-primary);
+	color: var(--color-text);
+}
+
+.fact-chip.absent {
+	border-style: dashed;
+	opacity: 0.6;
+	cursor: default;
+}
+
+.fact-chip.absent:hover {
+	border-color: var(--color-border);
+	color: var(--color-text-secondary);
+}
+
 /* Mobile-first utility classes */
 .container {
 	max-width: 100%;

@@ -89,6 +89,10 @@ pub async fn serve(
         )
         .route("/api/workspaces/:segment/:name/stop", post(workspace_stop))
         .route(
+            "/api/workspaces/:segment/:name/workflow",
+            post(workspace_workflow),
+        )
+        .route(
             "/api/workspaces/:segment/:name/shell",
             post(workspace_open_shell),
         )
@@ -230,11 +234,34 @@ async fn adopt_current_pane(
 
 /// The agents this daemon can start, so the browser offers one action per agent ("New Claude
 /// agent") rather than a single button that hides which one it means.
+///
+/// `installed` is whether the agent's own launch binary resolves on the daemon's PATH — the
+/// browser offers only those, since a plugin is present for every agent this build knows about
+/// whether or not the machine has it. `default` marks the one a start with no agent named
+/// resolves to.
 async fn agents_list(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({
-        "agents": state.rhai_plugins.list_agents(),
-        "default": state.config.ancillaries.agent,
-    }))
+    let default = AgentSpec::resolve(
+        &state.rhai_plugins,
+        None,
+        None,
+        state.config.ancillaries.agent.as_deref(),
+    )
+    .ok();
+
+    let agents: Vec<_> = state
+        .rhai_plugins
+        .list_agents()
+        .into_iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "installed": AgentSpec::parse(name).installed(&state.rhai_plugins),
+                "default": default.as_ref().is_some_and(|d| d.name == name),
+            })
+        })
+        .collect();
+
+    Json(json!({ "agents": agents }))
 }
 
 async fn ancillaries_list(State(state): State<AppState>) -> impl IntoResponse {
@@ -283,8 +310,9 @@ async fn segments_create(
 
 // ==================== Workspace API ====================
 
-/// One workspace, rendered exactly as `breq get <ws> --json` emits it
-/// (`breq/src/render.rs::detail_json`): the place's identity plus its full [`Sets`].
+/// One workspace, rendered as `breq get <ws> --json` emits it
+/// (`breq/src/render.rs::detail_json`): the place's identity plus its full [`Sets`], and the rmux
+/// session it lives in — which a browser has no way to derive but every attach command names.
 fn workspace_view(
     place: &Place,
     sets: &Sets,
@@ -302,6 +330,7 @@ fn workspace_view(
         "vcs_tracked": place.vcs_tracked,
         "state": place.state,
         "sets": sets,
+        "session": place.session_name(),
     })
 }
 
@@ -605,6 +634,92 @@ async fn workspace_open_shell(
     })))
 }
 
+/// The workflow verbs a browser may run.
+///
+/// An enum rather than a command line: this endpoint spawns a process, so what it can spawn is
+/// decided here and anything else is a 422 from the extractor.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum WorkflowVerb {
+    Complete,
+    Abort,
+}
+
+impl WorkflowVerb {
+    fn as_str(self) -> &'static str {
+        match self {
+            WorkflowVerb::Complete => "complete",
+            WorkflowVerb::Abort => "abort",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRequest {
+    verb: WorkflowVerb,
+}
+
+/// Run one workflow verb — `breq complete <ws>`, `breq abort <ws>` — in a held `cmd` window.
+///
+/// The web drives the same `breq-complete` / `breq-abort` scripts the CLI does, and their output
+/// lives in a pane rather than in this response: a script that prints for a minute, or stops to
+/// ask something, is then read and answered where every other command is.
+async fn workspace_workflow(
+    State(state): State<AppState>,
+    Path((segment, name)): Path<(String, String)>,
+    Json(request): Json<WorkflowRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let registry = PlaceRegistry::new(&state.config).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{:#}", e)})),
+        )
+    })?;
+
+    let seg = registry.segment(Some(&segment)).map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Segment not found: {}", segment)})),
+        )
+    })?;
+    let place = registry.require(&seg, &name).map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Workspace not found: {}/{}", segment, name)})),
+        )
+    })?;
+
+    if !toren_lib::rmux::is_available() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "rmux is not installed, so there is no pane to run the verb in"})),
+        ));
+    }
+
+    let session = place.session_name();
+    let argv = [
+        "breq".to_string(),
+        request.verb.as_str().to_string(),
+        place.name.clone(),
+    ];
+    let window = state
+        .panes
+        .run_command(&session, &place.path, &place.env(), &argv)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{:#}", e)})),
+            )
+        })?;
+
+    Ok(Json(json!({
+        "success": true,
+        "session": session,
+        "window": window,
+    })))
+}
+
 /// The agent sessions recorded for a workspace, oldest first, straight out of `state.json`.
 ///
 /// Separate from the workspace view because picking a session to resume should not pay for the
@@ -699,4 +814,36 @@ async fn workspace_stop(
     toren_lib::sessions::settle_saved(&mut place, &state.rhai_plugins);
 
     Ok(Json(json!({ "success": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verb(body: serde_json::Value) -> Result<WorkflowVerb, serde_json::Error> {
+        serde_json::from_value::<WorkflowRequest>(body).map(|r| r.verb)
+    }
+
+    #[test]
+    fn the_workflow_body_accepts_only_the_two_verbs() {
+        assert_eq!(
+            verb(json!({"verb": "complete"})).unwrap().as_str(),
+            "complete"
+        );
+        assert_eq!(verb(json!({"verb": "abort"})).unwrap().as_str(), "abort");
+
+        for rejected in [
+            json!({"verb": "rm"}),
+            json!({"verb": "Complete"}),
+            json!({"verb": ["complete"]}),
+            json!({"verb": null}),
+            json!({}),
+        ] {
+            assert!(
+                verb(rejected.clone()).is_err(),
+                "{} must be rejected",
+                rejected
+            );
+        }
+    }
 }

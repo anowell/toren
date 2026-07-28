@@ -3,6 +3,7 @@ import { onDestroy } from 'svelte';
 import { goto } from '$app/navigation';
 import { page } from '$app/stores';
 import AgentTerminal from '$lib/components/AgentTerminal.svelte';
+import FactsStrip from '$lib/components/FactsStrip.svelte';
 import SegmentDropdown from '$lib/components/SegmentDropdown.svelte';
 import SessionsModal from '$lib/components/SessionsModal.svelte';
 import TaskStatusIcon from '$lib/components/TaskStatusIcon.svelte';
@@ -18,25 +19,29 @@ import {
 } from '$lib/stores/toren';
 import type { HeldAction } from '$lib/terminal/held';
 import type {
+	AgentInfo,
 	AgentSession,
 	SessionInfo,
 	StartWorkspaceRequest,
+	WorkflowVerb,
 	WorkspaceView,
 } from '$lib/types/toren';
 
-let messageInput = '';
 let showMobilePanel = false;
-let showDetails = false;
 
 /** Typed structurally so biome doesn't see the import as type-only. */
-let terminal: { sendLine(text: string): void; interrupt(): void; resync(): void } | null = null;
+let terminal: { resync(): void } | null = null;
 let paneStatus = 'connecting';
-let paneSession: string | null = null;
 let wsError: string | null = null;
 // Bumped whenever the pane behind an unchanged window name has been replaced — a resume, another
 // agent, or a retry after the terminal gave up. The url is the same either way, so this is the
 // only thing that can tell the terminal to leave the pane it is on.
 let attachNonce = 0;
+
+// Attaching is normally instant, so saying so is noise; a wait long enough to notice is not.
+const ATTACHING_NOTICE_MS = 300;
+let attachingSlowly = false;
+let attachingTimer: ReturnType<typeof setTimeout> | null = null;
 
 function goToSegmentSelector() {
 	torenStore.selectSegment(null);
@@ -76,9 +81,14 @@ function selectWindow(window: string) {
 	selectedWindow = window;
 }
 
-/** Prefer the agent's activity string over the raw status for the agent row. */
-function sessionLabel(s: SessionInfo): string {
-	return s.agent_activity || s.status;
+/** The agent's own word for what it is doing, which is worth more than its pane's status. */
+function paneActivity(s: SessionInfo): string {
+	return s.agent_activity ?? '';
+}
+
+/** A live agent pane is stopped rather than dismissed: stopping it is what closes it. */
+function isLiveAgent(s: SessionInfo): boolean {
+	return s.window === 'agent' && s.status !== 'exited';
 }
 
 // Gated on auth: the pane bridge is only opened once the main connection is up. When a specific
@@ -92,55 +102,60 @@ $: terminalUrl =
 
 $: if (terminalUrl) {
 	paneStatus = 'connecting';
-	paneSession = null;
 	wsError = null;
+	startAttachingTimer();
 }
 
 /** Attach to whatever is in the selected window now, forgetting what was there before. */
 function reattachPane() {
 	attachNonce += 1;
 	paneStatus = 'connecting';
-	paneSession = null;
 	wsError = null;
+	startAttachingTimer();
+}
+
+function startAttachingTimer() {
+	stopAttachingTimer();
+	attachingTimer = setTimeout(() => {
+		attachingTimer = null;
+		attachingSlowly = true;
+	}, ATTACHING_NOTICE_MS);
+}
+
+function stopAttachingTimer() {
+	if (attachingTimer) clearTimeout(attachingTimer);
+	attachingTimer = null;
+	attachingSlowly = false;
 }
 
 $: displayStatus = currentWorkspace ? getWorkspaceDisplayStatus(currentWorkspace) : 'ready';
 $: task = currentWorkspace ? primaryTask(currentWorkspace) : null;
-$: sets = currentWorkspace?.sets;
 
 function handleTerminalStatus(event: CustomEvent<{ status: string; session?: string }>) {
 	paneStatus = event.detail.status;
-	if (event.detail.session) paneSession = event.detail.session;
 	if (paneStatus === 'attached') wsError = null;
+	// A dropped socket is already on its way back, so it is the same wait as a first attach.
+	if (paneStatus === 'disconnected') startAttachingTimer();
+	else stopAttachingTimer();
 }
 
 function handleTerminalError(event: CustomEvent<{ message: string }>) {
 	wsError = event.detail.message;
+	stopAttachingTimer();
 }
 
 onDestroy(() => {
+	stopAttachingTimer();
 	terminal = null;
 });
-
-/** Redundant with the terminal on desktop, but the terminal is awkward to type into on a phone. */
-function handleSendMessage() {
-	const content = messageInput.trim();
-	if (!content || !terminal) return;
-	messageInput = '';
-	terminal.sendLine(content);
-}
-
-function handleInterrupt() {
-	terminal?.interrupt();
-}
 
 let lifecycleLoading = false;
 let lifecycleError: string | null = null;
 let shellLoading = false;
 let dismissing: string | null = null;
 
-// The agents this daemon can start, so "New agent" names them rather than hiding the choice.
-let agents: string[] = [];
+// The agents this daemon can start, so "+ Agent" names them rather than hiding the choice.
+let agents: AgentInfo[] = [];
 let agentsRequested = false;
 let showAgentMenu = false;
 let agentMenu: HTMLDivElement;
@@ -152,13 +167,19 @@ let sessionsLoading = false;
 let sessionsError: string | null = null;
 let resumingId: string | null = null;
 
+// Whether there is anything to resume, which the workspace itself already knows.
+$: hasRecordedSessions = (currentWorkspace?.state.agent?.sessions?.length ?? 0) > 0;
+
+// A workflow verb runs a script that rewrites the workspace, so it is confirmed by name first.
+let pendingVerb: WorkflowVerb | null = null;
+let workflowRunning = false;
+
 $: if ($torenStore.authenticated && !agentsRequested) loadAgents();
 
 async function loadAgents() {
 	agentsRequested = true;
 	try {
-		const response = await torenStore.loadAgents($torenStore.shipUrl);
-		agents = response.agents ?? [];
+		agents = await torenStore.loadAgents($torenStore.shipUrl);
 	} catch {
 		// A daemon that cannot list its agents can still start the configured default.
 		agents = [];
@@ -210,9 +231,15 @@ function handleNewAgent(agent?: string) {
 	startAgent(agent ? { agent } : {});
 }
 
-async function openSessions() {
-	if (!currentWorkspace) return;
+function openSessions() {
+	showAgentMenu = false;
 	showSessions = true;
+	loadRecordedSessions();
+}
+
+/** The rows behind both the resume modal and the facts strip's runs chip. */
+async function loadRecordedSessions() {
+	if (!currentWorkspace || sessionsLoading) return;
 	sessionsLoading = true;
 	sessionsError = null;
 	try {
@@ -280,6 +307,35 @@ async function handleNewShell() {
 		lifecycleError = err instanceof Error ? err.message : 'Failed to open shell';
 	} finally {
 		shellLoading = false;
+	}
+}
+
+/**
+ * Run `breq complete` / `breq abort` for this workspace, and go and watch it.
+ *
+ * The daemon runs it in a held pane rather than reporting an outcome, because these scripts talk:
+ * they print for a while, and they stop to ask things. Selecting the window they landed in is the
+ * whole point of the button.
+ */
+async function runWorkflow() {
+	if (!currentWorkspace || !pendingVerb || workflowRunning) return;
+	workflowRunning = true;
+	lifecycleError = null;
+	try {
+		const target = await torenStore.runWorkflow(
+			$torenStore.shipUrl,
+			currentWorkspace.segment,
+			currentWorkspace.name,
+			pendingVerb,
+		);
+		pendingVerb = null;
+		await refreshCurrent();
+		selectWindow(target);
+		reattachPane();
+	} catch (err) {
+		lifecycleError = err instanceof Error ? err.message : 'Failed to run';
+	} finally {
+		workflowRunning = false;
 	}
 }
 
@@ -360,12 +416,10 @@ function navigateToWorkspace(ws: WorkspaceView) {
 	closeMobilePanel();
 }
 
-$: attached = paneStatus === 'attached';
 // Only the daemon's own verdict holds a pane: a socket that gave up says nothing about the process
 // behind it, and treating that as held would rebind the keys over a pane that is still running.
 $: paneEnded = paneStatus === 'ended';
 $: paneUnreachable = paneStatus === 'unreachable';
-$: isWorking = displayStatus === 'busy';
 </script>
 
 <svelte:window on:click={closeAgentMenu} />
@@ -381,8 +435,27 @@ $: isWorking = displayStatus === 'busy';
 	/>
 {/if}
 
+{#if pendingVerb && currentWorkspace}
+	<!-- svelte-ignore a11y_click_events_have_key_events -->
+	<div class="modal-overlay" on:click={() => (pendingVerb = null)} role="presentation">
+		<div class="modal" on:click|stopPropagation role="dialog" tabindex="-1">
+			<h2>{pendingVerb === 'complete' ? 'Complete' : 'Abort'} {currentWorkspace.name}?</h2>
+			<p class="modal-body">
+				Runs <code>breq {pendingVerb} {currentWorkspace.name}</code> in a held pane, where you can
+				read what it says and answer it.
+			</p>
+			<div class="modal-actions">
+				<button class="modal-btn" on:click={() => (pendingVerb = null)}>Cancel</button>
+				<button class="modal-btn confirm" on:click={runWorkflow} disabled={workflowRunning}>
+					{workflowRunning ? 'Running…' : `Run breq ${pendingVerb}`}
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
 <div class="workspace-view">
-	<!-- Header -->
+	<!-- App bar -->
 	<header class="workspace-header">
 		<div class="header-left">
 			<button class="logo-link" on:click={goToSegmentSelector}>
@@ -393,13 +466,28 @@ $: isWorking = displayStatus === 'busy';
 			{/if}
 		</div>
 		<div class="header-right">
-			{#if isWorking}
-				<button class="interrupt-btn" on:click={handleInterrupt} title="Interrupt">
-					<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-						<rect x="6" y="6" width="12" height="12" rx="2" />
-					</svg>
-				</button>
-			{/if}
+			<!-- The sidebar is the project scope, and on a phone the app bar is where it lives. -->
+			<button class="panel-toggle mobile-only" on:click={toggleMobilePanel} aria-label="View workspaces">
+				<svg
+					xmlns="http://www.w3.org/2000/svg"
+					width="18"
+					height="18"
+					viewBox="0 0 24 24"
+					fill="none"
+					stroke="currentColor"
+					stroke-width="2"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+				>
+					<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+					<circle cx="9" cy="7" r="4"></circle>
+					<path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+					<path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+				</svg>
+				{#if $segmentWorkspaces.length > 0}
+					<span class="badge">{$segmentWorkspaces.length}</span>
+				{/if}
+			</button>
 			<div class="status">
 				<span
 					class="status-dot"
@@ -415,9 +503,15 @@ $: isWorking = displayStatus === 'busy';
 		</div>
 	</header>
 
-	<!-- Workspace indicator -->
+	<!-- Ancillary bar: this workspace, and the two verbs that end it -->
 	{#if currentWorkspace}
 		<div class="workspace-indicator">
+			<span
+				class="workspace-status-dot"
+				class:busy={displayStatus === 'busy'}
+				class:ready={displayStatus === 'ready'}
+				title={displayStatus === 'busy' ? 'An agent is running' : 'Idle'}
+			></span>
 			<span class="workspace-name">{currentWorkspace.name}</span>
 			<span class="separator">·</span>
 			{#if task}
@@ -429,158 +523,107 @@ $: isWorking = displayStatus === 'busy';
 				<span class="task-label">{currentWorkspace.path}</span>
 			{/if}
 			<div class="indicator-actions">
-				{#if isWorking}
-					<button class="action-btn stop" on:click={handleStop} disabled={lifecycleLoading} title="Stop agent">Stop</button>
-				{:else}
-					<div class="agent-menu" bind:this={agentMenu}>
-						{#if agents.length > 1}
-							<button
-								class="action-btn start"
-								on:click={() => (showAgentMenu = !showAgentMenu)}
-								disabled={lifecycleLoading}
-								aria-expanded={showAgentMenu}
-								title="Start a new agent session"
-							>New agent ▾</button>
-							{#if showAgentMenu}
-								<div class="agent-menu-list">
-									{#each agents as agent (agent)}
-										<button class="agent-menu-item" on:click={() => handleNewAgent(agent)}>
-											New {agent} agent
-										</button>
-									{/each}
-								</div>
-							{/if}
-						{:else}
-							<!-- One agent, or a daemon that could not list them: the default is the choice. -->
-							<button
-								class="action-btn start"
-								on:click={() => handleNewAgent(agents[0])}
-								disabled={lifecycleLoading}
-								title="Start a new agent session"
-							>{agents.length === 1 ? `New ${agents[0]} agent` : 'New agent'}</button>
-						{/if}
-					</div>
-					<button
-						class="action-btn resume"
-						on:click={openSessions}
-						disabled={lifecycleLoading}
-						title="Resume one of this workspace's recorded sessions"
-					>Resume Previous Session</button>
-				{/if}
 				{#if lifecycleError}
 					<span class="lifecycle-error">{lifecycleError}</span>
 				{/if}
+				<button
+					class="action-btn complete"
+					on:click={() => (pendingVerb = 'complete')}
+					disabled={workflowRunning}
+					title="Run breq complete for this workspace"
+				>Complete</button>
+				<button
+					class="action-btn abort"
+					on:click={() => (pendingVerb = 'abort')}
+					disabled={workflowRunning}
+					title="Run breq abort for this workspace"
+				>Abort</button>
 			</div>
 		</div>
 
-		<!-- Sessions (rmux windows): click to attach the terminal to that window -->
-		<div class="sessions-bar">
-			{#each sessions as s (s.window)}
-				<div class="session-chip" class:active={s.window === selectedWindow} class:held={s.status === 'exited'}>
-					<button class="chip-main" on:click={() => selectWindow(s.window)} title={s.command}>
-						<span class="chip-dot status-{s.status}"></span>
-						<span class="chip-name mono">{s.window}</span>
-						<span class="chip-status">{sessionLabel(s)}</span>
-						<span class="chip-cmd mono">{s.command}</span>
-					</button>
-					<!-- Held panes accumulate — every resume leaves one — so dismissal is one click. -->
-					<button
-						class="chip-close"
-						on:click={() => dismissWindow(s.window)}
-						disabled={dismissing === s.window}
-						title="Dismiss {s.window}"
-						aria-label="Dismiss {s.window}"
-					>×</button>
-				</div>
-			{/each}
-			<button
-				class="session-chip new-shell"
-				on:click={handleNewShell}
-				disabled={shellLoading}
-				title="Open a new shell window"
-			>
-				{shellLoading ? 'Opening…' : '+ New shell'}
-			</button>
-		</div>
+		<!-- Facts strip: what is true of this workspace, one chip at a time -->
+		<FactsStrip
+			workspace={currentWorkspace}
+			sessions={recordedSessions}
+			{sessionsLoading}
+			{sessionsError}
+			busyId={resumingId}
+			on:sessions={loadRecordedSessions}
+			on:resume={handleResumeSession}
+		/>
 
-		<!-- Sets summary / details toggle -->
-		{#if sets}
-			<button class="sets-summary" on:click={() => (showDetails = !showDetails)}>
-				<span>{sets.sessions.length} session{sets.sessions.length === 1 ? '' : 's'}</span>
-				<span>{sets.changes.length} change{sets.changes.length === 1 ? '' : 's'}</span>
-				<span>{sets.prs.length} PR{sets.prs.length === 1 ? '' : 's'}</span>
-				<span>{sets.tasks.length} task{sets.tasks.length === 1 ? '' : 's'}</span>
-				<span class="sets-chevron">{showDetails ? '▾' : '▸'}</span>
-			</button>
-			{#if showDetails}
-				<div class="sets-details">
-					{#if sets.sessions.length > 0}
-						<section>
-							<h4>Sessions</h4>
-							{#each sets.sessions as s (s.window)}
-								<div class="set-row">
-									<span class="badge status-{s.status}">{s.status}</span>
-									<span class="mono">{s.window}</span>
-									<span class="dim mono">{s.command}</span>
-									{#if s.agent_activity}<span class="dim">· {s.agent_activity}</span>{/if}
-								</div>
+		<!-- Panes bar: one chip per rmux window, and the two ways to make another -->
+		<div class="panes-bar">
+			<div class="panes-scroll">
+				{#each sessions as s (s.window)}
+					<div class="session-chip" class:active={s.window === selectedWindow} class:held={s.status === 'exited'}>
+						<!-- The dot is the status; the words behind it are a tooltip, not a bar. -->
+						<button class="chip-main" on:click={() => selectWindow(s.window)} title="{s.status} · {s.command}">
+							<span class="chip-dot status-{s.status}"></span>
+							<span class="chip-name mono">{s.window}</span>
+							{#if paneActivity(s)}<span class="chip-activity">{paneActivity(s)}</span>{/if}
+							<span class="chip-cmd mono">{s.command}</span>
+						</button>
+						{#if isLiveAgent(s)}
+							<!-- The agent's own pane: stopping it is what closes it, so there is no second verb. -->
+							<button
+								class="chip-stop"
+								on:click={handleStop}
+								disabled={lifecycleLoading}
+								title="Stop the agent"
+								aria-label="Stop the agent"
+							>
+								<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9" viewBox="0 0 24 24" fill="currentColor">
+									<rect x="4" y="4" width="16" height="16" rx="2" />
+								</svg>
+							</button>
+						{:else}
+							<!-- Held panes accumulate — every resume leaves one — so dismissal is one click. -->
+							<button
+								class="chip-close"
+								on:click={() => dismissWindow(s.window)}
+								disabled={dismissing === s.window}
+								title="Dismiss {s.window}"
+								aria-label="Dismiss {s.window}"
+							>×</button>
+						{/if}
+					</div>
+				{/each}
+			</div>
+			<div class="pane-actions">
+				<button
+					class="pane-btn"
+					on:click={handleNewShell}
+					disabled={shellLoading}
+					title="Open a new shell window"
+				>{shellLoading ? 'Opening…' : '+ Shell'}</button>
+				<div class="agent-menu" bind:this={agentMenu}>
+					<button
+						class="pane-btn"
+						on:click={() => (showAgentMenu = !showAgentMenu)}
+						disabled={lifecycleLoading}
+						aria-expanded={showAgentMenu}
+						title="Start an agent in this workspace"
+					>+ Agent ▾</button>
+					{#if showAgentMenu}
+						<div class="agent-menu-list">
+							{#each agents as agent (agent.name)}
+								<button class="agent-menu-item" on:click={() => handleNewAgent(agent.name)}>
+									New {agent.name} agent
+								</button>
+							{:else}
+								<!-- No agent this daemon can start is named, so the default is the only choice. -->
+								<button class="agent-menu-item" on:click={() => handleNewAgent()}>New agent</button>
 							{/each}
-						</section>
-					{/if}
-					{#if sets.branches.length > 0}
-						<section>
-							<h4>Branches</h4>
-							<div class="set-row wrap">
-								{#each sets.branches as b (b)}<span class="badge mono">{b}</span>{/each}
-							</div>
-						</section>
-					{/if}
-					{#if sets.changes.length > 0}
-						<section>
-							<h4>Changes</h4>
-							{#each sets.changes as c (c.id)}
-								<div class="set-row">
-									<span class="mono dim">{stripTaskPrefix(c.id)}</span>
-									<span>{c.summary}</span>
-								</div>
-							{/each}
-						</section>
-					{/if}
-					{#if sets.prs.length > 0}
-						<section>
-							<h4>PRs{#if sets.prs_age} <span class="dim">({sets.prs_age})</span>{/if}</h4>
-							{#each sets.prs as pr (pr.id)}
-								<div class="set-row">
-									<a href={pr.url} target="_blank" rel="noreferrer" class="mono">{pr.id}</a>
-									<span class="mono dim">{pr.branch}</span>
-									<span class="badge">{pr.state}</span>
-									{#if pr.ci}<span class="badge">{pr.ci}</span>{/if}
-								</div>
-							{/each}
-						</section>
-					{/if}
-					{#if sets.tasks.length > 0}
-						<section>
-							<h4>Tasks</h4>
-							{#each sets.tasks as t (t.link)}
-								<div class="set-row">
-									<TaskStatusIcon status={getTaskDisplayStatus(t)} />
-									{#if t.url}
-										<a href={t.url} target="_blank" rel="noreferrer" class="mono">{stripTaskPrefix(t.id)}</a>
-									{:else}
-										<span class="mono">{stripTaskPrefix(t.id)}</span>
-									{/if}
-									{#if t.title}<span>{t.title}</span>{/if}
-									{#if t.status}<span class="dim">· {t.status}</span>{/if}
-									{#if t.assignee}<span class="dim">· @{t.assignee}</span>{/if}
-									{#if t.error}<span class="lifecycle-error">{t.error}</span>{/if}
-								</div>
-							{/each}
-						</section>
+							{#if hasRecordedSessions}
+								<div class="agent-menu-divider"></div>
+								<button class="agent-menu-item" on:click={openSessions}>Resume previous session…</button>
+							{/if}
+						</div>
 					{/if}
 				</div>
-			{/if}
-		{/if}
+			</div>
+		</div>
 	{:else}
 		<div class="workspace-indicator not-found">
 			<span>{$torenStore.selectedSegment?.name} / {nameParam}</span>
@@ -618,12 +661,9 @@ $: isWorking = displayStatus === 'busy';
 					<button class="banner-btn" on:click={dropToShell}>Drop to shell</button>
 					<button class="banner-btn" on:click={() => dismissWindow(selectedWindow)} disabled={dismissing !== null}>Dismiss</button>
 				</div>
-			{:else if !attached}
-				<div class="terminal-banner">Attaching to {currentWorkspace.name}{selectedWindow ? ` · ${selectedWindow}` : ''}...</div>
-			{:else if paneSession}
-				<div class="terminal-banner">
-					Attached to <code>{paneSession}</code>{#if selectedWindow} · <code>{selectedWindow}</code>{/if} — the same pane a local mirror shows
-				</div>
+			{:else if attachingSlowly}
+				<!-- Attaching is normally too quick to see; a wait long enough to notice is not. -->
+				<div class="terminal-banner">Attaching…</div>
 			{/if}
 			<AgentTerminal
 				bind:this={terminal}
@@ -635,61 +675,6 @@ $: isWorking = displayStatus === 'busy';
 				on:held={handleHeld}
 			/>
 		{/if}
-	</div>
-
-	<!-- Input area -->
-	<div class="workspace-input">
-		<button class="panel-toggle mobile-only" on:click={toggleMobilePanel} aria-label="View workspaces">
-			<svg
-				xmlns="http://www.w3.org/2000/svg"
-				width="20"
-				height="20"
-				viewBox="0 0 24 24"
-				fill="none"
-				stroke="currentColor"
-				stroke-width="2"
-				stroke-linecap="round"
-				stroke-linejoin="round"
-			>
-				<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-				<circle cx="9" cy="7" r="4"></circle>
-				<path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-				<path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-			</svg>
-			{#if $segmentWorkspaces.length > 0}
-				<span class="badge">{$segmentWorkspaces.length}</span>
-			{/if}
-		</button>
-		<form on:submit|preventDefault={handleSendMessage}>
-			<textarea
-				bind:value={messageInput}
-				placeholder="Type a line into the terminal..."
-				rows="1"
-				disabled={!attached}
-				on:keydown={(e) => {
-					if (e.key === 'Enter' && !e.shiftKey) {
-						e.preventDefault();
-						handleSendMessage();
-					}
-				}}
-			></textarea>
-			<button type="submit" disabled={!messageInput.trim() || !attached} aria-label="Send line">
-				<svg
-					xmlns="http://www.w3.org/2000/svg"
-					width="20"
-					height="20"
-					viewBox="0 0 24 24"
-					fill="none"
-					stroke="currentColor"
-					stroke-width="2"
-					stroke-linecap="round"
-					stroke-linejoin="round"
-				>
-					<line x1="22" y1="2" x2="11" y2="13"></line>
-					<polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-				</svg>
-			</button>
-		</form>
 	</div>
 </div>
 
@@ -748,10 +733,11 @@ $: isWorking = displayStatus === 'busy';
 		flex-direction: column;
 		height: 100%;
 		width: 100%;
+		min-height: 0;
 		background: var(--color-bg);
 	}
 
-	/* Header */
+	/* App bar */
 	.workspace-header {
 		display: flex;
 		align-items: center;
@@ -788,23 +774,6 @@ $: isWorking = displayStatus === 'busy';
 		gap: var(--spacing-sm);
 	}
 
-	.interrupt-btn {
-		width: 32px;
-		height: 32px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		background: var(--color-error);
-		border: none;
-		border-radius: var(--radius-sm);
-		color: white;
-		cursor: pointer;
-	}
-
-	.interrupt-btn:hover {
-		opacity: 0.8;
-	}
-
 	.status {
 		display: flex;
 		align-items: center;
@@ -831,7 +800,7 @@ $: isWorking = displayStatus === 'busy';
 		color: var(--color-text-secondary);
 	}
 
-	/* Workspace indicator */
+	/* Ancillary bar */
 	.workspace-indicator {
 		display: flex;
 		align-items: center;
@@ -869,6 +838,7 @@ $: isWorking = displayStatus === 'busy';
 		display: flex;
 		align-items: center;
 		gap: var(--spacing-xs);
+		flex-shrink: 0;
 	}
 
 	.action-btn {
@@ -879,6 +849,7 @@ $: isWorking = displayStatus === 'busy';
 		text-transform: uppercase;
 		cursor: pointer;
 		border: 1px solid transparent;
+		background: none;
 	}
 
 	.action-btn:disabled {
@@ -886,66 +857,24 @@ $: isWorking = displayStatus === 'busy';
 		cursor: not-allowed;
 	}
 
-	.action-btn.start {
+	.action-btn.complete {
+		color: var(--color-success);
+		border-color: var(--color-success);
+	}
+
+	.action-btn.complete:hover:not(:disabled) {
 		background: var(--color-success);
 		color: var(--color-bg);
 	}
 
-	.action-btn.start:hover:not(:disabled) {
-		opacity: 0.85;
-	}
-
-	.action-btn.stop {
-		background: none;
+	.action-btn.abort {
 		color: var(--color-error);
 		border-color: var(--color-error);
 	}
 
-	.action-btn.stop:hover:not(:disabled) {
+	.action-btn.abort:hover:not(:disabled) {
 		background: var(--color-error);
 		color: white;
-	}
-
-	.action-btn.resume {
-		background: var(--color-primary);
-		color: white;
-	}
-
-	.action-btn.resume:hover:not(:disabled) {
-		opacity: 0.85;
-	}
-
-	.agent-menu {
-		position: relative;
-	}
-
-	.agent-menu-list {
-		position: absolute;
-		top: calc(100% + 4px);
-		right: 0;
-		min-width: 180px;
-		background: var(--color-bg-secondary);
-		border: 1px solid var(--color-border);
-		border-radius: var(--radius-md);
-		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-		z-index: 100;
-		overflow: hidden;
-	}
-
-	.agent-menu-item {
-		display: block;
-		width: 100%;
-		padding: var(--spacing-sm) var(--spacing-md);
-		background: none;
-		border: none;
-		color: var(--color-text);
-		font-size: 0.85rem;
-		text-align: left;
-		cursor: pointer;
-	}
-
-	.agent-menu-item:hover {
-		background: var(--color-bg-tertiary);
 	}
 
 	.lifecycle-error {
@@ -959,81 +888,77 @@ $: isWorking = displayStatus === 'busy';
 		margin-left: auto;
 	}
 
-	/* Sets summary / details */
-	.sets-summary {
+	/* Confirm dialog */
+	.modal-overlay {
+		position: fixed;
+		inset: 0;
+		background: rgba(0, 0, 0, 0.8);
 		display: flex;
 		align-items: center;
-		gap: var(--spacing-md);
+		justify-content: center;
+		z-index: 1000;
+		padding: var(--spacing-md);
+	}
+
+	.modal {
+		background: var(--color-bg-secondary);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-lg);
+		padding: var(--spacing-xl);
+		max-width: 420px;
 		width: 100%;
-		padding: var(--spacing-xs) var(--spacing-md);
-		background: var(--color-bg-secondary);
-		border: none;
-		border-bottom: 1px solid var(--color-border);
-		color: var(--color-text-secondary);
-		font-size: 0.75rem;
-		cursor: pointer;
-		text-align: left;
-		flex-shrink: 0;
 	}
 
-	.sets-summary:hover {
+	.modal h2 {
+		margin: 0 0 var(--spacing-sm) 0;
+		color: var(--color-text);
+		font-size: 1.1rem;
+	}
+
+	.modal-body {
+		margin: 0 0 var(--spacing-lg) 0;
+		color: var(--color-text-secondary);
+		font-size: 0.85rem;
+	}
+
+	.modal-body code {
+		font-family: var(--font-mono);
 		color: var(--color-text);
 	}
 
-	.sets-chevron {
-		margin-left: auto;
-	}
-
-	.sets-details {
-		flex-shrink: 0;
-		max-height: 40vh;
-		overflow-y: auto;
-		padding: var(--spacing-sm) var(--spacing-md);
-		background: var(--color-bg-secondary);
-		border-bottom: 1px solid var(--color-border);
-		font-size: 0.8rem;
-	}
-
-	.sets-details section {
-		margin-bottom: var(--spacing-sm);
-	}
-
-	.sets-details h4 {
-		margin: 0 0 var(--spacing-xs) 0;
-		font-size: 0.7rem;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		color: var(--color-text-secondary);
-	}
-
-	.set-row {
+	.modal-actions {
 		display: flex;
-		align-items: center;
-		gap: var(--spacing-xs);
-		padding: 2px 0;
+		justify-content: flex-end;
+		gap: var(--spacing-sm);
+	}
+
+	.modal-btn {
+		padding: var(--spacing-xs) var(--spacing-md);
+		background: var(--color-bg-tertiary);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
 		color: var(--color-text);
-		overflow: hidden;
+		font-size: 0.85rem;
+		cursor: pointer;
 	}
 
-	.set-row.wrap {
-		flex-wrap: wrap;
+	.modal-btn:hover:not(:disabled) {
+		border-color: var(--color-primary);
 	}
 
-	.set-row a {
-		color: var(--color-primary);
-		text-decoration: none;
+	.modal-btn.confirm {
+		background: var(--color-primary);
+		border-color: var(--color-primary);
+		color: white;
 	}
 
-	.set-row a:hover {
-		text-decoration: underline;
+	.modal-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
 	.mono {
 		font-family: var(--font-mono);
-	}
-
-	.dim {
-		color: var(--color-text-secondary);
 	}
 
 	.badge {
@@ -1044,31 +969,26 @@ $: isWorking = displayStatus === 'busy';
 		color: var(--color-text-secondary);
 	}
 
-	.badge.status-running {
-		background: var(--color-warning);
-		color: var(--color-bg);
-	}
-
-	.badge.status-idle {
-		background: var(--color-success);
-		color: var(--color-bg);
-	}
-
-	.badge.status-exited {
-		background: var(--color-border);
-		color: var(--color-text-secondary);
-	}
-
-	/* Sessions bar (rmux windows) */
-	.sessions-bar {
+	/* Panes bar (rmux windows) */
+	.panes-bar {
 		display: flex;
 		align-items: center;
 		gap: var(--spacing-xs);
 		padding: var(--spacing-xs) var(--spacing-md);
 		background: var(--color-bg-secondary);
 		border-bottom: 1px solid var(--color-border);
-		overflow-x: auto;
 		flex-shrink: 0;
+	}
+
+	/* Only the chips scroll: a scrolling bar would clip the agent menu and carry off the buttons
+	   that open it. */
+	.panes-scroll {
+		display: flex;
+		align-items: center;
+		gap: var(--spacing-xs);
+		flex: 1;
+		min-width: 0;
+		overflow-x: auto;
 	}
 
 	.session-chip {
@@ -1086,7 +1006,7 @@ $: isWorking = displayStatus === 'busy';
 		white-space: nowrap;
 	}
 
-	.session-chip:hover:not(:disabled) {
+	.session-chip:hover {
 		border-color: var(--color-primary);
 		color: var(--color-text);
 	}
@@ -1107,7 +1027,10 @@ $: isWorking = displayStatus === 'busy';
 		cursor: pointer;
 	}
 
-	.chip-close {
+	.chip-close,
+	.chip-stop {
+		display: flex;
+		align-items: center;
 		background: none;
 		border: none;
 		padding: 0 2px;
@@ -1117,11 +1040,13 @@ $: isWorking = displayStatus === 'busy';
 		cursor: pointer;
 	}
 
-	.chip-close:hover:not(:disabled) {
+	.chip-close:hover:not(:disabled),
+	.chip-stop:hover:not(:disabled) {
 		color: var(--color-error);
 	}
 
-	.chip-close:disabled {
+	.chip-close:disabled,
+	.chip-stop:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
 	}
@@ -1130,11 +1055,6 @@ $: isWorking = displayStatus === 'busy';
 		border-color: var(--color-primary);
 		background: var(--color-bg-tertiary);
 		color: var(--color-text);
-	}
-
-	.session-chip:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
 	}
 
 	.chip-dot {
@@ -1162,8 +1082,10 @@ $: isWorking = displayStatus === 'busy';
 		color: var(--color-text);
 	}
 
-	.chip-status {
+	.chip-activity {
 		color: var(--color-text-secondary);
+		opacity: 0.7;
+		font-style: italic;
 	}
 
 	.chip-cmd {
@@ -1173,9 +1095,72 @@ $: isWorking = displayStatus === 'busy';
 		text-overflow: ellipsis;
 	}
 
-	.session-chip.new-shell {
-		font-weight: 600;
+	.pane-actions {
+		display: flex;
+		align-items: center;
+		gap: var(--spacing-xs);
+		padding-left: var(--spacing-sm);
+		flex-shrink: 0;
+	}
+
+	.pane-btn {
+		padding: 3px 10px;
+		background: var(--color-bg);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
 		color: var(--color-primary);
+		font-size: 0.75rem;
+		font-weight: 600;
+		white-space: nowrap;
+		cursor: pointer;
+	}
+
+	.pane-btn:hover:not(:disabled) {
+		border-color: var(--color-primary);
+	}
+
+	.pane-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.agent-menu {
+		position: relative;
+	}
+
+	.agent-menu-list {
+		position: absolute;
+		top: calc(100% + 4px);
+		right: 0;
+		min-width: 200px;
+		background: var(--color-bg-secondary);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+		z-index: 100;
+		overflow: hidden;
+	}
+
+	.agent-menu-item {
+		display: block;
+		width: 100%;
+		padding: var(--spacing-sm) var(--spacing-md);
+		background: none;
+		border: none;
+		color: var(--color-text);
+		font-size: 0.85rem;
+		text-align: left;
+		white-space: nowrap;
+		cursor: pointer;
+	}
+
+	.agent-menu-item:hover {
+		background: var(--color-bg-tertiary);
+	}
+
+	.agent-menu-divider {
+		height: 1px;
+		background: var(--color-border);
 	}
 
 	/* Terminal */
@@ -1223,11 +1208,6 @@ $: isWorking = displayStatus === 'busy';
 		cursor: not-allowed;
 	}
 
-	.terminal-banner code {
-		font-family: var(--font-mono);
-		color: var(--color-text);
-	}
-
 	.empty-state {
 		display: flex;
 		flex-direction: column;
@@ -1261,20 +1241,9 @@ $: isWorking = displayStatus === 'busy';
 		max-width: 300px;
 	}
 
-	/* Input */
-	.workspace-input {
-		display: flex;
-		align-items: flex-end;
-		gap: var(--spacing-sm);
-		padding: var(--spacing-sm) var(--spacing-md);
-		background: var(--color-bg-secondary);
-		border-top: 1px solid var(--color-border);
-		flex-shrink: 0;
-	}
-
 	.panel-toggle {
-		width: 44px;
-		height: 44px;
+		width: 32px;
+		height: 32px;
 		display: flex;
 		align-items: center;
 		justify-content: center;
@@ -1293,70 +1262,19 @@ $: isWorking = displayStatus === 'busy';
 
 	.panel-toggle .badge {
 		position: absolute;
-		top: -4px;
-		right: -4px;
-		min-width: 18px;
-		height: 18px;
+		top: -6px;
+		right: -6px;
+		min-width: 16px;
+		height: 16px;
 		padding: 0 4px;
 		background: var(--color-warning);
 		color: var(--color-bg);
-		font-size: 0.7rem;
+		font-size: 0.65rem;
 		font-weight: 700;
-		border-radius: 9px;
+		border-radius: 8px;
 		display: flex;
 		align-items: center;
 		justify-content: center;
-	}
-
-	form {
-		flex: 1;
-		display: flex;
-		gap: var(--spacing-sm);
-		align-items: flex-end;
-	}
-
-	textarea {
-		flex: 1;
-		min-height: 44px;
-		max-height: 150px;
-		padding: var(--spacing-sm) var(--spacing-md);
-		background: var(--color-bg-tertiary);
-		border: 1px solid var(--color-border);
-		border-radius: var(--radius-md);
-		resize: none;
-		font-size: 1rem;
-		line-height: 1.4;
-		color: var(--color-text);
-	}
-
-	textarea:focus {
-		border-color: var(--color-primary);
-		outline: none;
-	}
-
-	textarea:disabled {
-		opacity: 0.5;
-	}
-
-	button[type='submit'] {
-		width: 44px;
-		height: 44px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		background: var(--color-primary);
-		border-radius: var(--radius-md);
-		color: white;
-		flex-shrink: 0;
-	}
-
-	button[type='submit']:hover:not(:disabled) {
-		background: var(--color-primary-hover);
-	}
-
-	button[type='submit']:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
 	}
 
 	/* Mobile panel */
@@ -1457,6 +1375,7 @@ $: isWorking = displayStatus === 'busy';
 		height: 8px;
 		border-radius: 50%;
 		flex-shrink: 0;
+		background: var(--color-text-secondary);
 	}
 
 	.workspace-status-dot.ready {

@@ -117,6 +117,29 @@ impl PaneRunner {
         Ok(window)
     }
 
+    /// Run a one-shot command in a `cmd` window of its own, returning that window's name.
+    ///
+    /// Held, so the output of something that ran and finished stays readable until it is
+    /// dismissed — which is why the browser drives workflow scripts through here instead of
+    /// streaming their output over HTTP.
+    pub async fn run_command(
+        &self,
+        session: &str,
+        workspace_path: &Path,
+        env: &[(String, String)],
+        argv: &[String],
+    ) -> Result<String> {
+        rmux_conv::ensure_session(session, workspace_path, env)?;
+        let window = rmux_conv::spawn_command(session, workspace_path, argv, true)?;
+        info!(
+            "ran '{}' in window '{}' of {}",
+            argv.join(" "),
+            window,
+            session
+        );
+        Ok(window)
+    }
+
     /// Point a mirror at the pane running right now in `window`.
     ///
     /// Adopts a session this process never started — which is all re-adoption after a restart
