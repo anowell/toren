@@ -51,13 +51,15 @@ pub fn list(rows: &[(Place, Sets)], plugins: &PluginManager, show_segment: bool)
     let w_delivery = width(cells.iter().map(|c| c.delivery.len()), 8);
     let w_tasks = width(cells.iter().map(|c| task_cell(&c.tasks).1), 5);
 
-    let fixed = w_name + w_age + w_agents + w_changes + w_delivery + w_tasks + 6;
+    // Two spaces between columns, one inside a cell: a task's glyph belongs to its id, and the
+    // gap has to say so.
+    let fixed = w_name + w_age + w_agents + w_changes + w_delivery + w_tasks + 12;
     let w_title = term_width.saturating_sub(fixed).max(10);
 
     println!(
         "{}",
         format!(
-            "{:<w_name$} {:<w_age$} {:<w_agents$} {:<w_changes$} {:<w_delivery$} {:<w_tasks$} {}",
+            "{:<w_name$}  {:<w_age$}  {:<w_agents$}  {:<w_changes$}  {:<w_delivery$}  {:<w_tasks$}  {}",
             "WORKSPACE",
             "AGE",
             "AGENTS",
@@ -97,7 +99,7 @@ pub fn list(rows: &[(Place, Sets)], plugins: &PluginManager, show_segment: bool)
         let tasks = pad(task_cell(&cell.tasks), w_tasks);
 
         println!(
-            "{} {:<w_age$} {} {:<w_changes$} {:<w_delivery$} {} {}",
+            "{}  {:<w_age$}  {}  {:<w_changes$}  {:<w_delivery$}  {}  {}",
             name,
             cell.age,
             agents,
