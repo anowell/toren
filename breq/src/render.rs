@@ -228,16 +228,27 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
     if let Some(agent) = place.agent() {
         field("agent", &agent.packed());
     }
-    field("age", &place.age_label());
-    field("session", &place.session_name());
+    field(
+        "created",
+        &place.created_label().unwrap_or_else(|| "-".to_string()),
+    );
+    // "session" alone read as any of three things — the rmux one is which it is.
+    field("rmux", &place.session_name());
     if !place.vcs_tracked {
         field("vcs", "untracked (prunable with `breq cleanup`)");
     }
 
-    section("sessions", sets.sessions.len());
-    for session in &sets.sessions {
+    // Every pane is a session, which said nothing about which ones you can talk to and which
+    // ones are working. Split by that instead.
+    let (agents, shells): (Vec<_>, Vec<_>) = sets
+        .sessions
+        .iter()
+        .partition(|s| s.window == toren_lib::rmux::AGENT_WINDOW);
+
+    section("agents", agents.len());
+    for session in &agents {
         let activity = match &session.agent_activity {
-            Some(activity) => format!("  agent:{}", activity),
+            Some(activity) => format!("  {}", activity),
             None => String::new(),
         };
         println!(
@@ -246,12 +257,20 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
         );
     }
 
+    section("shells", shells.len());
+    for session in &shells {
+        println!(
+            "  {:<8} {:<8} {}",
+            session.window, session.status, session.command
+        );
+    }
+
     section("changes", sets.changes.len());
     for commit in &sets.changes {
         println!("  {} {}", commit.id, commit.summary);
     }
 
-    section("remote branches", sets.branches.len());
+    section("branches", sets.branches.len());
     for branch in &sets.branches {
         println!("  {}", branch);
     }

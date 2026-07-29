@@ -182,7 +182,7 @@ impl Sets {
         let sessions = collect_sessions(place, plugins);
         let changes = collect_changes(place, ws_mgr);
         let branches = if place.exists() {
-            ws_mgr.remote_branches(&place.segment_path, &place.path)
+            ws_mgr.branches(&place.segment_path, &place.path, place.base().as_deref())
         } else {
             Vec::new()
         };

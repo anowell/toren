@@ -1346,10 +1346,11 @@ fn get_key(
             return Ok(());
         }
         "branches" => {
-            for branch in registry
-                .workspaces
-                .remote_branches(&place.segment_path, &place.path)
-            {
+            for branch in registry.workspaces.branches(
+                &place.segment_path,
+                &place.path,
+                place.base().as_deref(),
+            ) {
                 println!("{}", branch);
             }
             return Ok(());

@@ -174,7 +174,9 @@ pub trait VcsBackend: Send + Sync {
     /// Remote branches/bookmarks that contain this workspace's work.
     ///
     /// Derived from the VCS only — no forge API, so this stays fast and offline.
-    fn remote_branches(&self, workspace_path: &Path) -> Vec<String>;
+    /// Branches carrying work this workspace did, local ones included. `base` bounds it to what
+    /// was built on top; without one, everything reachable.
+    fn branches(&self, workspace_path: &Path, base: Option<&str>) -> Vec<String>;
 
     /// Push workspace changes to remote
     fn push(&self, workspace_path: &Path) -> Result<()>;
@@ -191,6 +193,21 @@ pub trait VcsBackend: Send + Sync {
 
     /// Detect the active branch in a segment repo (for base_branch recording at assign time)
     fn active_branch(&self, segment_path: &Path) -> Option<String>;
+}
+
+/// Collapse a branch that exists in both places onto its remote name, so a bare name in the
+/// list means exactly one thing: it is local only.
+fn dedupe_pushed(names: Vec<String>, local_of: impl Fn(&str) -> Option<&str>) -> Vec<String> {
+    let pushed: std::collections::HashSet<&str> =
+        names.iter().filter_map(|n| local_of(n)).collect();
+    let mut out: Vec<String> = names
+        .iter()
+        .filter(|n| local_of(n).is_some() || !pushed.contains(n.as_str()))
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 // ==================== Jj Backend ====================
@@ -406,15 +423,22 @@ impl VcsBackend for JjBackend {
             .collect()
     }
 
-    fn remote_branches(&self, workspace_path: &Path) -> Vec<String> {
+    fn branches(&self, workspace_path: &Path, base: Option<&str>) -> Vec<String> {
+        // Only what this workspace put on top of its base. `::@` also matches the bookmarks the
+        // base itself carries — which is why a workspace that had done nothing yet still listed
+        // `main`, describing where it started rather than anything done here.
+        let revset = match base {
+            Some(base) => format!("({}..@) & (bookmarks() | remote_bookmarks())", base),
+            None => "(::@) & (bookmarks() | remote_bookmarks())".to_string(),
+        };
         let output = Command::new("jj")
             .args([
                 "log",
                 "-r",
-                "::@ & remote_bookmarks()",
+                &revset,
                 "--no-graph",
                 "-T",
-                r#"remote_bookmarks ++ "\n""#,
+                r#"bookmarks ++ " " ++ remote_bookmarks ++ "\n""#,
             ])
             .current_dir(workspace_path)
             .output()
@@ -427,14 +451,12 @@ impl VcsBackend for JjBackend {
             return Vec::new();
         }
 
-        let mut branches: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        let names: Vec<String> = String::from_utf8_lossy(&output.stdout)
             .split_whitespace()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        branches.sort();
-        branches.dedup();
-        branches
+        dedupe_pushed(names, |name| name.split_once('@').map(|(local, _)| local))
     }
 
     fn push(&self, workspace_path: &Path) -> Result<()> {
@@ -936,15 +958,22 @@ impl VcsBackend for GitWorktreeBackend {
             .collect()
     }
 
-    fn remote_branches(&self, workspace_path: &Path) -> Vec<String> {
+    fn branches(&self, workspace_path: &Path, base: Option<&str>) -> Vec<String> {
+        let mut args = vec![
+            "for-each-ref".to_string(),
+            "--format=%(refname:short)".to_string(),
+            "--contains".to_string(),
+            "HEAD".to_string(),
+        ];
+        // Refs that contain the base describe where this workspace started, not what it did.
+        if let Some(base) = base {
+            args.push(format!("--no-contains={}", base));
+        }
+        args.push("refs/heads".to_string());
+        args.push("refs/remotes".to_string());
+
         let output = Command::new("git")
-            .args([
-                "for-each-ref",
-                "--format=%(refname:short)",
-                "--contains",
-                "HEAD",
-                "refs/remotes",
-            ])
+            .args(&args)
             .current_dir(workspace_path)
             .output()
             .ok();
@@ -956,11 +985,12 @@ impl VcsBackend for GitWorktreeBackend {
             return Vec::new();
         }
 
-        String::from_utf8_lossy(&output.stdout)
+        let names: Vec<String> = String::from_utf8_lossy(&output.stdout)
             .lines()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
-            .collect()
+            .collect();
+        dedupe_pushed(names, |name| name.split_once('/').map(|(_, local)| local))
     }
 
     fn push(&self, workspace_path: &Path) -> Result<()> {
@@ -1272,10 +1302,15 @@ impl WorkspaceManager {
             .changes_since(workspace_path, base)
     }
 
-    /// Remote branches carrying this workspace's work.
-    pub fn remote_branches(&self, segment_path: &Path, workspace_path: &Path) -> Vec<String> {
+    /// Branches carrying this workspace's work, local ones included.
+    pub fn branches(
+        &self,
+        segment_path: &Path,
+        workspace_path: &Path,
+        base: Option<&str>,
+    ) -> Vec<String> {
         self.backend_for(segment_path)
-            .remote_branches(workspace_path)
+            .branches(workspace_path, base)
     }
 
     /// Resolve the revision a stacked child should fork from: the parent's working copy.

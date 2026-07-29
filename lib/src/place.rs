@@ -126,6 +126,19 @@ impl Place {
         Some(chrono::Utc::now().signed_duration_since(then.with_timezone(&chrono::Utc)))
     }
 
+    /// When the place was made, in local time: `2026-07-24 15:07 (4d ago)`.
+    ///
+    /// `list` has room for the age alone; `get` has room to say which day that was.
+    pub fn created_label(&self) -> Option<String> {
+        let created = self.state.created_at.as_ref()?;
+        let then = chrono::DateTime::parse_from_rfc3339(created).ok()?;
+        Some(format!(
+            "{} ({} ago)",
+            then.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"),
+            self.age_label()
+        ))
+    }
+
     /// Compact age for list output: `2m`, `3h`, `4d`.
     pub fn age_label(&self) -> String {
         match self.age() {
