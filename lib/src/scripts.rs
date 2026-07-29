@@ -135,7 +135,9 @@ const DASHES: &[&str] = &[" — ", " – ", " -- ", " - ", ": "];
 /// A script that documents nothing still lists, under its filename — the whole point is that
 /// dropping any `breq-<name>` into `~/.toren/bin` makes a working verb.
 fn describe(path: &Path, name: &str) -> Verb {
-    let fallback = format!("breq {}", name);
+    // A script writes its usage the way you call it, `breq <name> …`; help already implies the
+    // `breq`, so it is matched on and then sliced off.
+    let invocation = format!("breq {}", name);
     let doc = std::fs::read_to_string(path)
         .ok()
         .and_then(|text| {
@@ -152,10 +154,11 @@ fn describe(path: &Path, name: &str) -> Verb {
         .filter_map(|sep| doc.find(sep).map(|at| (at, sep.len())))
         .min()
     {
-        Some((at, len)) if doc.starts_with(&fallback) => {
-            (doc[..at].to_string(), doc[at + len..].to_string())
-        }
-        _ => (fallback, doc),
+        Some((at, len)) if doc.starts_with(&invocation) => (
+            doc[invocation.len() - name.len()..at].to_string(),
+            doc[at + len..].to_string(),
+        ),
+        _ => (name.to_string(), doc),
     };
 
     Verb {
@@ -275,23 +278,24 @@ mod tests {
             describe(&path, "ship")
         };
 
+        // The `breq ` a script writes is dropped: help already implies it.
         let documented = write("#!/usr/bin/env bash\n# breq ship [ws] — push it\n\ntrue\n");
-        assert_eq!(documented.usage, "breq ship [ws]");
+        assert_eq!(documented.usage, "ship [ws]");
         assert_eq!(documented.summary, "push it");
 
         // No usage prefix: the whole line is what it does.
         let bare = write("#!/usr/bin/env bash\n# push it\ntrue\n");
-        assert_eq!(bare.usage, "breq ship");
+        assert_eq!(bare.usage, "ship");
         assert_eq!(bare.summary, "push it");
 
         // A dash inside the summary is not a separator; only the first one splits.
         let dashed = write("#!/usr/bin/env bash\n# breq ship — push it - hard\ntrue\n");
-        assert_eq!(dashed.usage, "breq ship");
+        assert_eq!(dashed.usage, "ship");
         assert_eq!(dashed.summary, "push it - hard");
 
         // Undocumented still lists, so a scratch script is a working verb.
         let silent = write("#!/usr/bin/env bash\ntrue\n");
-        assert_eq!(silent.usage, "breq ship");
+        assert_eq!(silent.usage, "ship");
         assert_eq!(silent.summary, "");
     }
 

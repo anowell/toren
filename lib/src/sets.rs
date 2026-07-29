@@ -297,20 +297,14 @@ impl Sets {
         parts.join(" ")
     }
 
-    /// Compact task summary for `list`, e.g. "runes:tor-bau(in-progress)".
-    pub fn task_summary(&self) -> String {
-        if self.tasks.is_empty() {
-            return "-".to_string();
-        }
+    /// One task id per link, each with the state its glyph stands for.
+    ///
+    /// `None` is a link whose status has never been read — no glyph, rather than a guess.
+    pub fn task_cells(&self) -> Vec<(Option<TaskState>, String)> {
         self.tasks
             .iter()
-            .map(|t| match (&t.status, &t.age) {
-                (Some(status), Some(age)) => format!("{}({} {})", t.id, status, age),
-                (Some(status), None) => format!("{}({})", t.id, status),
-                (None, _) => t.id.clone(),
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
+            .map(|t| (t.status.as_deref().map(task_state), t.id.clone()))
+            .collect()
     }
 
     /// What to call this workspace, in falling order of authority.
@@ -383,11 +377,31 @@ impl Sets {
     }
 }
 
-/// Whether a tracker's own word for a status means the task is finished with.
+/// How far along a task is. Trackers name many more states than this and breq stores whatever
+/// word they use; this is the axis `breq list` can show in a single glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Todo,
+    Wip,
+    Closed,
+}
+
+impl TaskState {
+    /// How full the circle is, is how far along the work is.
+    pub fn glyph(self) -> char {
+        match self {
+            TaskState::Todo => '○',
+            TaskState::Wip => '◐',
+            TaskState::Closed => '●',
+        }
+    }
+}
+
+/// Distill a tracker's own word for a status into one of three states.
 ///
-/// Breq applies no vocabulary of its own anywhere else; this is the one place it has to guess,
-/// because "is the task still open" is what decides whether its title still describes the work.
-pub fn is_closed_status(status: &str) -> bool {
+/// Breq applies no vocabulary of its own anywhere else; this is the one place it has to guess.
+/// Todo is the fallback, so an unrecognized word reads as "not started" rather than as progress.
+pub fn task_state(status: &str) -> TaskState {
     const CLOSED: &[&str] = &[
         "closed",
         "done",
@@ -402,12 +416,36 @@ pub fn is_closed_status(status: &str) -> bool {
         "wontfix",
         "duplicate",
     ];
+    const WIP: &[&str] = &[
+        "inprogress",
+        "started",
+        "active",
+        "doing",
+        "inreview",
+        "review",
+        "blocked",
+    ];
     let normalized: String = status
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
         .collect();
-    CLOSED.contains(&normalized.as_str())
+
+    if CLOSED.contains(&normalized.as_str()) {
+        TaskState::Closed
+    } else if WIP.contains(&normalized.as_str()) || normalized.starts_with("wip") {
+        // `wip:review` and friends: a tracker that namespaces its in-flight states.
+        TaskState::Wip
+    } else {
+        TaskState::Todo
+    }
+}
+
+/// Whether a tracker's own word for a status means the task is finished with.
+///
+/// "Is the task still open" is what decides whether its title still describes the work.
+pub fn is_closed_status(status: &str) -> bool {
+    task_state(status) == TaskState::Closed
 }
 
 /// The user's login shell, for the last rung of the title chain.
@@ -913,39 +951,72 @@ mod tests {
     fn empty_sets_render_as_dashes() {
         let sets = Sets::default();
         assert_eq!(sets.delivery_summary(), "-");
-        assert_eq!(sets.task_summary(), "-");
+        assert!(sets.task_cells().is_empty());
         assert_eq!(sets.session_summary(), "-");
         assert!(!sets.has_changes());
     }
 
     #[test]
-    fn task_summary_shows_native_status() {
-        let sets = Sets {
-            tasks: vec![TaskView {
-                link: "runes:tor-bau".into(),
-                source: "runes".into(),
-                id: "tor-bau".into(),
-                title: Some("workflow revamp".into()),
-                status: Some("in-progress".into()),
+    fn task_cells_carry_a_state_and_a_bare_id() {
+        let cell = |status: Option<&str>| {
+            Sets {
+                tasks: vec![TaskView {
+                    link: "runes:tor-bau".into(),
+                    source: "runes".into(),
+                    id: "tor-bau".into(),
+                    status: status.map(Into::into),
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
-            ..Default::default()
+            }
+            .task_cells()
+            .remove(0)
         };
-        // The source prefix is dropped: an id's own shape already says which tracker it is.
-        assert_eq!(sets.task_summary(), "tor-bau(in-progress)");
 
-        // A cached read says how old it is, so nothing reads as fresher than it is.
-        let stale = Sets {
-            tasks: vec![TaskView {
-                link: "runes:tor-bau".into(),
-                id: "tor-bau".into(),
-                status: Some("in-progress".into()),
-                age: Some("3h".into()),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        assert_eq!(stale.task_summary(), "tor-bau(in-progress 3h)");
+        // The source prefix is dropped: an id's own shape already says which tracker it is.
+        assert_eq!(
+            cell(Some("in-progress")),
+            (Some(TaskState::Wip), "tor-bau".into())
+        );
+        assert_eq!(
+            cell(Some("todo")),
+            (Some(TaskState::Todo), "tor-bau".into())
+        );
+        assert_eq!(
+            cell(Some("done")),
+            (Some(TaskState::Closed), "tor-bau".into())
+        );
+
+        // Never read: no state to draw, rather than one guessed from nothing.
+        assert_eq!(cell(None), (None, "tor-bau".into()));
+    }
+
+    #[test]
+    fn every_trackers_vocabulary_distills_to_three_states() {
+        for todo in ["todo", "open", "backlog", "New", "unstarted", "ready", "??"] {
+            assert_eq!(task_state(todo), TaskState::Todo, "{}", todo);
+        }
+        // `wip:review` and friends: a tracker that namespaces its in-flight states.
+        for wip in [
+            "wip",
+            "wip:review",
+            "in-progress",
+            "In Progress",
+            "started",
+            "review",
+        ] {
+            assert_eq!(task_state(wip), TaskState::Wip, "{}", wip);
+        }
+        for closed in [
+            "done",
+            "Closed",
+            "won't fix",
+            "duplicate",
+            "abandoned",
+            "merged",
+        ] {
+            assert_eq!(task_state(closed), TaskState::Closed, "{}", closed);
+        }
     }
 
     #[test]
@@ -1171,7 +1242,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sets.title(&place, &plugins), "Testing title");
-        assert_eq!(sets.task_summary(), "tor-mt4");
+        assert_eq!(sets.task_cells(), vec![(None, "tor-mt4".to_string())]);
 
         refresh_task(&place, &plugins, "runes:tor-mt4").unwrap();
 
@@ -1184,6 +1255,11 @@ mod tests {
         };
         // Rung 1 of the title chain now outranks the stored title, as it is meant to.
         assert_eq!(sets.title(&place, &plugins), "breq list not accurate");
-        assert_eq!(sets.task_summary(), "tor-mt4(todo now)");
+        assert_eq!(
+            sets.task_cells(),
+            vec![(Some(TaskState::Todo), "tor-mt4".to_string())]
+        );
+        // The stamp's age is what `breq get` reports; `list` shows only the state.
+        assert_eq!(sets.tasks[0].age.as_deref(), Some("now"));
     }
 }

@@ -8,6 +8,7 @@
 use anyhow::Result;
 use colored::Colorize;
 use serde_json::json;
+use toren_lib::sets::{task_state, TaskState};
 use toren_lib::{Place, PluginManager, Sets};
 
 /// One row per workspace.
@@ -34,7 +35,7 @@ pub fn list(rows: &[(Place, Sets)], plugins: &PluginManager, show_segment: bool)
                 sets.changes.len().to_string()
             },
             delivery: sets.delivery_summary(),
-            tasks: sets.task_summary(),
+            tasks: sets.task_cells(),
             title: if place.is_decorated() {
                 sets.title(place, plugins)
             } else {
@@ -48,7 +49,7 @@ pub fn list(rows: &[(Place, Sets)], plugins: &PluginManager, show_segment: bool)
     let w_sessions = width(cells.iter().map(|c| c.sessions.len()), 8);
     let w_changes = width(cells.iter().map(|c| c.changes.len()), 3);
     let w_delivery = width(cells.iter().map(|c| c.delivery.len()), 8);
-    let w_tasks = width(cells.iter().map(|c| c.tasks.len()), 5);
+    let w_tasks = width(cells.iter().map(|c| task_cell(&c.tasks).1), 5);
 
     let fixed = w_name + w_age + w_sessions + w_changes + w_delivery + w_tasks + 6;
     let w_title = term_width.saturating_sub(fixed).max(10);
@@ -89,20 +90,26 @@ pub fn list(rows: &[(Place, Sets)], plugins: &PluginManager, show_segment: bool)
             name.normal()
         };
 
+        let (tasks, tasks_width) = task_cell(&cell.tasks);
+        let tasks = format!(
+            "{}{}",
+            tasks,
+            " ".repeat(w_tasks.saturating_sub(tasks_width))
+        );
+
         println!(
-            "{} {:<w_age$} {:<w_sessions$} {:<w_changes$} {:<w_delivery$} {:<w_tasks$} {}",
+            "{} {:<w_age$} {:<w_sessions$} {:<w_changes$} {:<w_delivery$} {} {}",
             name,
             cell.age,
             cell.sessions,
             cell.changes,
             cell.delivery,
-            cell.tasks,
+            tasks,
             truncate(&cell.title, w_title),
             w_age = w_age,
             w_sessions = w_sessions,
             w_changes = w_changes,
             w_delivery = w_delivery,
-            w_tasks = w_tasks,
         );
     }
 }
@@ -115,8 +122,39 @@ struct Row {
     sessions: String,
     changes: String,
     delivery: String,
-    tasks: String,
+    tasks: Vec<(Option<TaskState>, String)>,
     title: String,
+}
+
+/// A link whose status has never been read gets no glyph rather than a guessed one.
+fn glyph(state: Option<TaskState>) -> String {
+    match state {
+        Some(TaskState::Closed) => TaskState::Closed.glyph().to_string().green().to_string(),
+        Some(TaskState::Wip) => TaskState::Wip.glyph().to_string().yellow().to_string(),
+        Some(TaskState::Todo) => TaskState::Todo.glyph().to_string(),
+        None => String::new(),
+    }
+}
+
+/// The task column, with the width it *looks* — colour codes and the multi-byte glyphs both
+/// make `len()` the wrong number to pad by.
+fn task_cell(tasks: &[(Option<TaskState>, String)]) -> (String, usize) {
+    if tasks.is_empty() {
+        return ("-".to_string(), 1);
+    }
+    let width = tasks
+        .iter()
+        .map(|(state, id)| id.chars().count() + usize::from(state.is_some()))
+        .sum::<usize>()
+        + tasks.len()
+        - 1;
+
+    let text = tasks
+        .iter()
+        .map(|(state, id)| format!("{}{}", glyph(*state), id))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (text, width)
 }
 
 fn width(lens: impl Iterator<Item = usize>, min: usize) -> usize {
@@ -204,12 +242,14 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
                 format!("unreadable: {}", error).red()
             ),
             None => {
-                let age = match &task.age {
-                    Some(age) => format!(" (cached {})", age),
+                let age = match task.age.as_deref() {
+                    Some("now") => "  (just read)".to_string(),
+                    Some(age) => format!("  (read {} ago)", age),
                     None => String::new(),
                 };
                 println!(
-                    "  {}  {:<12} {}{}",
+                    "  {}{}  {:<12} {}{}",
+                    glyph(task.status.as_deref().map(task_state)),
                     task.link,
                     task.status.as_deref().unwrap_or("-"),
                     task.title.as_deref().unwrap_or(""),
