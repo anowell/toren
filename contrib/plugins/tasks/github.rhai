@@ -20,13 +20,31 @@ fn claim(id, assignee) {
     shell("gh", ["issue", "edit", id, "--add-assignee", assignee], #{});
 }
 
-fn complete(id) {
-    shell("gh", ["issue", "close", id]);
-}
-
-fn abort(id) {
-    // Non-throwing: issue may already be open
-    shell("gh", ["issue", "reopen", id], #{});
+fn set_field(id, field, value) {
+    if field == "status" {
+        // Non-throwing: the issue may already be in the requested state
+        if value == "closed" {
+            shell("gh", ["issue", "close", id], #{});
+        } else if value == "open" {
+            shell("gh", ["issue", "reopen", id], #{});
+        } else {
+            throw `github: unknown status "${value}" (expected "open" or "closed")`;
+        }
+    } else if field == "assignee" {
+        // Non-throwing: assignee may not be a valid GitHub login
+        if value == "none" || value == "" {
+            let current = info(id).assignee;
+            if current != "" {
+                shell("gh", ["issue", "edit", id, "--remove-assignee", current], #{});
+            }
+        } else {
+            shell("gh", ["issue", "edit", id, "--add-assignee", value], #{});
+        }
+    } else if field == "title" {
+        shell("gh", ["issue", "edit", id, "--title", value]);
+    } else {
+        throw `github: cannot write field "${field}"`;
+    }
 }
 
 fn create(title, desc) {

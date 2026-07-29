@@ -50,9 +50,6 @@ fn set_field(id, field, value) {
     shell("mytool", ["update", id, "--" + field, value]);
 }
 
-fn complete(id) { shell("mytool", ["update", id, "--status", "done"]); }
-fn abort(id)    { shell("mytool", ["update", id, "--status", "todo", "--assignee", ""]); }
-
 fn create(title, desc) {
     let args = ["create", "--title", title];
     if desc != () { args += ["--description", desc]; }

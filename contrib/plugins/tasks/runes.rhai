@@ -12,12 +12,8 @@ fn claim(id, assignee) {
     shell("runes", ["edit", id, "--status", "in-progress", "--assignee", assignee]);
 }
 
-fn complete(id) {
-    shell("runes", ["edit", id, "--status", "done"]);
-}
-
-fn abort(id) {
-    shell("runes", ["edit", id, "--status", "todo", "--assignee", "none"]);
+fn set_field(id, field, value) {
+    shell("runes", ["edit", id, "--" + field, value]);
 }
 
 fn create(title, desc) {

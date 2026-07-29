@@ -23,16 +23,23 @@ fn linear_gql(query, vars) {
 }
 
 fn issue_with_states(id) {
-    let data = linear_gql(`{ issues(filter: { identifier: { eq: "${id}" } }) { nodes { id identifier team { states { nodes { id type } } } } } }`);
+    let data = linear_gql(`{ issues(filter: { identifier: { eq: "${id}" } }) { nodes { id identifier team { states { nodes { id name type } } } } } }`);
     if data.issues.nodes.len() == 0 { throw "Not found: " + id; }
     data.issues.nodes[0]
 }
 
-fn find_state(issue, state_type) {
+fn state_by_type(issue, state_type) {
     for s in issue.team.states.nodes {
         if s.type == state_type { return s.id; }
     }
     throw "No '" + state_type + "' workflow state found";
+}
+
+fn state_by_name(issue, name) {
+    for s in issue.team.states.nodes {
+        if s.name == name { return s.id; }
+    }
+    ()
 }
 
 fn info(id) {
@@ -51,20 +58,31 @@ fn info(id) {
 
 fn claim(id, assignee) {
     let issue = issue_with_states(id);
-    let state_id = find_state(issue, "started");
+    let state_id = state_by_type(issue, "started");
     linear_gql(`mutation { issueUpdate(id: "${issue.id}", input: { stateId: "${state_id}" }) { success } }`);
 }
 
-fn complete(id) {
-    let issue = issue_with_states(id);
-    let state_id = find_state(issue, "completed");
-    linear_gql(`mutation { issueUpdate(id: "${issue.id}", input: { stateId: "${state_id}" }) { success } }`);
-}
-
-fn abort(id) {
-    let issue = issue_with_states(id);
-    let state_id = find_state(issue, "unstarted");
-    linear_gql(`mutation { issueUpdate(id: "${issue.id}", input: { stateId: "${state_id}", assigneeId: null }) { success } }`);
+fn set_field(id, field, value) {
+    if field == "status" {
+        let issue = issue_with_states(id);
+        let state_id = state_by_name(issue, value);
+        if state_id == () { state_id = state_by_type(issue, value); }
+        linear_gql(`mutation { issueUpdate(id: "${issue.id}", input: { stateId: "${state_id}" }) { success } }`);
+    } else if field == "assignee" {
+        let issue = issue_with_states(id);
+        if value == "none" || value == "" {
+            linear_gql(`mutation { issueUpdate(id: "${issue.id}", input: { assigneeId: null }) { success } }`);
+        } else {
+            let users = linear_gql(`{ users(filter: { displayName: { eq: "${value}" } }) { nodes { id } } }`);
+            if users.users.nodes.len() == 0 { throw `linear: no user named "${value}"`; }
+            linear_gql(`mutation { issueUpdate(id: "${issue.id}", input: { assigneeId: "${users.users.nodes[0].id}" }) { success } }`);
+        }
+    } else if field == "title" {
+        let issue = issue_with_states(id);
+        linear_gql(`mutation { issueUpdate(id: "${issue.id}", input: { title: "${value}" }) { success } }`);
+    } else {
+        throw `linear: cannot write field "${field}"`;
+    }
 }
 
 fn create(title, desc) {

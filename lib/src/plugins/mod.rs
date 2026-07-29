@@ -3,7 +3,7 @@
 //! Resolvers adapt external systems to breq. They come in three families, one per external
 //! system breq needs to read or write:
 //!
-//! - `tasks/` — issue trackers: `info`, `claim`, `set_field`, `complete`, `abort`, `create`
+//! - `tasks/` — issue trackers: `info`, `claim`, `set_field`, `create`
 //! - `agents/` — coding agents: `argv`, `resume_argv`, `activity`, `title`, `session_id`
 //! - `delivery/` — forges: `prs`
 //!
@@ -302,16 +302,6 @@ impl PluginManager {
             (id.to_string(), field.to_string(), value.to_string()),
             ctx,
         )?;
-        Ok(())
-    }
-
-    pub fn resolve_complete(&self, source: &str, id: &str, ctx: PluginContext) -> Result<()> {
-        let _ = self.call(Family::Tasks, source, "complete", (id.to_string(),), ctx)?;
-        Ok(())
-    }
-
-    pub fn resolve_abort(&self, source: &str, id: &str, ctx: PluginContext) -> Result<()> {
-        let _ = self.call(Family::Tasks, source, "abort", (id.to_string(),), ctx)?;
         Ok(())
     }
 
@@ -919,6 +909,27 @@ mod tests {
                 engine
                     .compile(&source)
                     .unwrap_or_else(|e| panic!("Failed to compile {}: {}", path.display(), e));
+            }
+        }
+    }
+
+    /// Compiling proves a plugin parses, not that it implements what breq calls.
+    #[test]
+    fn contrib_task_plugins_implement_the_contract() {
+        let contrib = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("contrib/plugins");
+
+        let mgr = PluginManager::new(&contrib).unwrap();
+        for source in mgr.list(Family::Tasks) {
+            for fn_name in ["info", "claim", "set_field", "create"] {
+                assert!(
+                    mgr.has_fn(Family::Tasks, source, fn_name),
+                    "contrib/plugins/tasks/{}.rhai defines no {}()",
+                    source,
+                    fn_name
+                );
             }
         }
     }

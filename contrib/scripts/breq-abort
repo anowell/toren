@@ -9,9 +9,22 @@
 
 set -euo pipefail
 
+case "${1:-}" in
+    -h|--help)
+        echo "usage: breq abort [workspace]"
+        echo
+        echo "Reopen the workspace's linked tasks and drop their assignee."
+        exit 0
+        ;;
+esac
+
 ws="${1:-${TOREN_WORKSPACE:-}}"
 if [ -z "$ws" ]; then
     echo "usage: breq abort <workspace>" >&2
+    exit 2
+fi
+if [ "${ws#-}" != "$ws" ]; then
+    echo "breq abort: unknown option '$ws'" >&2
     exit 2
 fi
 
@@ -31,7 +44,7 @@ for link in $links; do
         *)      status="open" ;;
     esac
 
-    echo "$link -> $status"
     breq set "$ws" task.status "$status" --task "$link"
     breq set "$ws" task.assignee "none" --task "$link" 2>/dev/null || true
+    echo "$link -> $status"
 done

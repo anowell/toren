@@ -9,9 +9,22 @@
 
 set -euo pipefail
 
+case "${1:-}" in
+    -h|--help)
+        echo "usage: breq submit [workspace]"
+        echo
+        echo "Push the workspace's work, open a PR, mark its tasks in review."
+        exit 0
+        ;;
+esac
+
 ws="${1:-${TOREN_WORKSPACE:-}}"
 if [ -z "$ws" ]; then
     echo "usage: breq submit <workspace>" >&2
+    exit 2
+fi
+if [ "${ws#-}" != "$ws" ]; then
+    echo "breq submit: unknown option '$ws'" >&2
     exit 2
 fi
 

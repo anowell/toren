@@ -11,9 +11,22 @@
 
 set -euo pipefail
 
+case "${1:-}" in
+    -h|--help)
+        echo "usage: breq complete [workspace]"
+        echo
+        echo "Mark the workspace's linked tasks done. Does not tear the workspace down."
+        exit 0
+        ;;
+esac
+
 ws="${1:-${TOREN_WORKSPACE:-}}"
 if [ -z "$ws" ]; then
     echo "usage: breq complete <workspace>" >&2
+    exit 2
+fi
+if [ "${ws#-}" != "$ws" ]; then
+    echo "breq complete: unknown option '$ws'" >&2
     exit 2
 fi
 
@@ -33,8 +46,8 @@ for link in $links; do
         *)      status="done" ;;
     esac
 
-    echo "$link -> $status"
     breq set "$ws" task.status "$status" --task "$link"
+    echo "$link -> $status"
 done
 
 echo

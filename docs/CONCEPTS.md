@@ -139,8 +139,8 @@ to session-specific:
 
 2. **Rhai resolvers** *(per integration, `~/.toren/plugins/`)* — a plugin *census* across three
    families, each a directory of small `.rhai` files keyed by name:
-   - **`tasks/`** — a task tracker. `info` / `claim` / `set_field` / `complete` / `abort` /
-     `create`. Shipped: `beads`, `github`, `linear`, `runes`.
+   - **`tasks/`** — a task tracker. `info` / `claim` / `set_field` / `create`.
+     Shipped: `beads`, `github`, `linear`, `runes`.
    - **`agents/`** — a coding agent. `argv` / `resume_argv` / `activity` / `title` / `session_id`.
      Shipped and vendored: `claude`, `codex`, `gemini`, `opencode`, `pi` — user-overridable.
    - **`delivery/`** — a forge, for PR/CI state. `prs`. Shipped: `github`.

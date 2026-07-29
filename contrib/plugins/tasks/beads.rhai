@@ -13,12 +13,9 @@ fn claim(id, assignee) {
     shell("bd", ["update", id, "--status", "in_progress", "--assignee", assignee]);
 }
 
-fn complete(id) {
-    shell("bd", ["update", id, "--status", "closed"]);
-}
-
-fn abort(id) {
-    shell("bd", ["update", id, "--status", "open", "--assignee", ""]);
+fn set_field(id, field, value) {
+    let unassigning = field == "assignee" && value == "none";
+    shell("bd", ["update", id, "--" + field, if unassigning { "" } else { value }]);
 }
 
 fn create(title, desc) {

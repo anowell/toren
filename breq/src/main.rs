@@ -238,12 +238,10 @@ enum Commands {
     /// Write a workspace state field, or a task field (pass-through to its source)
     ///
     /// List-valued keys take +/- prefixes: `breq set one +task runes:tor-456`.
+    /// A `-key` removal needs `--` first: `breq set one -- -task runes:tor-456`.
     Set {
         /// Workspace name (optional inside a workspace), key, value
-        ///
-        /// `allow_hyphen_values` is what lets `-task` read as a list-removal key rather than
-        /// an unknown flag.
-        #[arg(num_args = 2..=3, allow_hyphen_values = true)]
+        #[arg(num_args = 2..=3)]
         args: Vec<String>,
 
         /// Apply a task field write to one linked task rather than all of them
