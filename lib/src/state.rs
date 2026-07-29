@@ -141,6 +141,14 @@ pub struct AgentSession {
     /// Task link the session was started against, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// True when breq found this session in the agent's own files rather than starting it —
+    /// someone ran the agent in the workspace directly.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub adopted: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The agent that works this workspace, and the sessions it has kept here.

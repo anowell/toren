@@ -225,9 +225,6 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
     if let Some(parent) = place.parent() {
         field("parent", &parent);
     }
-    if let Some(agent) = place.agent() {
-        field("agent", &agent.packed());
-    }
     field(
         "created",
         &place.created_label().unwrap_or_else(|| "-".to_string()),
@@ -319,16 +316,24 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
     section("agent sessions", sessions.len());
     for session in sessions.iter().rev() {
         let state = match (&session.ended_at, session.exit) {
+            // breq never watched an adopted session's pane, so it cannot call it live.
+            (None, _) if session.adopted => "unknown".to_string(),
             (None, _) => "live".to_string(),
             (Some(_), Some(code)) => format!("exited {}", code),
             (Some(_), None) => "ended".to_string(),
         };
+        let origin = if session.adopted {
+            "  (adopted)".dimmed().to_string()
+        } else {
+            String::new()
+        };
         println!(
-            "  {:<38} {:<8} {:<10} {}",
+            "  {:<38} {:<8} {:<10} {}{}",
             session.id.as_deref().unwrap_or("(pending)"),
             session.agent,
             state,
-            session.title.as_deref().unwrap_or("")
+            session.title.as_deref().unwrap_or(""),
+            origin
         );
     }
 

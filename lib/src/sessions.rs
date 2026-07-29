@@ -20,7 +20,7 @@
 use anyhow::Result;
 
 use crate::place::Place;
-use crate::plugins::PluginManager;
+use crate::plugins::{Family, PluginManager};
 use crate::rmux;
 use crate::state::{AgentSession, TaskLink};
 
@@ -123,8 +123,12 @@ fn liveness(session: &str) -> Liveness {
 /// answer for: closing a session out mid-run would stamp a half-written title on it. Returns
 /// whether anything changed.
 pub fn settle(place: &mut Place, plugins: &PluginManager) -> bool {
-    if place.state.open_session_mut().is_none() {
-        return false;
+    match place.state.open_session_mut() {
+        None => return false,
+        // An adopted session was never hosted in this workspace's rmux session, so the absence of
+        // an agent pane is not news of its death — it never had one.
+        Some(open) if open.adopted => return false,
+        Some(_) => {}
     }
     let liveness = liveness(&place.session_name());
     settle_with(place, plugins, liveness)
@@ -183,6 +187,80 @@ pub fn settle_saved(place: &mut Place, plugins: &PluginManager) {
     if let Err(e) = place.save() {
         tracing::warn!(
             "failed to record the end of the agent session in '{}': {:#}",
+            place.name,
+            e
+        );
+    }
+}
+
+/// Record a session the agent kept here that breq never started.
+///
+/// `session_id(ws_path)` reads the agent's own files, and those do not care who launched it — a
+/// bare `claude` in the workspace leaves the same trace `breq do` would. A session the agent
+/// knows and `state.json` does not is one of those. Adopting it is what lets `--resume` reach it,
+/// and what keeps a place's record honest about what happened in it.
+///
+/// Idempotent, and it defers to a session breq is still holding open: that one is either its own
+/// or about to be settled into its own.
+pub fn adopt(place: &mut Place, plugins: &PluginManager) -> Vec<String> {
+    if place.state.open_session_mut().is_some() {
+        return Vec::new();
+    }
+
+    // A workspace that has only ever been worked by hand has no agent recorded, which is exactly
+    // the case worth catching — so with nothing configured, ask everything installed.
+    let candidates: Vec<String> = match place.agent() {
+        Some(agent) => vec![agent.name],
+        None => plugins
+            .list(Family::Agents)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    };
+
+    let mut adopted = Vec::new();
+    for agent in candidates {
+        let Some(id) = plugins.agent_session_id(&agent, &place.path) else {
+            continue;
+        };
+        if id.is_empty() || place.state.session(&id).is_some() {
+            continue;
+        }
+
+        let title = plugins.agent_title(&agent, &place.path);
+        place.state.push_session(AgentSession {
+            id: Some(id.clone()),
+            agent: agent.clone(),
+            title,
+            adopted: true,
+            ..Default::default()
+        });
+
+        tracing::info!(
+            event = "agent.adopted",
+            segment = %place.segment,
+            workspace = %place.name,
+            uid = place.uid(),
+            agent = %agent,
+            session_id = %id,
+            "adopted a {} session breq did not start in '{}'",
+            agent,
+            place.name
+        );
+        adopted.push(id);
+    }
+    adopted
+}
+
+/// [`adopt`], persisted. Best-effort: a workspace that will not take the write is looked at
+/// again next time, and adopting is idempotent.
+pub fn adopt_saved(place: &mut Place, plugins: &PluginManager) {
+    if adopt(place, plugins).is_empty() {
+        return;
+    }
+    if let Err(e) = place.save() {
+        tracing::warn!(
+            "failed to record an adopted agent session in '{}': {:#}",
             place.name,
             e
         );
@@ -248,6 +326,69 @@ mod tests {
 
     fn plugins() -> PluginManager {
         PluginManager::new(Path::new("/nonexistent")).unwrap()
+    }
+
+    /// An agent that reports a session for any directory — which is what the real ones do, since
+    /// they read their own files and cannot tell who started them.
+    fn agent_reporting(root: &Path, id: &str) -> PluginManager {
+        let dir = root.join("plugins");
+        std::fs::create_dir_all(dir.join("agents")).unwrap();
+        std::fs::write(
+            dir.join("agents/claude.rhai"),
+            format!(
+                r#"fn session_id(ws) {{ "{}" }}
+                   fn title(ws) {{ "work done by hand" }}"#,
+                id
+            ),
+        )
+        .unwrap();
+        PluginManager::new(&dir).unwrap()
+    }
+
+    #[test]
+    fn an_agent_run_by_hand_is_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut place = place(dir.path());
+        place.state.set_agent("claude", None);
+        let plugins = agent_reporting(dir.path(), "outside-1");
+
+        assert_eq!(adopt(&mut place, &plugins), ["outside-1"]);
+
+        let session = place.state.latest_session().unwrap();
+        assert_eq!(session.id.as_deref(), Some("outside-1"));
+        assert_eq!(session.title.as_deref(), Some("work done by hand"));
+        assert!(session.adopted);
+
+        // Idempotent: looking again adopts nothing, so `breq get` can run all day.
+        assert!(adopt(&mut place, &plugins).is_empty());
+    }
+
+    #[test]
+    fn settle_leaves_an_adopted_session_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut place = place(dir.path());
+        place.state.set_agent("claude", None);
+        let plugins = agent_reporting(dir.path(), "outside-1");
+        adopt(&mut place, &plugins);
+
+        // No agent pane is the normal state of a hand-run agent, not evidence that it stopped.
+        assert!(!settle(&mut place, &plugins));
+        assert_eq!(place.state.latest_session().unwrap().ended_at, None);
+    }
+
+    #[test]
+    fn adoption_defers_to_a_session_breq_is_holding_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut place = place(dir.path());
+        place.state.set_agent("claude", None);
+        let plugins = agent_reporting(dir.path(), "outside-1");
+
+        record_start(&mut place, &plugins, "claude", None).unwrap();
+
+        // Whatever the agent is writing belongs to breq's own in-flight session; settle claims it.
+        assert!(adopt(&mut place, &plugins).is_empty());
+        assert_eq!(place.state.sessions().len(), 1);
+        assert!(!place.state.sessions()[0].adopted);
     }
 
     #[test]
@@ -351,6 +492,7 @@ mod tests {
             exit: Some(0),
             title: Some("spike the pane mirror".into()),
             task: None,
+            adopted: false,
         });
         place.state.push_session(AgentSession {
             id: Some("aa11".into()),
