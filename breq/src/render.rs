@@ -124,14 +124,26 @@ struct Row {
     title: String,
 }
 
+/// A task as a row shows it: how far along, then which one, both carrying the colour so the
+/// state reads without having to resolve the glyph.
+///
 /// A link whose status has never been read gets no glyph rather than a guessed one.
-fn glyph(state: Option<TaskState>) -> String {
+fn task_token(state: Option<TaskState>, id: &str) -> String {
     match state {
-        Some(TaskState::Closed) => TaskState::Closed.glyph().to_string().green().to_string(),
-        Some(TaskState::Wip) => TaskState::Wip.glyph().to_string().yellow().to_string(),
-        Some(TaskState::Todo) => TaskState::Todo.glyph().to_string(),
-        None => String::new(),
+        Some(TaskState::Closed) => format!("{} {}", TaskState::Closed.glyph(), id)
+            .green()
+            .to_string(),
+        Some(TaskState::Wip) => format!("{} {}", TaskState::Wip.glyph(), id)
+            .yellow()
+            .to_string(),
+        Some(TaskState::Todo) => format!("{} {}", TaskState::Todo.glyph(), id),
+        None => id.dimmed().to_string(),
     }
+}
+
+/// What [`task_token`] takes up on screen: the glyph and the space after it, or neither.
+fn task_token_width(state: Option<TaskState>, id: &str) -> usize {
+    id.chars().count() + if state.is_some() { 2 } else { 0 }
 }
 
 /// How many tasks a row spells out before falling back to `+N`.
@@ -163,11 +175,11 @@ fn task_cell(tasks: &[(Option<TaskState>, String)]) -> (String, usize) {
 
     let mut text: Vec<String> = shown
         .iter()
-        .map(|(state, id)| format!("{}{}", glyph(*state), id))
+        .map(|(state, id)| task_token(*state, id))
         .collect();
     let mut width = shown
         .iter()
-        .map(|(state, id)| id.chars().count() + usize::from(state.is_some()))
+        .map(|(state, id)| task_token_width(*state, id))
         .sum::<usize>()
         + shown.len()
         - 1;
@@ -271,9 +283,8 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
                     None => String::new(),
                 };
                 println!(
-                    "  {}{}  {:<12} {}{}",
-                    glyph(task.status.as_deref().map(task_state)),
-                    task.link,
+                    "  {}  {:<12} {}{}",
+                    task_token(task.status.as_deref().map(task_state), &task.link),
                     task.status.as_deref().unwrap_or("-"),
                     task.title.as_deref().unwrap_or(""),
                     age.dimmed()
@@ -367,16 +378,16 @@ mod tests {
 
         assert_eq!(task_cell(&[]), ("-".to_string(), 1));
 
-        // glyph + id
+        // glyph, space, id
         let (_, w) = task_cell(&[task(TaskState::Todo, "tor-1")]);
-        assert_eq!(w, 6);
+        assert_eq!(w, 7);
 
         // two of them, one space between
         let (_, w) = task_cell(&[
             task(TaskState::Wip, "tor-1"),
             task(TaskState::Todo, "tor-2"),
         ]);
-        assert_eq!(w, 13);
+        assert_eq!(w, 15);
 
         // past the cap the rest collapse into "+N"
         let (text, w) = task_cell(&[
@@ -387,7 +398,7 @@ mod tests {
         ]);
         assert!(text.contains("+2"), "{}", text);
         assert!(!text.contains("tor-3"), "{}", text);
-        assert_eq!(w, 16);
+        assert_eq!(w, 18);
 
         // a link never read gets no glyph, so it is a character narrower
         let (_, w) = task_cell(&[(None, "tor-1".to_string())]);
