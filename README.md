@@ -93,12 +93,12 @@ breq do -p <prompt> --no-rmux      # Skip rmux; exec the agent directly
 breq setup [workspace]             # Create a workspace (no task, no agent)
 breq setup --from <workspace>      # Stack a child workspace on another
 breq setup <name>                  # Adopt an existing working copy in place
-breq destroy <workspace>          # Delete a workspace (no status changes, no push)
-breq destroy <workspace> --kill   # ...also stop live panes
+breq destroy <workspace>           # Delete a workspace (no status changes, no push)
+breq destroy <workspace> --kill    # ...also stop live panes
 breq destroy <workspace> --no-delete  # ...keep the working copy, drop only breq's state
 
 # Read and annotate
-breq list                          # One row per workspace: sessions, changes, delivery, tasks
+breq list                          # One row per workspace: agents, changes, delivery, tasks
 breq list --all --refresh          # Every segment; refresh remote metadata (the only networked path)
 breq get <workspace>               # Full detail for one place (--json for scripts)
 breq get <workspace> <key>         # One value, e.g. workspace.path, session, task.status

@@ -259,20 +259,26 @@ impl Sets {
         self.sessions.iter().any(|s| s.status == "running")
     }
 
-    /// Compact session summary for `list`, e.g. "agent:running".
-    pub fn session_summary(&self) -> String {
-        if self.sessions.is_empty() {
-            return "-".to_string();
-        }
-        self.sessions
+    /// Live agent panes, and whether any of them is mid-turn.
+    ///
+    /// Every pane is a session — shells, one-shot commands, the agent — but "is an agent working
+    /// in here" is the only one of those facts that earns a column in a row per workspace. The
+    /// rest are in `breq get`.
+    pub fn agents(&self) -> Option<(usize, bool)> {
+        let live: Vec<&SessionInfo> = self
+            .sessions
             .iter()
-            .filter(|s| s.window == rmux::AGENT_WINDOW || s.status != "idle")
-            .map(|s| {
-                let status = s.agent_activity.as_deref().unwrap_or(&s.status);
-                format!("{}:{}", s.window, status)
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
+            .filter(|s| s.window == rmux::AGENT_WINDOW && s.status != "exited")
+            .collect();
+        if live.is_empty() {
+            return None;
+        }
+        // Only the agent's own logs distinguish "sitting at its prompt" from "working"; a pane
+        // breq cannot ask reads as idle rather than as busy.
+        let busy = live
+            .iter()
+            .any(|s| s.agent_activity.as_deref() == Some("running"));
+        Some((live.len(), busy))
     }
 
     /// Compact delivery summary for `list`, e.g. "#12 open ci:passing (3h)".
@@ -297,14 +303,25 @@ impl Sets {
         parts.join(" ")
     }
 
-    /// One task id per link, each with the state its glyph stands for.
+    /// One task id per link, each with the state its glyph stands for, most live first.
+    ///
+    /// In flight, then not started, then finished — a workspace can carry more tasks than a row
+    /// can hold, so the ones still asking for something come first. Within a state the link order
+    /// is kept: the tracker contract has no update time to rank by.
     ///
     /// `None` is a link whose status has never been read — no glyph, rather than a guess.
     pub fn task_cells(&self) -> Vec<(Option<TaskState>, String)> {
-        self.tasks
+        let mut cells: Vec<(Option<TaskState>, String)> = self
+            .tasks
             .iter()
             .map(|t| (t.status.as_deref().map(task_state), t.id.clone()))
-            .collect()
+            .collect();
+        cells.sort_by_key(|(state, _)| match state {
+            Some(TaskState::Wip) => 0,
+            Some(TaskState::Todo) | None => 1,
+            Some(TaskState::Closed) => 2,
+        });
+        cells
     }
 
     /// What to call this workspace, in falling order of authority.
@@ -952,7 +969,7 @@ mod tests {
         let sets = Sets::default();
         assert_eq!(sets.delivery_summary(), "-");
         assert!(sets.task_cells().is_empty());
-        assert_eq!(sets.session_summary(), "-");
+        assert_eq!(sets.agents(), None);
         assert!(!sets.has_changes());
     }
 
@@ -992,6 +1009,31 @@ mod tests {
     }
 
     #[test]
+    fn task_cells_put_the_live_ones_first() {
+        let task = |id: &str, status: &str| TaskView {
+            link: format!("runes:{}", id),
+            id: id.into(),
+            status: Some(status.into()),
+            ..Default::default()
+        };
+        let sets = Sets {
+            tasks: vec![
+                task("done-1", "closed"),
+                task("todo-1", "todo"),
+                task("wip-1", "in-progress"),
+                task("done-2", "done"),
+                task("todo-2", "backlog"),
+            ],
+            ..Default::default()
+        };
+
+        // In flight, then not started, then finished — and link order kept within each, since
+        // the tracker contract carries no update time to rank by.
+        let ids: Vec<String> = sets.task_cells().into_iter().map(|(_, id)| id).collect();
+        assert_eq!(ids, ["wip-1", "todo-1", "todo-2", "done-1", "done-2"]);
+    }
+
+    #[test]
     fn every_trackers_vocabulary_distills_to_three_states() {
         for todo in ["todo", "open", "backlog", "New", "unstarted", "ready", "??"] {
             assert_eq!(task_state(todo), TaskState::Todo, "{}", todo);
@@ -1019,42 +1061,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_summary_prefers_agent_activity_over_pane_liveness() {
-        let sets = Sets {
-            sessions: vec![SessionInfo {
-                window: "agent".into(),
-                status: "running".into(),
-                command: "claude".into(),
-                agent_activity: Some("idle".into()),
-            }],
-            ..Default::default()
-        };
-        assert_eq!(sets.session_summary(), "agent:idle");
-        // The pane is alive, so the workspace still counts as busy for destroy purposes.
-        assert!(sets.is_busy());
+    fn pane(window: &str, status: &str, activity: Option<&str>) -> SessionInfo {
+        SessionInfo {
+            window: window.into(),
+            status: status.into(),
+            command: "claude".into(),
+            agent_activity: activity.map(Into::into),
+        }
     }
 
     #[test]
-    fn session_summary_hides_an_idle_shell() {
+    fn agents_report_activity_rather_than_pane_liveness() {
+        let sets = Sets {
+            sessions: vec![pane("agent", "running", Some("idle"))],
+            ..Default::default()
+        };
+        // The pane is alive but the agent is at its prompt: one agent, not busy.
+        assert_eq!(sets.agents(), Some((1, false)));
+        // ...though the live pane still counts as busy for destroy purposes.
+        assert!(sets.is_busy());
+
+        let working = Sets {
+            sessions: vec![pane("agent", "running", Some("running"))],
+            ..Default::default()
+        };
+        assert_eq!(working.agents(), Some((1, true)));
+    }
+
+    #[test]
+    fn agents_ignore_shells_and_dead_panes() {
         let sets = Sets {
             sessions: vec![
-                SessionInfo {
-                    window: "shell".into(),
-                    status: "idle".into(),
-                    command: "zsh".into(),
-                    agent_activity: None,
-                },
-                SessionInfo {
-                    window: "agent".into(),
-                    status: "exited".into(),
-                    command: "claude".into(),
-                    agent_activity: None,
-                },
+                pane("shell", "idle", None),
+                pane("shell-2", "running", None),
+                pane("agent", "exited", None),
             ],
             ..Default::default()
         };
-        assert_eq!(sets.session_summary(), "agent:exited");
+        assert_eq!(sets.agents(), None);
     }
 
     // ── The shipped runes resolver, against a stub `runes` on PATH ───────────

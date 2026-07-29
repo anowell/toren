@@ -189,7 +189,7 @@ enum Commands {
         segment: Option<String>,
     },
 
-    /// One row per workspace: sessions, changes, delivery, tasks
+    /// One row per workspace: agents, changes, delivery, tasks
     List {
         /// List every segment
         #[arg(short, long)]

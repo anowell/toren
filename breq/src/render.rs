@@ -28,7 +28,7 @@ pub fn list(rows: &[(Place, Sets)], plugins: &PluginManager, show_segment: bool)
             dirty: sets.has_changes(),
             adoptable: !place.is_decorated(),
             age: place.age_label(),
-            sessions: sets.session_summary(),
+            agents: sets.agents(),
             changes: if sets.changes.is_empty() {
                 "-".to_string()
             } else {
@@ -46,28 +46,28 @@ pub fn list(rows: &[(Place, Sets)], plugins: &PluginManager, show_segment: bool)
 
     let w_name = width(cells.iter().map(|c| c.name.len() + 2), 9);
     let w_age = width(cells.iter().map(|c| c.age.len()), 3);
-    let w_sessions = width(cells.iter().map(|c| c.sessions.len()), 8);
+    let w_agents = width(cells.iter().map(|c| agent_cell(c.agents).1), 6);
     let w_changes = width(cells.iter().map(|c| c.changes.len()), 3);
     let w_delivery = width(cells.iter().map(|c| c.delivery.len()), 8);
     let w_tasks = width(cells.iter().map(|c| task_cell(&c.tasks).1), 5);
 
-    let fixed = w_name + w_age + w_sessions + w_changes + w_delivery + w_tasks + 6;
+    let fixed = w_name + w_age + w_agents + w_changes + w_delivery + w_tasks + 6;
     let w_title = term_width.saturating_sub(fixed).max(10);
 
     println!(
         "{}",
         format!(
-            "{:<w_name$} {:<w_age$} {:<w_sessions$} {:<w_changes$} {:<w_delivery$} {:<w_tasks$} {}",
+            "{:<w_name$} {:<w_age$} {:<w_agents$} {:<w_changes$} {:<w_delivery$} {:<w_tasks$} {}",
             "WORKSPACE",
             "AGE",
-            "SESSIONS",
+            "AGENTS",
             "CHG",
             "DELIVERY",
             "TASKS",
             "TITLE",
             w_name = w_name,
             w_age = w_age,
-            w_sessions = w_sessions,
+            w_agents = w_agents,
             w_changes = w_changes,
             w_delivery = w_delivery,
             w_tasks = w_tasks,
@@ -90,24 +90,22 @@ pub fn list(rows: &[(Place, Sets)], plugins: &PluginManager, show_segment: bool)
             name.normal()
         };
 
-        let (tasks, tasks_width) = task_cell(&cell.tasks);
-        let tasks = format!(
-            "{}{}",
-            tasks,
-            " ".repeat(w_tasks.saturating_sub(tasks_width))
-        );
+        let pad = |(text, width): (String, usize), to: usize| {
+            format!("{}{}", text, " ".repeat(to.saturating_sub(width)))
+        };
+        let agents = pad(agent_cell(cell.agents), w_agents);
+        let tasks = pad(task_cell(&cell.tasks), w_tasks);
 
         println!(
-            "{} {:<w_age$} {:<w_sessions$} {:<w_changes$} {:<w_delivery$} {} {}",
+            "{} {:<w_age$} {} {:<w_changes$} {:<w_delivery$} {} {}",
             name,
             cell.age,
-            cell.sessions,
+            agents,
             cell.changes,
             cell.delivery,
             tasks,
             truncate(&cell.title, w_title),
             w_age = w_age,
-            w_sessions = w_sessions,
             w_changes = w_changes,
             w_delivery = w_delivery,
         );
@@ -119,7 +117,7 @@ struct Row {
     dirty: bool,
     adoptable: bool,
     age: String,
-    sessions: String,
+    agents: Option<(usize, bool)>,
     changes: String,
     delivery: String,
     tasks: Vec<(Option<TaskState>, String)>,
@@ -136,25 +134,50 @@ fn glyph(state: Option<TaskState>) -> String {
     }
 }
 
+/// How many tasks a row spells out before falling back to `+N`.
+const TASKS_SHOWN: usize = 2;
+
+/// The agent column: how many are live in there, and whether any is mid-turn.
+fn agent_cell(agents: Option<(usize, bool)>) -> (String, usize) {
+    match agents {
+        None => ("-".to_string(), 1),
+        Some((count, busy)) => {
+            let mark = if busy {
+                "◐".yellow().to_string()
+            } else {
+                "○".to_string()
+            };
+            (format!("{}{}", mark, count), 1 + count.to_string().len())
+        }
+    }
+}
+
 /// The task column, with the width it *looks* — colour codes and the multi-byte glyphs both
 /// make `len()` the wrong number to pad by.
 fn task_cell(tasks: &[(Option<TaskState>, String)]) -> (String, usize) {
     if tasks.is_empty() {
         return ("-".to_string(), 1);
     }
-    let width = tasks
+    let shown = &tasks[..tasks.len().min(TASKS_SHOWN)];
+    let overflow = tasks.len() - shown.len();
+
+    let mut text: Vec<String> = shown
+        .iter()
+        .map(|(state, id)| format!("{}{}", glyph(*state), id))
+        .collect();
+    let mut width = shown
         .iter()
         .map(|(state, id)| id.chars().count() + usize::from(state.is_some()))
         .sum::<usize>()
-        + tasks.len()
+        + shown.len()
         - 1;
 
-    let text = tasks
-        .iter()
-        .map(|(state, id)| format!("{}{}", glyph(*state), id))
-        .collect::<Vec<_>>()
-        .join(" ");
-    (text, width)
+    if overflow > 0 {
+        let more = format!("+{}", overflow);
+        width += 1 + more.chars().count();
+        text.push(more.dimmed().to_string());
+    }
+    (text.join(" "), width)
 }
 
 fn width(lens: impl Iterator<Item = usize>, min: usize) -> usize {
@@ -334,5 +357,44 @@ mod tests {
         assert_eq!(width([1, 2, 3].into_iter(), 5), 5);
         assert_eq!(width([9, 2].into_iter(), 5), 9);
         assert_eq!(width(std::iter::empty(), 4), 4);
+    }
+
+    /// The reported width is what pads the column, and it has to match what the cell *looks*
+    /// like — never the byte length, which colour codes and the glyphs both inflate.
+    #[test]
+    fn a_cells_width_is_what_it_looks_not_what_it_weighs() {
+        let task = |state, id: &str| (Some(state), id.to_string());
+
+        assert_eq!(task_cell(&[]), ("-".to_string(), 1));
+
+        // glyph + id
+        let (_, w) = task_cell(&[task(TaskState::Todo, "tor-1")]);
+        assert_eq!(w, 6);
+
+        // two of them, one space between
+        let (_, w) = task_cell(&[
+            task(TaskState::Wip, "tor-1"),
+            task(TaskState::Todo, "tor-2"),
+        ]);
+        assert_eq!(w, 13);
+
+        // past the cap the rest collapse into "+N"
+        let (text, w) = task_cell(&[
+            task(TaskState::Wip, "tor-1"),
+            task(TaskState::Todo, "tor-2"),
+            task(TaskState::Closed, "tor-3"),
+            task(TaskState::Closed, "tor-4"),
+        ]);
+        assert!(text.contains("+2"), "{}", text);
+        assert!(!text.contains("tor-3"), "{}", text);
+        assert_eq!(w, 16);
+
+        // a link never read gets no glyph, so it is a character narrower
+        let (_, w) = task_cell(&[(None, "tor-1".to_string())]);
+        assert_eq!(w, 5);
+
+        assert_eq!(agent_cell(None), ("-".to_string(), 1));
+        assert_eq!(agent_cell(Some((1, true))).1, 2);
+        assert_eq!(agent_cell(Some((12, false))).1, 3);
     }
 }
