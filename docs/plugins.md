@@ -142,18 +142,21 @@ Multi-step workflows — "ship this", "hand it back", "open a PR" — are **not*
 ordinary shell scripts dispatched git-style: `breq <name>` with an unknown verb runs a `breq-<name>`
 script found on your `PATH` or in `~/.toren/bin`.
 
-`breq init` installs the shipped defaults, which are *task verbs* — they update your tracker over the
-place/task surface (`breq get`, `breq set task.*`) and never tear the workspace down:
+`breq init` installs the shipped defaults, which compose the place and task surfaces (`breq get`,
+`breq set task.*`, `breq destroy`) into one move:
 
 | Script | What it does |
 |--------|--------------|
-| `breq-complete` | Marks each linked task done (per-tracker status strings). No teardown, no push. |
-| `breq-abort` | Reopens each linked task and drops its assignee. |
-| `breq-submit` | Pushes, opens a PR, marks tasks in-review. Installed when `breq init` detects github + `gh`. |
+| `breq-complete` | Marks each linked task done (per-tracker status strings), then destroys the workspace. |
+| `breq-abort` | Sets each linked task back to work-in-progress, unassigns it, then destroys the workspace. |
+| `breq-submit` | Pushes, opens a PR, marks tasks in-review. Keeps the workspace. Installed when `breq init` detects github + `gh`. |
 
-These are yours to edit — the per-tracker status values in them are defaults, not a vocabulary breq
-imposes. Because completing a task and tearing down its place are separate axes, none of these delete
-the workspace; when you're done with the place, `breq teardown <ws>`.
+These are yours to edit — the per-tracker status values, and whether finishing the work also
+retires the place, are defaults in a file rather than a vocabulary breq imposes. `breq-submit` is
+the shipped example of the other choice: it ships a piece and leaves the workspace warm.
+
+Both destroying scripts do it last, so a `destroy` that refuses (something is still running in
+there) leaves the tracker already updated and needs only `breq destroy <ws> --kill`.
 
 > The old model had `commands/` Rhai plugins (`assign`, `complete`, `abort`) and a `DeferredAction`
 > protocol for scripts that needed to start an agent. Those are gone. `assign` is now `breq do <task>`

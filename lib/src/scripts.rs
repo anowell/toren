@@ -118,6 +118,118 @@ pub fn shipped_names() -> Vec<&'static str> {
     SHIPPED.iter().map(|(name, _)| *name).collect()
 }
 
+/// A workflow verb as `breq --help` shows it.
+pub struct Verb {
+    pub name: String,
+    /// How to call it, from the script's own first comment line.
+    pub usage: String,
+    pub summary: String,
+}
+
+/// Separators a script may put between its usage and what it does.
+const DASHES: &[&str] = &[" — ", " – ", " -- ", " - ", ": "];
+
+/// Read a script's self-description: the first comment line below the shebang, split into
+/// how you call it and what it does.
+///
+/// A script that documents nothing still lists, under its filename — the whole point is that
+/// dropping any `breq-<name>` into `~/.toren/bin` makes a working verb.
+fn describe(path: &Path, name: &str) -> Verb {
+    let fallback = format!("breq {}", name);
+    let doc = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .skip_while(|l| l.starts_with("#!") || l.trim().is_empty())
+                .take_while(|l| l.trim_start().starts_with('#'))
+                .map(|l| l.trim_start().trim_start_matches('#').trim().to_string())
+                .find(|l| !l.is_empty())
+        })
+        .unwrap_or_default();
+
+    let (usage, summary) = match DASHES
+        .iter()
+        .filter_map(|sep| doc.find(sep).map(|at| (at, sep.len())))
+        .min()
+    {
+        Some((at, len)) if doc.starts_with(&fallback) => {
+            (doc[..at].to_string(), doc[at + len..].to_string())
+        }
+        _ => (fallback, doc),
+    };
+
+    Verb {
+        name: name.to_string(),
+        usage,
+        summary,
+    }
+}
+
+/// Every `breq-<name>` script reachable as a verb, sorted by name.
+///
+/// Same precedence as [`find`], so what this lists is what would actually run.
+pub fn discover() -> Vec<Verb> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    dirs.push(bin_dir());
+
+    let mut verbs: Vec<Verb> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("breq-"))
+            else {
+                continue;
+            };
+            if name.is_empty()
+                || verbs.iter().any(|v| v.name == name)
+                || !is_executable(&path)
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                continue;
+            }
+            verbs.push(describe(&path, name));
+        }
+    }
+    verbs.sort_by(|a, b| a.name.cmp(&b.name));
+    verbs
+}
+
+/// The `Custom Commands:` section of `breq --help`.
+pub fn verbs_help() -> String {
+    let verbs = discover();
+    if verbs.is_empty() {
+        return "Custom Commands:\n  none installed — see `breq doctor` to add the shipped ones."
+            .to_string();
+    }
+
+    let width = verbs.iter().map(|v| v.usage.len()).max().unwrap_or(0);
+    let mut out = String::from("Custom Commands:\n");
+    for verb in &verbs {
+        if verb.summary.is_empty() {
+            out.push_str(&format!("  {}\n", verb.usage));
+        } else {
+            out.push_str(&format!(
+                "  {:<width$}  {}\n",
+                verb.usage,
+                verb.summary,
+                width = width
+            ));
+        }
+    }
+    out.push_str("\nAny executable `breq-<name>` on PATH or in ~/.toren/bin is a verb.");
+    out
+}
+
 /// Whether `~/.toren/bin` is on PATH — scripts are still reachable through `breq <name>`
 /// either way, but a user typing `breq-complete` directly needs it.
 pub fn bin_dir_on_path() -> bool {
@@ -152,6 +264,35 @@ mod tests {
         assert!(is_universal("breq-complete"));
         assert!(is_universal("breq-abort"));
         assert!(!is_universal("breq-submit"));
+    }
+
+    #[test]
+    fn a_script_describes_itself_by_its_first_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |body: &str| {
+            let path = dir.path().join("breq-ship");
+            std::fs::write(&path, body).unwrap();
+            describe(&path, "ship")
+        };
+
+        let documented = write("#!/usr/bin/env bash\n# breq ship [ws] — push it\n\ntrue\n");
+        assert_eq!(documented.usage, "breq ship [ws]");
+        assert_eq!(documented.summary, "push it");
+
+        // No usage prefix: the whole line is what it does.
+        let bare = write("#!/usr/bin/env bash\n# push it\ntrue\n");
+        assert_eq!(bare.usage, "breq ship");
+        assert_eq!(bare.summary, "push it");
+
+        // A dash inside the summary is not a separator; only the first one splits.
+        let dashed = write("#!/usr/bin/env bash\n# breq ship — push it - hard\ntrue\n");
+        assert_eq!(dashed.usage, "breq ship");
+        assert_eq!(dashed.summary, "push it - hard");
+
+        // Undocumented still lists, so a scratch script is a working verb.
+        let silent = write("#!/usr/bin/env bash\ntrue\n");
+        assert_eq!(silent.usage, "breq ship");
+        assert_eq!(silent.summary, "");
     }
 
     #[test]

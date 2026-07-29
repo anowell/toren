@@ -36,34 +36,37 @@ them apart.
 
 Workspaces within a segment are named with numbered words — `one`, `two`, `three` — following the
 books' convention ("One Esk Nineteen"). `breq setup` takes the next free slot; you can also name one
-explicitly. Each *incarnation* of a slot (setup, teardown, setup again) also gets a short **uid**,
+explicitly. Each *incarnation* of a slot (setup, destroy, setup again) also gets a short **uid**,
 minted at setup, so the three lives of `toren/one` stay distinguishable in sessions and history.
 
 ## Two orthogonal verb families
 
 Every `breq` verb belongs to one of two families, and they move along different axes:
 
-- **Place verbs** manage the workspace: `setup`, `teardown`, `do`, `sh`, `set`/`get`, `list`.
+- **Place verbs** manage the workspace: `setup`, `destroy`, `do`, `sh`, `set`/`get`, `list`.
   They create it, run agents in it, read and annotate it, and tear it down.
-- **Task verbs** update the tracker: writing `set <ws> task.status ...`, and the
-  `breq-complete` / `breq-abort` / `breq-submit` scripts layered over it. They never touch the
-  workspace.
+- **Task writes** update the tracker: `set <ws> task.status ...`. They never touch the workspace.
 
-The one deliberate crossing point: **`breq do <task>` claims the task it was handed.** That single
-tracker write is the *only* tracker side effect in any place verb. Everything else keeps the axes
-clean — `teardown` changes no task status and pushes nothing; `breq complete` changes task status
-and deletes nothing.
+The one deliberate crossing point inside breq: **`breq do <task>` claims the task it was handed.**
+That single tracker write is the *only* tracker side effect in any place verb, and `destroy`
+changes no task status and pushes nothing. Breq's own verbs never mix the two axes.
 
-This is what dissolves the old, confused question *"do I complete or destroy?"* They are not two
-answers to one question — they are two questions:
+**The workflow scripts are where they mix, because you said so.** `breq-complete` and `breq-abort`
+are ordinary shell scripts composing both: complete closes the linked tasks and then destroys the
+place; abort hands the tasks back as work-in-progress and destroys it too. That composition is a
+default living in a file you can edit, not a rule breq enforces.
 
-- **"Am I finished with this piece of work?"** → a task verb (`breq complete <ws>`).
-- **"Am I finished with this place?"** → a place verb (`breq teardown <ws>`).
+This is what dissolves the old, confused question *"do I complete or destroy?"* — not by picking an
+answer, but by keeping the two moves separable underneath:
 
-You can ship a piece and keep the warm workspace for the next one. You can tear down a spike whose
-task you never mean to close. `breq list` is where the two axes are shown side by side, so when they
-*have* diverged — task closed but workspace still alive, changes never pushed, agent long since idle
-— you can see it rather than compute it.
+- **"Am I finished with this piece of work?"** → a task write.
+- **"Am I finished with this place?"** → `breq destroy <ws>`.
+
+The shipped `breq complete` does both because that is the common case. When it isn't — you shipped a
+piece and want the warm workspace for the next one — the underlying verbs are still right there.
+`breq list` is where the two axes are shown side by side, so when they *have* diverged — task closed
+but workspace still alive, changes never pushed, agent long since idle — you can see it rather than
+compute it.
 
 > **Ancillary Justice framing.** An ancillary *is* a workspace: it exists exactly while its place
 > exists, and it is cleaned up (torn down) as a unit. What is no longer true is that its *task*
@@ -75,7 +78,7 @@ task you never mean to close. `breq list` is where the two axes are shown side b
 | Verb | What it does |
 |------|--------------|
 | `breq setup [ws]` | Create a workspace (working copy + hooks), no task, no agent. `--from <ws>` stacks a child on another workspace. Naming an existing working copy adopts it in place. |
-| `breq teardown <ws>` | Delete a workspace. Task-agnostic: no status changes, no push. `--kill` also stops live panes; `--no-delete` keeps the working copy and drops only breq's state. |
+| `breq destroy <ws>` | Delete a workspace. Task-agnostic: no status changes, no push. `--kill` also stops live panes; `--no-delete` keeps the working copy and drops only breq's state. |
 | `breq do [task]` | Run a coding agent in a place. Needs a task or a `-p` prompt. Infers the workspace from your cwd, else makes a fresh one. Claiming a named task is its one tracker side effect. |
 | `breq sh [ws]` | Open a shell in a place, or `breq sh <ws> -- <cmd>` to run a command there. The composability workhorse. |
 | `breq get <ws> [key]` | Read a place: full detail, or one key for scripting. `task.*` keys pass through to the tracker; `cache.*` keys read the workspace cache. |
@@ -102,7 +105,7 @@ There is **no global registry.** The old `~/.toren/assignments.json` is gone. In
   lives anywhere but the place.
 - **A uid is minted at setup** and embedded in the rmux session name
   (`toren-<segment>-<ws>-<uid>`), so three incarnations of a slot never conflate.
-- **Teardown leaves a line behind.** The teardown event in `~/.toren/logs/` records the uid, the
+- **Destroy leaves a line behind.** The destroy event in `~/.toren/logs/` records the uid, the
   linked tasks, the final revision, and the agent session id — the link to the agent's own record
   of the work, which outlives the workspace.
 - **Remote-derived values are write-through, never blocking.** Task status and title, PR state and
@@ -125,7 +128,7 @@ forked — so you can copy-on-write the parent's runtime state rather than rebui
 
 Any working copy can become a place breq manages: `breq setup <name>` on an existing, undecorated
 directory **adopts** it in place rather than recreating it — a hand-made worktree, or one that
-outlived its state, joins the fold. `breq teardown --no-delete` is the inverse: it drops
+outlived its state, joins the fold. `breq destroy --no-delete` is the inverse: it drops
 breq's state but leaves the working copy on disk.
 
 ## The extension census: four layers

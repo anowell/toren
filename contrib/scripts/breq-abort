@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# breq abort [workspace] — hand a workspace's tasks back.
+# breq abort [workspace] — hand the workspace's tasks back, then destroy it
 #
-# A plain PATH script, like breq-complete. Reopens each linked task and drops its assignee,
-# so the work returns to whatever "unclaimed" means in your tracker.
+# A plain PATH script, like breq-complete. Leaves each linked task in your tracker's
+# "started but nobody on it" state — work-in-progress, assignee dropped — so whoever picks
+# it up next can see it was already begun. Then the place goes away.
 #
-# It does not discard your work or delete the workspace. To do that:
-#   breq teardown <workspace> --kill
+# The work in the workspace is discarded with it. To keep the working copy, drop breq's
+# state only: breq destroy <workspace> --no-delete
 
 set -euo pipefail
 
@@ -13,7 +14,8 @@ case "${1:-}" in
     -h|--help)
         echo "usage: breq abort [workspace]"
         echo
-        echo "Reopen the workspace's linked tasks and drop their assignee."
+        echo "Set the workspace's linked tasks back to work-in-progress and unassign them,"
+        echo "then destroy the workspace."
         exit 0
         ;;
 esac
@@ -37,14 +39,16 @@ fi
 for link in $links; do
     source="${link%%:*}"
     case "$source" in
-        runes)  status="todo" ;;
+        runes)  status="wip" ;;
         github) status="open" ;;
-        linear) status="Todo" ;;
-        beads)  status="open" ;;
-        *)      status="open" ;;
+        linear) status="In Progress" ;;
+        beads)  status="in_progress" ;;
+        *)      status="wip" ;;
     esac
 
     breq set "$ws" task.status "$status" --task "$link"
     breq set "$ws" task.assignee "none" --task "$link" 2>/dev/null || true
     echo "$link -> $status"
 done
+
+breq destroy "$ws"

@@ -305,9 +305,9 @@ impl Sets {
         self.tasks
             .iter()
             .map(|t| match (&t.status, &t.age) {
-                (Some(status), Some(age)) => format!("{}({} {})", t.link, status, age),
-                (Some(status), None) => format!("{}({})", t.link, status),
-                (None, _) => t.link.clone(),
+                (Some(status), Some(age)) => format!("{}({} {})", t.id, status, age),
+                (Some(status), None) => format!("{}({})", t.id, status),
+                (None, _) => t.id.clone(),
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -931,19 +931,21 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(sets.task_summary(), "runes:tor-bau(in-progress)");
+        // The source prefix is dropped: an id's own shape already says which tracker it is.
+        assert_eq!(sets.task_summary(), "tor-bau(in-progress)");
 
         // A cached read says how old it is, so nothing reads as fresher than it is.
         let stale = Sets {
             tasks: vec![TaskView {
                 link: "runes:tor-bau".into(),
+                id: "tor-bau".into(),
                 status: Some("in-progress".into()),
                 age: Some("3h".into()),
                 ..Default::default()
             }],
             ..Default::default()
         };
-        assert_eq!(stale.task_summary(), "runes:tor-bau(in-progress 3h)");
+        assert_eq!(stale.task_summary(), "tor-bau(in-progress 3h)");
     }
 
     #[test]
@@ -958,7 +960,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sets.session_summary(), "agent:idle");
-        // The pane is alive, so the workspace still counts as busy for teardown purposes.
+        // The pane is alive, so the workspace still counts as busy for destroy purposes.
         assert!(sets.is_busy());
     }
 
@@ -1169,7 +1171,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sets.title(&place, &plugins), "Testing title");
-        assert_eq!(sets.task_summary(), "runes:tor-mt4");
+        assert_eq!(sets.task_summary(), "tor-mt4");
 
         refresh_task(&place, &plugins, "runes:tor-mt4").unwrap();
 
@@ -1182,6 +1184,6 @@ mod tests {
         };
         // Rung 1 of the title chain now outranks the stored title, as it is meant to.
         assert_eq!(sets.title(&place, &plugins), "breq list not accurate");
-        assert_eq!(sets.task_summary(), "runes:tor-mt4(todo now)");
+        assert_eq!(sets.task_summary(), "tor-mt4(todo now)");
     }
 }

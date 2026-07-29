@@ -1,6 +1,6 @@
 //! Taking a place down.
 //!
-//! Teardown is pure workspace deletion: destroy hooks, session, proxy routes, working copy.
+//! Pure workspace deletion: destroy hooks, session, proxy routes, working copy.
 //! It touches no tracker and pushes nothing. Shipping is a different axis — that's what the
 //! `breq-complete` / `breq-submit` scripts are for — and keeping them separate is what lets a
 //! workspace outlive the work it shipped.
@@ -16,7 +16,7 @@ use crate::workspace::{CleanupMode, WorkspaceManager};
 
 /// How to tear a place down.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct TeardownOptions {
+pub struct DestroyOptions {
     /// Kill processes and live panes instead of refusing.
     pub kill: bool,
     /// Keep the working copy and its VCS registration; drop only breq's own state.
@@ -24,9 +24,9 @@ pub struct TeardownOptions {
     pub no_delete: bool,
 }
 
-/// What teardown did.
+/// What destroy did.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct TeardownOutcome {
+pub struct DestroyOutcome {
     pub workspace: String,
     pub segment: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,12 +41,12 @@ pub struct TeardownOutcome {
 ///
 /// Refuses while anything is running in it unless `kill` is set — a live agent is work in
 /// progress, and this is the only thing standing between it and `rm -rf`.
-pub fn teardown(
+pub fn destroy(
     place: &Place,
     ws_mgr: &WorkspaceManager,
     plugins: &PluginManager,
-    opts: TeardownOptions,
-) -> Result<TeardownOutcome> {
+    opts: DestroyOptions,
+) -> Result<DestroyOutcome> {
     guard_session(place, opts.kill)?;
 
     // Asked while the working copy is still there, because that path is how an agent finds its
@@ -76,7 +76,7 @@ pub fn teardown(
         None
     };
 
-    ws_mgr.teardown_workspace(
+    ws_mgr.destroy_workspace(
         &place.segment_path,
         &place.segment,
         &place.name,
@@ -91,7 +91,7 @@ pub fn teardown(
     // The last thing said about this incarnation. The agent's own session file is the record of
     // what was done here; this is the line that ties the two together once the workspace is gone.
     info!(
-        event = "workspace.teardown",
+        event = "workspace.destroy",
         segment = %place.segment,
         workspace = %place.name,
         uid = place.uid(),
@@ -104,7 +104,7 @@ pub fn teardown(
         place.name
     );
 
-    Ok(TeardownOutcome {
+    Ok(DestroyOutcome {
         workspace: place.name.clone(),
         segment: place.segment.clone(),
         uid: place.uid(),

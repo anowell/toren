@@ -118,7 +118,7 @@ Aliases receive positional arguments (`$1`, `$2`).
 ## Logs
 
 `breq` and `toren-daemon` each write a rolling JSON log under `~/.toren/logs/` — `breq.jsonl` and
-`toren-daemon.jsonl`, rotated daily, seven days kept. Workspace create/adopt/teardown, agent
+`toren-daemon.jsonl`, rotated daily, seven days kept. Workspace create/adopt/destroy, agent
 start/resume/exit, plugin failures and VCS errors land there as structured events. It is a debug
 record, not an interface: nothing reads it back, and it replaces the old
 `~/.toren/completion_history.jsonl`, which `breq doctor` will point out if you still have one.

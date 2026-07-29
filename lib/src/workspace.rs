@@ -1325,14 +1325,14 @@ impl WorkspaceManager {
         workspace_name: &str,
         mode: CleanupMode,
     ) -> Result<SetupResult> {
-        self.teardown_workspace(segment_path, segment_name, workspace_name, mode, true)
+        self.destroy_workspace(segment_path, segment_name, workspace_name, mode, true)
     }
 
     /// Tear a workspace down: destroy hooks, then optionally VCS deregistration + deletion.
     ///
     /// `delete = false` runs the hooks and leaves the working copy and its VCS registration in
     /// place — the exact inverse of adopting a working copy with an in-place `breq setup`.
-    pub fn teardown_workspace(
+    pub fn destroy_workspace(
         &self,
         segment_path: &Path,
         segment_name: &str,

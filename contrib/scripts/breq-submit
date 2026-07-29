@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# breq submit [workspace] — push the workspace's work, open a PR, mark its tasks in review.
+# breq submit [workspace] — push, open a PR, mark the tasks in review
 #
 # The github + runes flavour of "I'm ready for eyes on this". Installed by `breq init` when it
 # detects that combination; edit freely for yours.

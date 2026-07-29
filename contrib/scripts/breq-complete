@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# breq complete [workspace] — mark a workspace's tasks done.
+# breq complete [workspace] — mark the workspace's tasks done, then destroy it
 #
 # This is a plain script on your PATH, not a breq subcommand: `breq complete` finds it by
 # name and hands it the arguments. Edit it. It is meant to be edited — the per-source status
 # values below are defaults, not a vocabulary breq imposes.
 #
-# Note what it does *not* do: tear the workspace down. Shipping and teardown are separate
-# axes, which is what lets you ship one piece and keep the warm workspace for the next.
-# When you're done with the place: breq teardown <workspace>
+# The destroy comes last on purpose: if it refuses because something is still running in
+# there, the tasks are already closed and `breq destroy <ws> --kill` finishes the job.
 
 set -euo pipefail
 
@@ -15,7 +14,7 @@ case "${1:-}" in
     -h|--help)
         echo "usage: breq complete [workspace]"
         echo
-        echo "Mark the workspace's linked tasks done. Does not tear the workspace down."
+        echo "Mark the workspace's linked tasks done, then destroy the workspace."
         exit 0
         ;;
 esac
@@ -50,6 +49,4 @@ for link in $links; do
     echo "$link -> $status"
 done
 
-echo
-echo "Workspace '$ws' is untouched. Tear it down when you're done with it:"
-echo "  breq teardown $ws"
+breq destroy "$ws"

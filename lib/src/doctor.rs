@@ -54,7 +54,7 @@ pub fn run(config: &Config, plugins: &PluginManager, fix: bool) -> Result<Vec<Ch
     ])
 }
 
-/// `~/.toren/completion_history.jsonl` — the teardown record the rolling log replaced.
+/// `~/.toren/completion_history.jsonl` — the destroy record the rolling log replaced.
 ///
 /// Reported, never read: it holds two incompatible schemas with no discriminator, and nothing
 /// ever consumed it. `--fix` deliberately leaves it alone — whatever it says about workspaces
@@ -71,7 +71,7 @@ fn check_retired_history() -> Result<CheckReport> {
         .findings
         .push(format!("{} is no longer written or read", shown));
     report.advice = Some(format!(
-        "teardowns now land in {}; delete {} once you are done with it",
+        "destroys now land in {}; delete {} once you are done with it",
         crate::config::tilde_shorten(&crate::logging::log_dir()),
         shown
     ));

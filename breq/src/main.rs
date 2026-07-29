@@ -2,16 +2,18 @@
 //!
 //! Two orthogonal verb families:
 //!
-//! - **Place verbs** (`setup`, `do`, `sh`, `teardown`) manage the workspace. The only tracker
+//! - **Place verbs** (`setup`, `do`, `sh`, `destroy`) manage the workspace. The only tracker
 //!   side effect anywhere in them is `do <task-id>` claiming the task it was handed.
-//! - **Task verbs** (`set <ws> task.status ...`, and the `breq-complete` / `breq-abort` scripts
-//!   over it) update the tracker, and never touch the workspace.
+//! - **Task writes** (`set <ws> task.status ...`) update the tracker, and never touch the
+//!   workspace.
 //!
 //! They're different axes, which is the point: shipping a piece of work and being finished with
-//! the place you did it in are separate decisions. `breq list` shows when they've diverged.
+//! the place you did it in are separate decisions. `breq list` shows when they've diverged. The
+//! `breq-complete` / `breq-abort` scripts compose both axes, but that composition lives in a
+//! file you can edit rather than in here.
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use colored::Colorize;
 use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
@@ -57,12 +59,6 @@ impl FormatTime for ShortTime {
 #[derive(Parser)]
 #[command(name = "breq")]
 #[command(about = "Composable workspace orchestration for coding agents")]
-#[command(
-    after_help = "Workflow verbs (breq-<name> scripts on PATH) are dispatched by name:\n  \
-                        breq complete <ws>   ship: mark the workspace's tasks done\n  \
-                        breq abort <ws>      hand the workspace's tasks back\n\
-                        \nSee `breq doctor` to install the shipped ones."
-)]
 struct Cli {
     /// Increase verbosity (-v for DEBUG, -vv for TRACE)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -176,7 +172,7 @@ enum Commands {
     },
 
     /// Destroy a workspace. Task-agnostic: no status changes, no push.
-    Teardown {
+    Destroy {
         /// Workspace name
         workspace: String,
 
@@ -308,9 +304,22 @@ enum HookArg {
 
 /// Subcommands clap owns. Anything else is looked up as a `breq-<name>` script.
 const BUILTIN_VERBS: &[&str] = &[
-    "do", "shell", "sh", "setup", "teardown", "list", "get", "set", "cleanup", "init", "doctor",
+    "do", "shell", "sh", "setup", "destroy", "list", "get", "set", "cleanup", "init", "doctor",
     "plugin", "help",
 ];
+
+/// Listing the custom verbs walks PATH, so only pay for it when help is being rendered.
+fn cli_command(raw_args: &[String]) -> clap::Command {
+    let cmd = Cli::command();
+    if raw_args
+        .iter()
+        .any(|a| a == "-h" || a == "--help" || a == "help")
+    {
+        cmd.after_help(toren_lib::scripts::verbs_help())
+    } else {
+        cmd
+    }
+}
 
 fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
@@ -319,7 +328,7 @@ fn main() -> Result<()> {
         std::process::exit(exit);
     }
 
-    let cli = Cli::parse();
+    let cli = Cli::from_arg_matches(&cli_command(&raw_args).get_matches())?;
 
     let log_level = match cli.verbose {
         0 => tracing::Level::INFO,
@@ -393,12 +402,12 @@ fn main() -> Result<()> {
             from,
             segment,
         } => cmd_setup(&config, workspace, from, segment.as_deref()),
-        Commands::Teardown {
+        Commands::Destroy {
             workspace,
             kill,
             no_delete,
             segment,
-        } => cmd_teardown(&config, &workspace, kill, no_delete, segment.as_deref()),
+        } => cmd_destroy(&config, &workspace, kill, no_delete, segment.as_deref()),
         Commands::List {
             all,
             segment,
@@ -476,7 +485,10 @@ fn dispatch_external(raw_args: &[String]) -> Result<Option<i32>> {
         toren_lib::tilde_shorten(&toren_lib::scripts::bin_dir())
     );
     eprintln!();
-    Cli::command().print_help().ok();
+    Cli::command()
+        .after_help(toren_lib::scripts::verbs_help())
+        .print_help()
+        .ok();
     Ok(Some(2))
 }
 
@@ -1126,9 +1138,9 @@ fn cmd_setup(
     Ok(())
 }
 
-// ─── teardown ───────────────────────────────────────────────────────────────
+// ─── destroy ───────────────────────────────────────────────────────────────
 
-fn cmd_teardown(
+fn cmd_destroy(
     config: &Config,
     workspace: &str,
     kill: bool,
@@ -1165,11 +1177,11 @@ fn cmd_teardown(
 
     eprintln!("Tearing down '{}' ({})", place.name, place.path.display());
 
-    let outcome = toren_lib::teardown(
+    let outcome = toren_lib::destroy(
         &place,
         &registry.workspaces,
         &plugins()?,
-        toren_lib::TeardownOptions { kill, no_delete },
+        toren_lib::DestroyOptions { kill, no_delete },
     )?;
 
     println!("{}", serde_json::to_string(&outcome)?);

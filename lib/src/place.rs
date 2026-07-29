@@ -413,7 +413,7 @@ impl PlaceRegistry {
 
     /// Adopt an existing working copy: mint state and run setup hooks in place.
     ///
-    /// The inverse of `teardown --no-delete`, and the reason workspaces are duck-typed —
+    /// The inverse of `destroy --no-delete`, and the reason workspaces are duck-typed —
     /// anything that is a working copy can become a place breq manages.
     pub fn adopt(&self, place: &mut Place) -> Result<()> {
         let num = crate::naming::word_to_number(&place.name).unwrap_or(0);

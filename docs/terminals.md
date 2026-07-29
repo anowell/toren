@@ -130,7 +130,7 @@ keeps scrollback. Attaching a browser seeds the terminal from whatever rmux stil
 pane, then switches to the live stream.
 
 What toren records instead is the link between those records: when a workspace is torn down, the
-teardown event in `~/.toren/logs/` carries the agent that worked there and that agent's own session
+destroy event in `~/.toren/logs/` carries the agent that worked there and that agent's own session
 id, so the incarnation can still be traced back to the agent's transcript of it long after the
 working copy is gone.
 
@@ -139,11 +139,12 @@ working copy is gone.
 - **Daemon restart loses rmux sessions** if the rmux daemon went down with it; agents are not
   auto-respawned, since silently restarting an expensive agent is worse than reporting that it's
   gone. Start a new one with `breq do --resume`.
-- **`breq teardown` kills the session**, but only after checking it. The session always holds an
-  idle shell sitting in the workspace, which would otherwise block teardown forever — so it has to
+- **`breq destroy` kills the session**, but only after checking it. The session always holds an
+  idle shell sitting in the workspace, which would otherwise block destroy forever — so it has to
   come down. But a live agent, or any pane running something other than an idle shell, means there
-  is work in there: teardown refuses and tells you to pass `--kill`. (Note that the task verbs —
-  `breq complete` / `abort` — never touch the session at all; they only update the tracker.)
+  is work in there: destroy refuses and tells you to pass `--kill`. (The `breq complete` / `abort`
+  scripts end in a `destroy`, so they inherit that refusal — the tracker is already updated by
+  then, and `breq destroy <ws> --kill` finishes it.)
 - **The web terminal follows the current agent.** Replacing the agent — `breq do` again, or from the
   UI — re-points the mirror; open browsers are told the old pane ended and reconnect to the new one.
 - **rmux's own web-share** (`rmux web-share`) is a separate feature from toren's web UI — it mints

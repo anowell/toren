@@ -129,8 +129,8 @@ independent decisions; `breq list` shows when they've diverged.
   registry. The VCS enumerates workspaces; each carries its own git-excluded
   `<ws>/.toren/{state.json,cache.json}`. A per-incarnation `uid` (minted at setup) is embedded
   in rmux session names (`toren-<segment>-<ws>-<uid>`).
-- **Verbs changed**: `destroy` → `teardown` (pure deletion — no status changes, no push;
-  `--no-delete` keeps the working copy). `assign` folded into `do` (`breq do <task>` claims the task
+- **Verbs changed**: `destroy` is now pure deletion — no status changes, no push;
+  `--no-delete` keeps the working copy. `assign` folded into `do` (`breq do <task>` claims the task
   and composes its context — the only tracker side effect in any place verb). New `get`/`set` state
   surface (`task.*` keys pass through to the tracker); `setup --from <ws>` stacks a child
   workspace; `breq setup <name>` adopts an existing working copy in place.

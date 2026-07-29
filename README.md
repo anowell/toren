@@ -73,9 +73,9 @@ Code with your prompt. Each workspace gets a name ("one", "two", etc.).
 
 ## Breq CLI
 
-`breq`'s verbs fall into two families. **Place verbs** manage the workspace; **task verbs** update
-your tracker and never touch the workspace. The only crossing point is `breq do <task>`, which
-claims the task it starts on.
+`breq`'s verbs fall into two families. **Place verbs** manage the workspace; **task writes** update
+your tracker and never touch the workspace. The only crossing point inside breq is `breq do <task>`,
+which claims the task it starts on. The workflow scripts below compose both on purpose.
 
 ```bash
 # Run a coding agent in a place (needs a task or a prompt)
@@ -93,9 +93,9 @@ breq do -p <prompt> --no-rmux      # Skip rmux; exec the agent directly
 breq setup [workspace]             # Create a workspace (no task, no agent)
 breq setup --from <workspace>      # Stack a child workspace on another
 breq setup <name>                  # Adopt an existing working copy in place
-breq teardown <workspace>          # Delete a workspace (no status changes, no push)
-breq teardown <workspace> --kill   # ...also stop live panes
-breq teardown <workspace> --no-delete  # ...keep the working copy, drop only breq's state
+breq destroy <workspace>          # Delete a workspace (no status changes, no push)
+breq destroy <workspace> --kill   # ...also stop live panes
+breq destroy <workspace> --no-delete  # ...keep the working copy, drop only breq's state
 
 # Read and annotate
 breq list                          # One row per workspace: sessions, changes, delivery, tasks
@@ -128,8 +128,8 @@ Anything that isn't a built-in verb is dispatched git-style to a `breq-<name>` s
 place/task surface above, and are meant to be edited:
 
 ```bash
-breq complete <ws>                 # Mark the workspace's linked tasks done (no teardown, no push)
-breq abort <ws>                    # Reopen the workspace's linked tasks and drop their assignee
+breq complete <ws>                 # Mark the workspace's linked tasks done, then destroy it
+breq abort <ws>                    # Hand the tasks back as work-in-progress, then destroy it
 breq submit <ws>                   # Push, open a PR, mark tasks in-review (github + runes flavour)
 ```
 
@@ -149,7 +149,7 @@ See [docs/plugins.md](docs/plugins.md).
 
 ## Workspace Hooks (toren.kdl)
 
-The `toren.kdl` file in your repo root configures workspace setup and teardown:
+The `toren.kdl` file in your repo root configures workspace setup and destroy:
 
 ```kdl
 var web_port="{{ 30000 + ws.num }}"

@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod alias;
 pub mod config;
+pub mod destroy;
 pub mod doctor;
 pub mod fsutil;
 pub mod logging;
@@ -15,7 +16,6 @@ pub mod sessions;
 pub mod sets;
 pub mod state;
 pub mod tasks;
-pub mod teardown;
 pub mod workspace;
 pub mod workspace_setup;
 
@@ -24,6 +24,7 @@ pub use config::{
     default_config_path, expand_path, expand_path_str, tilde_shorten, toren_root,
     AncillariesConfig, Config, DeliveryConfig, TasksConfig,
 };
+pub use destroy::{destroy, DestroyOptions, DestroyOutcome};
 pub use naming::{
     ancillary_id, ancillary_number, ancillary_segment, number_to_word, word_to_number,
 };
@@ -37,7 +38,6 @@ pub use state::{
     WorkspaceState,
 };
 pub use tasks::{format_link, infer_task_fields, split_link, InferredTaskFields, ResolvedTask};
-pub use teardown::{teardown, TeardownOptions, TeardownOutcome};
 pub use workspace::{
     detect_repo_type, CleanupMode, CommitInfo, GitWorktreeBackend, JjBackend, RepoType, VcsBackend,
     WorkspaceManager, WorkspaceOrigin,
