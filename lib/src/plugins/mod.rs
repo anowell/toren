@@ -4,7 +4,8 @@
 //! system breq needs to read or write:
 //!
 //! - `tasks/` — issue trackers: `info`, `claim`, `set_field`, `create`
-//! - `agents/` — coding agents: `argv`, `resume_argv`, `activity`, `title`, `session_id`
+//! - `agents/` — coding agents: `argv`, `resume_argv`, `activity`, `title`, `session_id`,
+//!   `last_activity`
 //! - `delivery/` — forges: `prs`
 //!
 //! The contract is structured and in-process, which is what lets `breq list` join across every
@@ -428,6 +429,39 @@ impl PluginManager {
     /// The agent's session id in a workspace, for resume.
     pub fn agent_session_id(&self, name: &str, ws_path: &Path) -> Option<String> {
         self.agent_string(name, "session_id", ws_path)
+    }
+
+    /// Seconds since the agent last wrote anything here.
+    ///
+    /// The one honest thing that can be said about a session breq never hosted: not whether it is
+    /// open, but when it was last doing something. Optional — an agent that cannot say returns
+    /// nothing rather than a guess.
+    pub fn agent_last_activity(&self, name: &str, ws_path: &Path) -> Option<i64> {
+        if !self.has_fn(Family::Agents, name, "last_activity") {
+            return None;
+        }
+        let result = self
+            .call(
+                Family::Agents,
+                name,
+                "last_activity",
+                (ws_path.display().to_string(),),
+                PluginContext::default(),
+            )
+            .map_err(|e| {
+                warn!(
+                    event = "plugin.failed",
+                    family = "agents",
+                    plugin = name,
+                    call = "last_activity",
+                    "agent '{}' last_activity failed: {:#}",
+                    name,
+                    e
+                );
+                e
+            })
+            .ok()?;
+        result.as_int().ok().filter(|secs| *secs >= 0)
     }
 
     fn agent_string(&self, name: &str, func: &str, ws_path: &Path) -> Option<String> {

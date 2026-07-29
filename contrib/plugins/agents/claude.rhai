@@ -122,6 +122,15 @@ fn title(ws_path) {
     ""
 }
 
+/// Seconds since Claude last wrote here. What can be said about a session nothing watched.
+fn last_activity(ws_path) {
+    let log = newest_log(ws_path);
+    if log == "" {
+        return -1;
+    }
+    fs::age_secs(log)
+}
+
 /// Claude names its logs after the session id, so the newest log's stem is the id.
 fn session_id(ws_path) {
     let log = newest_log(ws_path);

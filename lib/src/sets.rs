@@ -45,6 +45,9 @@ pub fn task_cache_key(link: &str) -> String {
 pub struct SessionInfo {
     /// rmux window name, e.g. "agent" or "shell".
     pub window: String,
+    /// rmux's handle for the pane, e.g. `%7`. Empty when the pane predates breq recording it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pane: String,
     /// `idle` | `running` | `exited`.
     pub status: String,
     /// Foreground command, e.g. "claude" or "zsh".
@@ -504,6 +507,7 @@ fn collect_sessions(place: &Place, plugins: &PluginManager) -> Vec<SessionInfo> 
             };
             SessionInfo {
                 window: pane.window,
+                pane: pane.id,
                 status: status.to_string(),
                 command: pane.command,
                 agent_activity,
@@ -1064,6 +1068,7 @@ mod tests {
     fn pane(window: &str, status: &str, activity: Option<&str>) -> SessionInfo {
         SessionInfo {
             window: window.into(),
+            pane: "%1".into(),
             status: status.into(),
             command: "claude".into(),
             agent_activity: activity.map(Into::into),

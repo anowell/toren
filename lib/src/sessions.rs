@@ -125,9 +125,9 @@ fn liveness(session: &str) -> Liveness {
 pub fn settle(place: &mut Place, plugins: &PluginManager) -> bool {
     match place.state.open_session_mut() {
         None => return false,
-        // An adopted session was never hosted in this workspace's rmux session, so the absence of
-        // an agent pane is not news of its death — it never had one.
-        Some(open) if open.adopted => return false,
+        // An external session was never hosted in this workspace's rmux session, so the absence
+        // of an agent pane is not news of its death — it never had one.
+        Some(open) if open.external => return false,
         Some(_) => {}
     }
     let liveness = liveness(&place.session_name());
@@ -193,16 +193,19 @@ pub fn settle_saved(place: &mut Place, plugins: &PluginManager) {
     }
 }
 
-/// Record a session the agent kept here that breq never started.
+/// Note a session the agent kept here that breq never started.
 ///
 /// `session_id(ws_path)` reads the agent's own files, and those do not care who launched it — a
 /// bare `claude` in the workspace leaves the same trace `breq do` would. A session the agent
-/// knows and `state.json` does not is one of those. Adopting it is what lets `--resume` reach it,
-/// and what keeps a place's record honest about what happened in it.
+/// knows and `state.json` does not is one of those.
+///
+/// Noting it is *not* taking charge of it: there is no pane to watch, so breq can neither report
+/// its liveness nor stop it. What the record buys is that `--resume` can reach it and that the
+/// place does not pretend nothing happened here.
 ///
 /// Idempotent, and it defers to a session breq is still holding open: that one is either its own
 /// or about to be settled into its own.
-pub fn adopt(place: &mut Place, plugins: &PluginManager) -> Vec<String> {
+pub fn note_external(place: &mut Place, plugins: &PluginManager) -> Vec<String> {
     if place.state.open_session_mut().is_some() {
         return Vec::new();
     }
@@ -218,7 +221,7 @@ pub fn adopt(place: &mut Place, plugins: &PluginManager) -> Vec<String> {
             .collect(),
     };
 
-    let mut adopted = Vec::new();
+    let mut noted = Vec::new();
     for agent in candidates {
         let Some(id) = plugins.agent_session_id(&agent, &place.path) else {
             continue;
@@ -232,35 +235,35 @@ pub fn adopt(place: &mut Place, plugins: &PluginManager) -> Vec<String> {
             id: Some(id.clone()),
             agent: agent.clone(),
             title,
-            adopted: true,
+            external: true,
             ..Default::default()
         });
 
         tracing::info!(
-            event = "agent.adopted",
+            event = "agent.external",
             segment = %place.segment,
             workspace = %place.name,
             uid = place.uid(),
             agent = %agent,
             session_id = %id,
-            "adopted a {} session breq did not start in '{}'",
+            "recorded a {} session breq did not start in '{}'",
             agent,
             place.name
         );
-        adopted.push(id);
+        noted.push(id);
     }
-    adopted
+    noted
 }
 
-/// [`adopt`], persisted. Best-effort: a workspace that will not take the write is looked at
-/// again next time, and adopting is idempotent.
-pub fn adopt_saved(place: &mut Place, plugins: &PluginManager) {
-    if adopt(place, plugins).is_empty() {
+/// [`note_external`], persisted. Best-effort: a workspace that will not take the write is looked
+/// at again next time, and noting is idempotent.
+pub fn note_external_saved(place: &mut Place, plugins: &PluginManager) {
+    if note_external(place, plugins).is_empty() {
         return;
     }
     if let Err(e) = place.save() {
         tracing::warn!(
-            "failed to record an adopted agent session in '{}': {:#}",
+            "failed to record an external agent session in '{}': {:#}",
             place.name,
             e
         );
@@ -346,30 +349,30 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_run_by_hand_is_adopted() {
+    fn an_agent_run_by_hand_is_recorded_as_external() {
         let dir = tempfile::tempdir().unwrap();
         let mut place = place(dir.path());
         place.state.set_agent("claude", None);
         let plugins = agent_reporting(dir.path(), "outside-1");
 
-        assert_eq!(adopt(&mut place, &plugins), ["outside-1"]);
+        assert_eq!(note_external(&mut place, &plugins), ["outside-1"]);
 
         let session = place.state.latest_session().unwrap();
         assert_eq!(session.id.as_deref(), Some("outside-1"));
         assert_eq!(session.title.as_deref(), Some("work done by hand"));
-        assert!(session.adopted);
+        assert!(session.external);
 
-        // Idempotent: looking again adopts nothing, so `breq get` can run all day.
-        assert!(adopt(&mut place, &plugins).is_empty());
+        // Idempotent: looking again records nothing, so `breq get` can run all day.
+        assert!(note_external(&mut place, &plugins).is_empty());
     }
 
     #[test]
-    fn settle_leaves_an_adopted_session_alone() {
+    fn settle_leaves_an_external_session_alone() {
         let dir = tempfile::tempdir().unwrap();
         let mut place = place(dir.path());
         place.state.set_agent("claude", None);
         let plugins = agent_reporting(dir.path(), "outside-1");
-        adopt(&mut place, &plugins);
+        note_external(&mut place, &plugins);
 
         // No agent pane is the normal state of a hand-run agent, not evidence that it stopped.
         assert!(!settle(&mut place, &plugins));
@@ -377,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn adoption_defers_to_a_session_breq_is_holding_open() {
+    fn an_external_session_defers_to_one_breq_is_holding_open() {
         let dir = tempfile::tempdir().unwrap();
         let mut place = place(dir.path());
         place.state.set_agent("claude", None);
@@ -386,9 +389,9 @@ mod tests {
         record_start(&mut place, &plugins, "claude", None).unwrap();
 
         // Whatever the agent is writing belongs to breq's own in-flight session; settle claims it.
-        assert!(adopt(&mut place, &plugins).is_empty());
+        assert!(note_external(&mut place, &plugins).is_empty());
         assert_eq!(place.state.sessions().len(), 1);
-        assert!(!place.state.sessions()[0].adopted);
+        assert!(!place.state.sessions()[0].external);
     }
 
     #[test]
@@ -492,7 +495,7 @@ mod tests {
             exit: Some(0),
             title: Some("spike the pane mirror".into()),
             task: None,
-            adopted: false,
+            external: false,
         });
         place.state.push_session(AgentSession {
             id: Some("aa11".into()),

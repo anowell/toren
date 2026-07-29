@@ -142,9 +142,10 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
     /// True when breq found this session in the agent's own files rather than starting it —
-    /// someone ran the agent in the workspace directly.
+    /// someone ran the agent in the workspace directly. Breq has no pane for one of these, so it
+    /// can neither report its liveness nor stop it; the record only makes it resumable.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub adopted: bool,
+    pub external: bool,
 }
 
 fn is_false(b: &bool) -> bool {

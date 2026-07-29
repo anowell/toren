@@ -209,6 +209,35 @@ fn truncate(text: &str, max: usize) -> String {
     format!("{}…", head)
 }
 
+/// How long ago the agent last wrote for this session, if it can be attributed to it.
+///
+/// An agent reports activity per *directory*, not per session, so the answer only belongs to the
+/// session it currently considers current. An older record with no ending was left that way by
+/// something that could not observe it, and nothing here can date it.
+fn last_wrote(
+    place: &Place,
+    plugins: &PluginManager,
+    session: &toren_lib::state::AgentSession,
+) -> Option<String> {
+    let id = session.id.as_deref()?;
+    let current = plugins.agent_session_id(&session.agent, &place.path)?;
+    if current != id {
+        return None;
+    }
+    let secs = plugins.agent_last_activity(&session.agent, &place.path)?;
+    Some(format!("{} ago", brief_duration(secs)))
+}
+
+/// `4d`, `3h`, `5m`, `20s` — the coarsest unit that is not zero.
+fn brief_duration(secs: i64) -> String {
+    match secs {
+        s if s >= 86_400 => format!("{}d", s / 86_400),
+        s if s >= 3_600 => format!("{}h", s / 3_600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{}s", s.max(0)),
+    }
+}
+
 /// Every set, in full, for one workspace.
 pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
     let header = match place.uid() {
@@ -229,8 +258,9 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
         "created",
         &place.created_label().unwrap_or_else(|| "-".to_string()),
     );
-    // "session" alone read as any of three things — the rmux one is which it is.
-    field("rmux", &place.session_name());
+    // "session" alone read as any of three things, and this is the rmux one — the session that
+    // holds the shell and agent windows below, not a window itself.
+    field("rmux session", &place.session_name());
     if !place.vcs_tracked {
         field("vcs", "untracked (prunable with `breq cleanup`)");
     }
@@ -242,6 +272,23 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
         .iter()
         .partition(|s| s.window == toren_lib::rmux::AGENT_WINDOW);
 
+    // Both are rmux panes, which is what makes a pane id meaningful here and nowhere below.
+    // Padded before it is dimmed: the escape codes are not columns.
+    let pane_of = |session: &toren_lib::sets::SessionInfo| {
+        format!("{:<5}", session.pane).dimmed().to_string()
+    };
+
+    section("shells", shells.len());
+    for session in &shells {
+        println!(
+            "  {:<8} {} {:<8} {}",
+            session.window,
+            pane_of(session),
+            session.status,
+            session.command
+        );
+    }
+
     section("agents", agents.len());
     for session in &agents {
         let activity = match &session.agent_activity {
@@ -249,16 +296,12 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
             None => String::new(),
         };
         println!(
-            "  {:<8} {:<8} {}{}",
-            session.window, session.status, session.command, activity
-        );
-    }
-
-    section("shells", shells.len());
-    for session in &shells {
-        println!(
-            "  {:<8} {:<8} {}",
-            session.window, session.status, session.command
+            "  {:<8} {} {:<8} {}{}",
+            session.window,
+            pane_of(session),
+            session.status,
+            session.command,
+            activity
         );
     }
 
@@ -316,14 +359,14 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
     section("agent sessions", sessions.len());
     for session in sessions.iter().rev() {
         let state = match (&session.ended_at, session.exit) {
-            // breq never watched an adopted session's pane, so it cannot call it live.
-            (None, _) if session.adopted => "unknown".to_string(),
-            (None, _) => "live".to_string(),
             (Some(_), Some(code)) => format!("exited {}", code),
             (Some(_), None) => "ended".to_string(),
+            // Nothing closed this one out. Whether it is still open is unknowable without a pane
+            // to watch, so say the one true thing instead: when the agent last wrote.
+            (None, _) => last_wrote(place, plugins, session).unwrap_or_else(|| "-".to_string()),
         };
-        let origin = if session.adopted {
-            "  (adopted)".dimmed().to_string()
+        let origin = if session.external {
+            "  (not breq's)".dimmed().to_string()
         } else {
             String::new()
         };

@@ -333,6 +333,9 @@ pub fn list_windows(session: &str) -> Result<Vec<String>> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneState {
     pub window: String,
+    /// rmux's own handle for the pane, e.g. `%7`. A new one each time a window's process is
+    /// replaced, so it names an incarnation rather than a role the way the window name does.
+    pub id: String,
     /// Process exited; `remain-on-exit` keeps the pane around.
     pub dead: bool,
     /// Current foreground command, e.g. `zsh` or `claude`.
@@ -392,7 +395,7 @@ pub fn list_panes(session: &str) -> Result<Vec<PaneState>> {
         session,
         "-s",
         "-F",
-        "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_pid}\t#{pane_dead_status}",
+        "#{window_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_pid}\t#{pane_dead_status}\t#{pane_id}",
     ])?;
 
     Ok(out
@@ -407,8 +410,10 @@ pub fn list_panes(session: &str) -> Result<Vec<PaneState>> {
                 .and_then(|p| p.trim().parse().ok())
                 .unwrap_or(0);
             let exit = fields.next().and_then(|s| s.trim().parse().ok());
+            let id = fields.next().unwrap_or("").trim().to_string();
             Some(PaneState {
                 window,
+                id,
                 dead,
                 command,
                 pid,

@@ -1266,7 +1266,7 @@ fn cmd_get(
     // nothing else is watching the pane for it.
     toren_lib::sessions::settle_saved(&mut place, &plugins);
     // ...and when an agent was run here by hand, this is when that shows up too.
-    toren_lib::sessions::adopt_saved(&mut place, &plugins);
+    toren_lib::sessions::note_external_saved(&mut place, &plugins);
 
     // Rendering one workspace already pays for the calls, so it refreshes the cache on the way
     // past — which is what keeps `breq list` current for the workspaces you actually work in.
