@@ -429,6 +429,71 @@ mod tests {
         rmux_conv::kill_session(&session).unwrap();
     }
 
+    /// An agent handed a task description as its prompt is spawned with newlines inside its argv,
+    /// and rmux keeps that argv as the pane's start command. Following the pane — finding it,
+    /// reading its liveness, sizing it — may not depend on what it was started with. Needs rmux
+    /// installed.
+    #[tokio::test]
+    async fn follows_a_pane_whose_start_command_spans_lines() {
+        if !rmux_conv::is_available() {
+            eprintln!("skipping: rmux not on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("one");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let segment = format!("panerunnerprompt{}", std::process::id());
+        let session = rmux_conv::session_name(&segment, "one", None);
+        rmux_conv::ensure_session(&session, &workspace, &[]).unwrap();
+        // The shape `breq do -t <task>` composes: title, blank line, then the task's description.
+        rmux_conv::spawn_agent(
+            &session,
+            &workspace,
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "cat".to_string(),
+                "runes how-wde: a task\n\n## Description\n\nseveral lines of it\n".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let runner = PaneRunner::new();
+        wait_for(|| async {
+            runner
+                .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW)
+                .await
+                .is_ok()
+        })
+        .await;
+
+        assert_eq!(
+            runner.status(&session, rmux_conv::AGENT_WINDOW).await,
+            PaneLiveness::Running,
+            "a pane that is plainly running must not read as gone"
+        );
+
+        let rmux = runner.rmux().await.unwrap();
+        let pane_id = find_window_pane(&rmux, &session, rmux_conv::AGENT_WINDOW)
+            .await
+            .unwrap();
+        // Geometry is the other lookup that has to find the pane.
+        runner.resize(&session, 100, 30).await.unwrap();
+        let snapshot = rmux
+            .pane_by_id(toren_mirror::SessionName::new(&session).unwrap(), pane_id)
+            .await
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap();
+        assert_eq!((snapshot.cols, snapshot.rows), (100, 30));
+
+        assert!(runner.stop_agent(&session, &session).await.unwrap());
+        rmux_conv::kill_session(&session).unwrap();
+    }
+
     /// Replacing the agent re-points the mirror and releases clients on the old pane; re-adopting
     /// an unchanged pane changes nothing. Needs rmux installed.
     #[tokio::test]
@@ -656,10 +721,11 @@ mod tests {
 
         // Now poison the shared client the way anything outside this crate can — by cancelling a
         // request mid-flight — and check the runner heals: the poisoned call fails and discards
-        // the client, the next one reconnects.
+        // the client, the next one reconnects. Attaching is what has to notice, because finding
+        // the pane behind a window no longer goes over the shared connection at all.
         poison(&client, &session).await;
         runner
-            .ensure_current(&session, &session, rmux_conv::AGENT_WINDOW)
+            .track(&session, &session, rmux_conv::AGENT_WINDOW)
             .await
             .expect_err("a poisoned client fails the call that finds it dead");
         runner

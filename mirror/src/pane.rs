@@ -2,8 +2,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use rmux_sdk::{
-    Pane, PaneExitState, PaneId, PaneOutputChunk, PaneOutputStart, PaneProcessState, Rmux,
-    SessionName, TerminalSizeSpec,
+    Pane, PaneExitState, PaneId, PaneOutputChunk, PaneOutputStart, Rmux, SessionName,
+    TerminalSizeSpec,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,42 +68,112 @@ pub enum PaneLiveness {
     Exited(PaneExitState),
 }
 
+/// One pane as rmux's own formats describe it: which window it is in, and whether its process is
+/// still running.
+///
+/// Deliberately not [`Pane::info`], which reads panes through a tab-separated format carrying
+/// `#{pane_start_command}`: a pane spawned with a multi-line argv — an agent handed a task
+/// description as its prompt — spills across lines and drops out of that parse entirely. Every
+/// field read here is one rmux cannot break a line in, so a pane's identity does not depend on
+/// what it was started with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneFacts {
+    window: String,
+    window_index: u32,
+    id: PaneId,
+    /// `None` while rmux has not said — which is not the same as a pane known to be alive.
+    dead: Option<bool>,
+    exit: PaneExitState,
+}
+
+const FACTS_FORMAT: &str = "#{window_name}\t#{window_index}\t#{pane_id}\
+                            \t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}";
+
+/// Every pane in a session, in window then pane order.
+///
+/// A session rmux cannot find is an empty list rather than an error: callers are asking about
+/// panes that may well be gone, and a session that has been killed has no panes by definition.
+async fn session_panes(rmux: &Rmux, session: &SessionName) -> Result<Vec<PaneFacts>> {
+    let run = rmux
+        .cmd([
+            "list-panes",
+            "-t",
+            session.as_str(),
+            "-s",
+            "-F",
+            FACTS_FORMAT,
+        ])
+        .await
+        .with_context(|| format!("Failed to list panes in rmux session '{}'", session))?;
+    if run.exit != Some(0) {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&run.stdout)
+        .lines()
+        .filter_map(parse_facts)
+        .collect())
+}
+
+async fn pane_facts(
+    rmux: &Rmux,
+    session: &SessionName,
+    pane_id: PaneId,
+) -> Result<Option<PaneFacts>> {
+    Ok(session_panes(rmux, session)
+        .await?
+        .into_iter()
+        .find(|pane| pane.id == pane_id))
+}
+
+fn parse_facts(line: &str) -> Option<PaneFacts> {
+    let mut fields = line.split('\t');
+    let window = fields.next()?.to_string();
+    let window_index = fields.next()?.trim().parse().ok()?;
+    let id = parse_pane_id(fields.next()?)?;
+    let dead = match fields.next()?.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    };
+    let code = fields.next().and_then(|field| field.trim().parse().ok());
+    let signal = fields.next().and_then(|field| field.trim().parse().ok());
+    // A signal beats a code: a process killed by one has no exit status of its own to report.
+    let exit = match (code, signal) {
+        (_, Some(signal)) => PaneExitState::from_signal(signal),
+        (Some(code), None) => PaneExitState::from_code(code),
+        (None, None) => PaneExitState::default(),
+    };
+    Some(PaneFacts {
+        window,
+        window_index,
+        id,
+        dead,
+        exit,
+    })
+}
+
+fn parse_pane_id(field: &str) -> Option<PaneId> {
+    Some(PaneId::new(field.trim().strip_prefix('%')?.parse().ok()?))
+}
+
 /// The pane running in a named window right now.
 ///
 /// The name is how the window was created and the only thing callers know up front; the id it
-/// resolves to is what everything afterwards uses, because indices move and ids do not.
+/// resolves to is what everything afterwards uses, because indices move and ids do not. Panes
+/// come back in window order, so the first match is the window's lowest pane index.
 pub async fn find_window_pane(rmux: &Rmux, session: &str, window: &str) -> Result<PaneId> {
-    let panes = rmux
-        .find_panes()
-        .session(session)
-        .all()
-        .await
-        .with_context(|| format!("Failed to list panes in rmux session '{}'", session))?;
-
-    // A pane's info snapshot describes its own window, so the name has to be checked pane by
-    // pane; the first match is the window's lowest pane index.
-    for discovered in panes {
-        let info = discovered.pane.info().await?;
-        let named = info
-            .windows
-            .iter()
-            .any(|w| w.id == discovered.window_id && w.name.as_deref() == Some(window));
-        if named {
-            return Ok(discovered.pane_id);
-        }
-    }
-
-    Err(anyhow!(
-        "rmux session '{}' has no '{}' window",
-        session,
-        window
-    ))
+    let name = session_name(session)?;
+    let panes = session_panes(rmux, &name).await?;
+    panes
+        .into_iter()
+        .find(|pane| pane.window == window)
+        .map(|pane| pane.id)
+        .ok_or_else(|| anyhow!("rmux session '{}' has no '{}' window", session, window))
 }
 
 /// Whether a pane's process is still running, without mirroring it.
 pub async fn liveness(rmux: &Rmux, session: &str, pane_id: PaneId) -> Result<PaneLiveness> {
-    let pane = pane_handle(rmux, session_name(session)?, pane_id).await?;
-    pane_liveness(&pane, pane_id).await
+    pane_liveness(rmux, &session_name(session)?, pane_id).await
 }
 
 /// One pane, followed by id: its bytes fan out through [`MirroredPane::mirror`], and input,
@@ -147,6 +217,7 @@ impl MirroredPane {
         let (stop, stopped) = watch::channel(false);
         let pump = tokio::spawn(pump(
             rmux.clone(),
+            session.clone(),
             pane.clone(),
             pane_id,
             mirror.clone(),
@@ -218,7 +289,7 @@ impl MirroredPane {
     }
 
     pub async fn liveness(&self) -> Result<PaneLiveness> {
-        pane_liveness(&self.pane, self.pane_id).await
+        pane_liveness(&self.rmux, &self.session, self.pane_id).await
     }
 
     /// Put every attached client back on the pane's real screen, returning the epoch the paint
@@ -237,18 +308,10 @@ impl MirroredPane {
     /// Resolved on every call and never cached: rmux renumbers windows as they come and go, and
     /// there is no way to address one by id, so a remembered index eventually resizes a stranger.
     async fn window_index(&self) -> Result<u32> {
-        let info = self.pane.info().await?;
-        let window_id = info
-            .panes
-            .iter()
-            .find(|p| p.id == self.pane_id)
-            .map(|p| p.window_id)
-            .ok_or_else(|| anyhow!("rmux pane {} is gone", self.pane_id))?;
-        info.windows
-            .iter()
-            .find(|w| w.id == window_id)
-            .map(|w| w.index)
-            .ok_or_else(|| anyhow!("rmux pane {} has no window", self.pane_id))
+        pane_facts(&self.rmux, &self.session, self.pane_id)
+            .await?
+            .map(|pane| pane.window_index)
+            .ok_or_else(|| anyhow!("rmux pane {} is gone", self.pane_id))
     }
 }
 
@@ -261,6 +324,7 @@ impl MirroredPane {
 /// whose internal await could not be raced against the liveness clock safely.
 async fn pump(
     rmux: Arc<Rmux>,
+    session: SessionName,
     pane: Pane,
     pane_id: PaneId,
     mirror: Arc<PaneMirror>,
@@ -293,7 +357,7 @@ async fn pump(
             Ok(chunks) => chunks,
             Err(e) => {
                 debug!("Pane {} output stream ended: {}", pane_id, e);
-                break exited(&pane, pane_id).await;
+                break exited(&rmux, &session, pane_id).await;
             }
         };
 
@@ -321,7 +385,7 @@ async fn pump(
             }
         }
         if eof {
-            break exited(&pane, pane_id).await;
+            break exited(&rmux, &session, pane_id).await;
         }
         delay = if streamed {
             POLL_FLOOR
@@ -333,7 +397,7 @@ async fn pump(
         // altogether keeps its subscription silent, so this is also what notices that.
         if Instant::now() >= liveness_due {
             liveness_due = Instant::now() + LIVENESS_POLL;
-            match followed(&pane, pane_id).await {
+            match followed(&rmux, &session, pane_id).await {
                 Ok(Followed::Exited(exit)) => break Some(exit),
                 Ok(Followed::Gone) => break None,
                 Ok(Followed::Running | Followed::Indeterminate) => {}
@@ -364,16 +428,14 @@ enum Followed {
     Indeterminate,
 }
 
-async fn followed(pane: &Pane, pane_id: PaneId) -> Result<Followed> {
-    let info = pane.info().await?;
-    // By id, never `.first()`: a window can hold panes that are not ours.
-    let Some(info) = info.panes.iter().find(|p| p.id == pane_id) else {
+async fn followed(rmux: &Rmux, session: &SessionName, pane_id: PaneId) -> Result<Followed> {
+    let Some(facts) = pane_facts(rmux, session, pane_id).await? else {
         return Ok(Followed::Gone);
     };
-    Ok(match info.process {
-        PaneProcessState::Running { .. } => Followed::Running,
-        PaneProcessState::Exited => Followed::Exited(info.exit_state.clone().unwrap_or_default()),
-        _ => Followed::Indeterminate,
+    Ok(match facts.dead {
+        Some(true) => Followed::Exited(facts.exit),
+        Some(false) => Followed::Running,
+        None => Followed::Indeterminate,
     })
 }
 
@@ -387,8 +449,8 @@ async fn reseed(rmux: &Rmux, pane: &Pane, pane_id: PaneId, mirror: &PaneMirror) 
 }
 
 /// The pane's exit status, which rmux only fills in once the process is actually gone.
-async fn exited(pane: &Pane, pane_id: PaneId) -> Option<PaneExitState> {
-    match followed(pane, pane_id).await {
+async fn exited(rmux: &Rmux, session: &SessionName, pane_id: PaneId) -> Option<PaneExitState> {
+    match followed(rmux, session, pane_id).await {
         Ok(Followed::Exited(exit)) => Some(exit),
         Ok(_) => None,
         Err(e) => {
@@ -398,8 +460,12 @@ async fn exited(pane: &Pane, pane_id: PaneId) -> Option<PaneExitState> {
     }
 }
 
-async fn pane_liveness(pane: &Pane, pane_id: PaneId) -> Result<PaneLiveness> {
-    Ok(match followed(pane, pane_id).await? {
+async fn pane_liveness(
+    rmux: &Rmux,
+    session: &SessionName,
+    pane_id: PaneId,
+) -> Result<PaneLiveness> {
+    Ok(match followed(rmux, session, pane_id).await? {
         Followed::Running => PaneLiveness::Running,
         Followed::Exited(exit) => PaneLiveness::Exited(exit),
         Followed::Gone | Followed::Indeterminate => PaneLiveness::Unknown,
@@ -413,4 +479,49 @@ async fn pane_handle(rmux: &Rmux, session: SessionName, pane_id: PaneId) -> Resu
 
 fn session_name(session: &str) -> Result<SessionName> {
     SessionName::new(session).map_err(|e| anyhow!("Invalid rmux session name '{}': {}", session, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_a_live_pane_off_one_line() {
+        let facts = parse_facts("agent\t2\t%7\t0\t\t").unwrap();
+        assert_eq!(facts.window, "agent");
+        assert_eq!(facts.window_index, 2);
+        assert_eq!(facts.id, PaneId::new(7));
+        assert_eq!(facts.dead, Some(false));
+    }
+
+    #[test]
+    fn a_dead_pane_carries_the_status_it_died_with() {
+        let facts = parse_facts("agent\t2\t%7\t1\t7\t").unwrap();
+        assert_eq!(facts.dead, Some(true));
+        assert_eq!(facts.exit, PaneExitState::from_code(7));
+    }
+
+    #[test]
+    fn a_signal_is_the_whole_story_of_an_exit() {
+        // rmux reports a status alongside the signal; the signal is what actually ended it.
+        let facts = parse_facts("agent\t2\t%7\t1\t0\t9").unwrap();
+        assert_eq!(facts.exit, PaneExitState::from_signal(9));
+    }
+
+    #[test]
+    fn a_pane_rmux_cannot_speak_for_is_neither_alive_nor_dead() {
+        let facts = parse_facts("agent\t2\t%7\t\t\t").unwrap();
+        assert_eq!(facts.dead, None);
+    }
+
+    /// The failure this whole path exists to avoid: a pane started with a multi-line argv puts
+    /// the tail of its own start command on lines of its own. Those lines are not panes, and
+    /// mistaking one for a pane is how a window loses its id.
+    #[test]
+    fn a_line_that_is_not_a_pane_is_dropped_rather_than_guessed_at() {
+        assert!(parse_facts("## Description").is_none());
+        assert!(parse_facts("").is_none());
+        assert!(parse_facts("agent\tsecond\t%7\t0\t\t").is_none());
+        assert!(parse_facts("agent\t2\tnot-a-pane-id\t0\t\t").is_none());
+    }
 }
