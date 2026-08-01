@@ -171,6 +171,19 @@ pub trait VcsBackend: Send + Sync {
     /// Non-empty commits between `base` and the working copy. An empty result means pristine.
     fn changes_since(&self, workspace_path: &Path, base: &str) -> Vec<CommitInfo>;
 
+    /// The VCS's own rendering of what this workspace has done, to print verbatim.
+    ///
+    /// Delegated rather than redrawn: jj and git already graph the history, decorate it with
+    /// bookmarks, mark the working copy, and honour the user's own template and colour config.
+    /// Nothing breq drew from [`CommitInfo`] would be as good, and it would drift.
+    fn log(
+        &self,
+        workspace_path: &Path,
+        base: Option<&str>,
+        color: bool,
+        limit: usize,
+    ) -> Option<String>;
+
     /// Remote branches/bookmarks that contain this workspace's work.
     ///
     /// Derived from the VCS only — no forge API, so this stays fast and offline.
@@ -386,6 +399,41 @@ impl VcsBackend for JjBackend {
             .next()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+    }
+
+    fn log(
+        &self,
+        workspace_path: &Path,
+        base: Option<&str>,
+        color: bool,
+        limit: usize,
+    ) -> Option<String> {
+        // Without a base there is no "since" to draw, so show the working copy alone rather than
+        // the repository's whole history.
+        let revset = match base {
+            Some(base) => format!("{}..@", base),
+            None => "@".to_string(),
+        };
+        let output = Command::new("jj")
+            .args([
+                "log",
+                "-r",
+                &revset,
+                // One line each: `get` is a summary, and the default template spends two.
+                "-T",
+                "builtin_log_oneline",
+                "-n",
+                &limit.to_string(),
+                "--color",
+                if color { "always" } else { "never" },
+            ])
+            .current_dir(workspace_path)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn changes_since(&self, workspace_path: &Path, base: &str) -> Vec<CommitInfo> {
@@ -930,6 +978,42 @@ impl VcsBackend for GitWorktreeBackend {
         self.capture_revision(workspace_path)
     }
 
+    fn log(
+        &self,
+        workspace_path: &Path,
+        base: Option<&str>,
+        color: bool,
+        limit: usize,
+    ) -> Option<String> {
+        // Without a base there is no "since" to draw, so show the tip alone rather than the
+        // repository's whole history.
+        let range = match base {
+            Some(base) => format!("{}..HEAD", base),
+            None => "HEAD~1..HEAD".to_string(),
+        };
+        let output = Command::new("git")
+            .args([
+                "log",
+                "--graph",
+                "--oneline",
+                "--decorate",
+                &format!("-{}", limit),
+                if color {
+                    "--color=always"
+                } else {
+                    "--color=never"
+                },
+                &range,
+            ])
+            .current_dir(workspace_path)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn changes_since(&self, workspace_path: &Path, base: &str) -> Vec<CommitInfo> {
         let range = format!("{}..HEAD", base);
         let output = Command::new("git")
@@ -1300,6 +1384,19 @@ impl WorkspaceManager {
     ) -> Vec<CommitInfo> {
         self.backend_for(segment_path)
             .changes_since(workspace_path, base)
+    }
+
+    /// The VCS's own view of this workspace's work, ready to print.
+    pub fn log(
+        &self,
+        segment_path: &Path,
+        workspace_path: &Path,
+        base: Option<&str>,
+        color: bool,
+        limit: usize,
+    ) -> Option<String> {
+        self.backend_for(segment_path)
+            .log(workspace_path, base, color, limit)
     }
 
     /// Branches carrying this workspace's work, local ones included.

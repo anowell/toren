@@ -1281,7 +1281,14 @@ fn cmd_get(
     if json {
         println!("{}", render::detail_json(&place, &sets, &plugins)?);
     } else {
-        render::detail(&place, &sets, &plugins);
+        let vcs_log = registry.workspaces.log(
+            &place.segment_path,
+            &place.path,
+            place.base().as_deref(),
+            std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            render::CHANGES_SHOWN,
+        );
+        render::detail(&place, &sets, &plugins, vcs_log);
     }
     Ok(())
 }

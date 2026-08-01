@@ -239,7 +239,10 @@ fn brief_duration(secs: i64) -> String {
 }
 
 /// Every set, in full, for one workspace.
-pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
+///
+/// `vcs_log` is the VCS's own drawing of the workspace's history, printed in place of anything
+/// breq would render from [`Sets::changes`] and [`Sets::branches`].
+pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager, vcs_log: Option<String>) {
     let header = match place.uid() {
         Some(uid) => format!("{}  {}  {}", place.name, place.segment, uid),
         None => format!("{}  {}  (undecorated)", place.name, place.segment),
@@ -249,7 +252,8 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
     field("path", &place.path.display().to_string());
     field("title", &sets.title(place, plugins));
     if let Some(base) = place.base() {
-        field("base", &base);
+        // Shortened the way the log beside it shortens: a full hash is never what you read.
+        field("base", base.chars().take(12).collect::<String>().as_str());
     }
     if let Some(parent) = place.parent() {
         field("parent", &parent);
@@ -272,20 +276,13 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
         .iter()
         .partition(|s| s.window == toren_lib::rmux::AGENT_WINDOW);
 
-    // Both are rmux panes, which is what makes a pane id meaningful here and nowhere below.
-    // Padded before it is dimmed: the escape codes are not columns.
-    let pane_of = |session: &toren_lib::sets::SessionInfo| {
-        format!("{:<5}", session.pane).dimmed().to_string()
-    };
-
+    // The window name, not rmux's pane id: the id names an incarnation and changes every time a
+    // window's process is replaced, while the name is stable and is what `breq sh --window` takes.
     section("shells", shells.len());
     for session in &shells {
         println!(
-            "  {:<8} {} {:<8} {}",
-            session.window,
-            pane_of(session),
-            session.status,
-            session.command
+            "  {:<8} {:<8} {}",
+            session.window, session.status, session.command
         );
     }
 
@@ -296,30 +293,28 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
             None => String::new(),
         };
         println!(
-            "  {:<8} {} {:<8} {}{}",
-            session.window,
-            pane_of(session),
-            session.status,
-            session.command,
-            activity
+            "  {:<8} {:<8} {}{}",
+            session.window, session.status, session.command, activity
         );
     }
 
-    section("changes", sets.changes.len());
-    for commit in &sets.changes {
-        println!("  {} {}", commit.id, commit.summary);
+    // One section for both, drawn by the VCS: its graph already decorates the branches, marks
+    // the working copy, and shows what is undescribed.
+    match vcs_log {
+        Some(log) if !log.trim().is_empty() => {
+            section("changes", sets.changes.len());
+            for line in log.trim_end().lines() {
+                println!("  {}", line);
+            }
+            if sets.changes.len() > CHANGES_SHOWN {
+                println!("  {}", "`breq sh <ws> -- jj log` for the rest".dimmed());
+            }
+        }
+        _ => section("changes", sets.changes.len()),
     }
 
-    section("branches", sets.branches.len());
-    for branch in &sets.branches {
-        println!("  {}", branch);
-    }
-
-    let pr_label = match &sets.prs_age {
-        Some(age) => format!("pull requests (cached {})", age),
-        None => "pull requests".to_string(),
-    };
-    section(&pr_label, sets.prs.len());
+    let cached = sets.prs_age.as_ref().map(|age| format!("cached {}", age));
+    section_noted("pull requests", sets.prs.len(), cached.as_deref());
     for pr in &sets.prs {
         let ci = if pr.ci.is_empty() {
             String::new()
@@ -370,14 +365,19 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager) {
         } else {
             String::new()
         };
-        println!(
-            "  {:<38} {:<8} {:<10} {}{}",
-            session.id.as_deref().unwrap_or("(pending)"),
+        // A session id is a uuid; `--resume` takes a prefix, and the full one is in --json.
+        let id = match session.id.as_deref() {
+            Some(id) => id.chars().take(8).collect::<String>(),
+            None => "(pending)".to_string(),
+        };
+        let line = format!(
+            "  {:<9} {:<8} {:<10} {}",
+            id,
             session.agent,
             state,
-            session.title.as_deref().unwrap_or(""),
-            origin
+            session.title.as_deref().unwrap_or("")
         );
+        println!("{}{}", line.trim_end(), origin);
     }
 
     let extra_keys = place.state.extra_keys();
@@ -409,17 +409,27 @@ pub fn detail_json(place: &Place, sets: &Sets, plugins: &PluginManager) -> Resul
 }
 
 fn field(name: &str, value: &str) {
-    println!("  {:<10} {}", name.dimmed(), value);
+    // Padded before it is dimmed, so the longest label still lines the column up.
+    println!("  {} {}", format!("{:<13}", name).dimmed(), value);
 }
 
 fn section(name: &str, count: usize) {
-    println!();
-    if count == 0 {
-        println!("{}", format!("{} (none)", name).dimmed());
-    } else {
-        println!("{}", format!("{} ({})", name, count).dimmed());
-    }
+    section_noted(name, count, None);
 }
+
+/// A section header with something to say about the set beyond its size — how stale it is.
+fn section_noted(name: &str, count: usize, note: Option<&str>) {
+    println!();
+    let inside = match (count, note) {
+        (0, _) => "none".to_string(),
+        (n, Some(note)) => format!("{}, {}", n, note),
+        (n, None) => n.to_string(),
+    };
+    println!("{}", format!("{} ({})", name, inside).dimmed());
+}
+
+/// How much of the workspace's history `get` draws before pointing at the VCS for the rest.
+pub const CHANGES_SHOWN: usize = 8;
 
 #[cfg(test)]
 mod tests {
