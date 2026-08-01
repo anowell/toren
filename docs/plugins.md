@@ -155,8 +155,8 @@ These are yours to edit — the per-tracker status values, and whether finishing
 retires the place, are defaults in a file rather than a vocabulary breq imposes. `breq-submit` is
 the shipped example of the other choice: it ships a piece and leaves the workspace warm.
 
-Both destroying scripts do it last, so a `destroy` that refuses (something is still running in
-there) leaves the tracker already updated and needs only `breq destroy <ws> --kill`.
+Both destroying scripts do it last, and with `--kill`: once the tracker has been updated the
+workspace is done, so live panes come down with it rather than blocking the teardown.
 
 > The old model had `commands/` Rhai plugins (`assign`, `complete`, `abort`) and a `DeferredAction`
 > protocol for scripts that needed to start an agent. Those are gone. `assign` is now `breq do <task>`

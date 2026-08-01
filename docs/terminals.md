@@ -143,8 +143,8 @@ working copy is gone.
   idle shell sitting in the workspace, which would otherwise block destroy forever — so it has to
   come down. But a live agent, or any pane running something other than an idle shell, means there
   is work in there: destroy refuses and tells you to pass `--kill`. (The `breq complete` / `abort`
-  scripts end in a `destroy`, so they inherit that refusal — the tracker is already updated by
-  then, and `breq destroy <ws> --kill` finishes it.)
+  scripts end in `destroy --kill` for that reason — by the time they run, the tracker says the work
+  is finished or handed back, so whatever is still in the panes is not worth keeping.)
 - **The web terminal follows the current agent.** Replacing the agent — `breq do` again, or from the
   UI — re-points the mirror; open browsers are told the old pane ended and reconnect to the new one.
 - **rmux's own web-share** (`rmux web-share`) is a separate feature from toren's web UI — it mints

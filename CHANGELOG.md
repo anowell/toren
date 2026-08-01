@@ -18,6 +18,10 @@ which is the same mirror the browser reads, from the same shared crate.
   in a pipeline, as does anything without a terminal.
 - **`breq sh <ws> --window <name>`** mirrors an existing window of the workspace's session, which is
   how a running agent (`--window agent`) is watched from a terminal.
+- **`breq complete` / `breq abort` now end in `destroy --kill`.** Both scripts update the tracker
+  first, so by the time the destroy runs the work is either finished or handed back — refusing over
+  a live pane only left the workspace half-retired and the teardown to be repeated by hand.
+  `breq destroy` on its own still refuses without `--kill`.
 
 ### The web terminal is kept, and hardened
 The browser reads the same mirror the local terminal does — nothing about the streaming path was

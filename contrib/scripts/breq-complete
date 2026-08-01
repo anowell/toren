@@ -5,8 +5,8 @@
 # name and hands it the arguments. Edit it. It is meant to be edited — the per-source status
 # values below are defaults, not a vocabulary breq imposes.
 #
-# The destroy comes last on purpose: if it refuses because something is still running in
-# there, the tasks are already closed and `breq destroy <ws> --kill` finishes the job.
+# The destroy comes last, and with --kill: once the tasks are closed the place has served its
+# purpose, so whatever is still running in there goes down with it.
 
 set -euo pipefail
 
@@ -49,4 +49,4 @@ for link in $links; do
     echo "$link -> $status"
 done
 
-breq destroy "$ws"
+breq destroy "$ws" --kill

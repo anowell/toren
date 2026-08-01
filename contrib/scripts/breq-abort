@@ -5,8 +5,8 @@
 # "started but nobody on it" state — work-in-progress, assignee dropped — so whoever picks
 # it up next can see it was already begun. Then the place goes away.
 #
-# The work in the workspace is discarded with it. To keep the working copy, drop breq's
-# state only: breq destroy <workspace> --no-delete
+# The work in the workspace is discarded with it, live panes and all. To keep the working
+# copy, drop breq's state only: breq destroy <workspace> --no-delete
 
 set -euo pipefail
 
@@ -51,4 +51,4 @@ for link in $links; do
     echo "$link -> $status"
 done
 
-breq destroy "$ws"
+breq destroy "$ws" --kill
