@@ -17,7 +17,7 @@ daemon:
 
 # Start the web UI (dev mode)
 web:
-    cd web && pnpm dev
+    cd web && bun run dev
 
 # Run the breq CLI in an example segment directory (dev mode)
 cli SEGMENT *ARGS:

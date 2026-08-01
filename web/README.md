@@ -23,28 +23,28 @@ Mobile-first web interface for controlling Toren (distributed development intell
 
 ```bash
 # Install dependencies
-pnpm install
+bun install
 
 # Start dev server (port 5174)
-pnpm dev
+bun run dev
 
 # Run tests
-pnpm test
+bun test
 
 # Watch mode
-pnpm test:watch
+bun test:watch
 
 # Lint
-pnpm lint
+bun run lint
 
 # Format
-pnpm format
+bun run format
 
 # Build for production
-pnpm build
+bun run build
 
 # Preview production build
-pnpm preview
+bun run preview
 ```
 
 ## Project Structure
@@ -127,7 +127,7 @@ Uses Svelte stores for reactive state management:
 
 3. Start the web interface:
    ```bash
-   cd web && pnpm dev
+   cd web && bun run dev
    ```
 
 4. Open http://localhost:5174 in your browser
