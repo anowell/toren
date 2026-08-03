@@ -45,6 +45,13 @@ pub struct Backfill {
 pub enum MirrorState {
     #[default]
     Live,
+    /// The pane is alive, and this mirror cannot follow it at the moment.
+    ///
+    /// The distinction from [`Self::Ended`] is the whole point: a mirror that could not open its
+    /// output subscription — because rmux caps them per connection — knows nothing about the
+    /// pane's process, and saying "ended" there is a lie a client acts on. Degraded says the
+    /// screen is stale, not that the work is over, and the pump keeps trying.
+    Degraded { reason: String },
     /// Nothing more will arrive. `exit` is what rmux recorded for the pane's process, and is
     /// `None` when the mirror was retired for another reason — the pane was replaced, or rmux
     /// never observed a status for it.
@@ -56,11 +63,24 @@ impl MirrorState {
         matches!(self, Self::Ended { .. })
     }
 
+    pub fn is_degraded(&self) -> bool {
+        matches!(self, Self::Degraded { .. })
+    }
+
     /// The pane's exit code, for a client that reports it onwards (a local mirror exits with it).
     pub fn exit_code(&self) -> Option<i32> {
         match self {
             Self::Ended { exit: Some(exit) } => exit.code,
             _ => None,
+        }
+    }
+
+    /// The word a client puts on this state.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Live => "attached",
+            Self::Degraded { .. } => "degraded",
+            Self::Ended { .. } => "ended",
         }
     }
 }
@@ -111,6 +131,15 @@ impl PaneMirror {
         self.epoch.load(Ordering::Relaxed)
     }
 
+    /// How many clients are reading this mirror right now.
+    ///
+    /// What the pump slows down for. A mirror with no readers still has to drain its subscription
+    /// — rmux's retained output is a bounded ring, and letting it overflow costs a screen paint —
+    /// but there is nobody for it to be quick about it for.
+    pub fn viewers(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
     /// How many bytes have been broadcast since `frame` — what a client still owes the pane if it
     /// applies it.
     pub fn bytes_behind(&self, frame: &Frame) -> u64 {
@@ -136,7 +165,7 @@ impl PaneMirror {
     pub fn exit(&self) -> Option<PaneExitState> {
         match &*self.state.borrow() {
             MirrorState::Ended { exit } => exit.clone(),
-            MirrorState::Live => None,
+            MirrorState::Live | MirrorState::Degraded { .. } => None,
         }
     }
 
@@ -144,6 +173,34 @@ impl PaneMirror {
         // Replaced rather than sent: a mirror nobody is watching yet must still remember that its
         // pane is over, for the client that attaches next.
         self.state.send_replace(MirrorState::Ended { exit });
+    }
+
+    /// Say the screen has stopped moving without saying the pane is over.
+    ///
+    /// Ignored once a mirror has ended: an exit is final, and a late failure to re-subscribe to a
+    /// pane that is already gone must not walk that back.
+    pub(crate) fn mark_degraded(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.state.send_if_modified(|state| {
+            if state.is_ended()
+                || matches!(state, MirrorState::Degraded { reason: held } if *held == reason)
+            {
+                return false;
+            }
+            *state = MirrorState::Degraded { reason };
+            true
+        });
+    }
+
+    /// Say the mirror is following the pane again, after a spell of not being able to.
+    pub(crate) fn mark_live(&self) {
+        self.state.send_if_modified(|state| {
+            if !state.is_degraded() {
+                return false;
+            }
+            *state = MirrorState::Live;
+            true
+        });
     }
 
     pub(crate) async fn push(&self, bytes: Arc<Vec<u8>>) {

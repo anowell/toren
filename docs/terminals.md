@@ -103,6 +103,47 @@ to a shell or a command you left running.
 directly. If `rmux` isn't installed at all, that's the automatic fallback — you just don't get
 detach-survival or browser attach.
 
+## What a mirror is responsible for
+
+A mirror is a thin thing, but "one pane, several viewers" breaks four assumptions a terminal is
+built on, and the mirror is where each is put back.
+
+**One connection per mirror.** rmux allows **16 pane-output subscriptions per connection** — a
+server-side limit, measured rather than guessed (`cargo run -p toren-mirror --example rmux_spike --
+caps`). Every mirror therefore takes a connection of its own. Sharing one put a ceiling on how many
+panes a workspace could show at once, and mirrors past the ceiling reported live panes as *exited
+and being held* — which is also why starting an agent in one answered `409 already running`. A
+failed subscription now means "ask the pane what it is doing", never "the pane is over".
+
+**Mirrors are reference-counted.** A mirror costs a connection, a subscription and a pump, so it
+exists while somebody is watching and is swept about half a minute after the last viewer leaves —
+long enough to absorb a tab switch, a reload, or a socket a phone dropped. An unwatched mirror also
+drops to the slow polling clock rather than chasing output nobody reads.
+
+**Liveness is watched separately from mirroring, and pushed.** The daemon keeps a `state_events`
+subscription on every pane it knows about whether or not anything is showing it — a long poll on a
+transport of its own, no output subscription, no forked `list-panes`. That is what makes killing a
+process in a window you are not looking at show up immediately rather than the next time you click
+into it; `/ws/lifecycle` is where it comes out. The old design observed liveness only in a mirror's
+pump, so unwatched panes had no watcher at all.
+
+**One PTY has one size, so one viewer owns it.** Both a terminal and a browser tab resizing the same
+pane meant last-write-wins, and the loser rendered a screen laid out for the winner — the cursor at
+the bottom of a pane whose UI is drawn higher up. The pane now carries a note saying which viewer is
+sizing it, which both `breq` and the daemon can read, and the note goes to whoever typed most
+recently (tmux's `window-size latest`, arrived at independently). Viewers that do not own the size
+render the pane's grid exactly, scaled to fit their window, with a button to take the size. A viewer
+that leaves hands the size back — which is what makes "the terminal closed, resize to the browser"
+work without anything having to detect that the terminal closed.
+
+**The mirror is the only party to a terminal query.** A query and its answer are a conversation
+between one program and one terminal; N viewers means N answers to a question asked once. rmux
+already answers CPR, DA1/2/3, DSR, DECRQM, XTVERSION, OSC colour queries and XTGETTCAP, so the
+mirror drops them on the way out — and drops viewers' *replies* on the way in, where they would
+otherwise arrive at a program that was answered long ago and land on whatever reads stdin next.
+That is the stray-character symptom. Image and terminfo payloads (kitty graphics, Sixel, DECUDK)
+are content rather than conversation and pass through untouched.
+
 ## Living with zellij
 
 rmux and zellij don't interoperate. There's no protocol between them; an rmux session is invisible

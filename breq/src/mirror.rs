@@ -76,7 +76,9 @@ async fn mirror(place: &Place, mut pane: Pane, mut rerun: Rerun<'_>) -> Result<i
         let attached = async {
             let pane_id =
                 toren_mirror::find_window_pane(&rmux_client, &session, &pane.window).await?;
-            MirroredPane::attach(rmux_client.clone(), &session, pane_id, pane.role).await
+            // On a connection of its own, not this one: rmux caps output subscriptions per
+            // connection, and the client here is also what resolves windows.
+            MirroredPane::attach(&session, pane_id, pane.role).await
         }
         .await;
         let mirrored = match attached {
@@ -93,11 +95,23 @@ async fn mirror(place: &Place, mut pane: Pane, mut rerun: Rerun<'_>) -> Result<i
             }
             Err(e) => return Err(e),
         };
+        // Somebody just typed `breq` in this terminal, which makes it the viewer being worked in
+        // — so it takes the pane's size, and any browser tab on the same pane scales to fit
+        // instead of fighting it for the PTY. Ownership moves back the moment they type there.
+        if let Err(e) = mirrored.claim_size().await {
+            tracing::debug!("Failed to claim the pane's size: {:#}", e);
+        }
         if let Some((cols, rows)) = terminal_size() {
             let _ = mirrored.resize(cols, rows).await;
         }
 
-        match follow(&mirrored, &mut out, &mut input, &mut winch, pane.hold).await? {
+        let next = follow(&mirrored, &mut out, &mut input, &mut winch, pane.hold).await?;
+        // This terminal is done sizing the pane, whatever happens next. Saying so is what lets a
+        // browser tab still watching it resize to its own geometry, without anything having to
+        // detect that the terminal went away.
+        let _ = mirrored.release_size().await;
+
+        match next {
             Next::Done(code) => return Ok(code),
             Next::Close(code) => {
                 // Dismissal is the user saying they have read it; nothing else clears a held pane.
@@ -159,6 +173,7 @@ async fn follow(
 
     let mut state = mirror.state();
     let mut text = InputText::default();
+    let mut replies = toren_mirror::QueryFilter::inbound();
     // Once the process is gone the keys mean something else, so the pane stops being typed at.
     let mut held: Option<i32> = None;
 
@@ -196,8 +211,14 @@ async fn follow(
                         return Ok(next);
                     },
                     None => {
-                        let text = text.push(&bytes);
+                        // This terminal answers queries like any other, and rmux has already
+                        // answered the pane's. Its replies stop here rather than arriving at a
+                        // program that asked once and was told long ago.
+                        let text = replies.push_text(&text.push(&bytes));
                         if !text.is_empty() {
+                            // Typing is what makes this the active viewer, and the active
+                            // viewer is the one the pane takes its size from.
+                            let _ = pane.claim_size().await;
                             pane.send_text(&text).await?;
                         }
                     }
@@ -205,7 +226,10 @@ async fn follow(
             },
             _ = winch.recv() => {
                 if let Some((cols, rows)) = terminal_size() {
-                    let _ = pane.resize(cols, rows).await;
+                    // Only if this terminal is the one sizing the pane. A browser tab that took
+                    // ownership is drawing the geometry the app inside is laid out for, and
+                    // resizing under it is how the cursor ends up somewhere the UI is not.
+                    let _ = pane.resize_as_owner(cols, rows).await;
                 }
             },
             changed = state.changed(), if held.is_none() => {
@@ -438,7 +462,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
-        let pane = MirroredPane::attach(client, &session, pane_id, PaneRole::Shell)
+        let pane = MirroredPane::attach(&session, pane_id, PaneRole::Shell)
             .await
             .unwrap();
 

@@ -9,6 +9,17 @@
 //! them by comparing epochs, which is what makes a resync a resync rather than a race. Frames
 //! *in* are keystrokes and carry no header.
 //!
+//! Three things this connection is, beyond a pipe:
+//!
+//! * **A viewer**, registered for as long as it is open. A mirror costs rmux a connection and an
+//!   output subscription, so it lives while somebody is watching and is swept when nobody is.
+//! * **A candidate for owning the pane's size**, which it becomes by typing. One PTY has one
+//!   geometry; a viewer that does not own it is told so, and told what the geometry is, so it can
+//!   scale rather than fight for it.
+//! * **A terminal whose answers must not escape**. A browser's xterm.js replies to queries like
+//!   any terminal, and those replies would arrive at a pane that asked once and was answered long
+//!   ago. They are dropped on the way in.
+//!
 //! The socket is also kept alive from here: a browser answers protocol pings itself, and sends its
 //! own as JSON because the browser API will not send a protocol one. Without either, a connection
 //! a proxy or a sleeping phone silently dropped looks exactly like an idle agent.
@@ -18,21 +29,21 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
+use toren_mirror::QueryFilter;
 use tracing::{info, warn};
 
 use super::AppState;
+use crate::services::pane_runner::{Geometry, ViewerId};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WsRequest {
     /// Keystrokes, forwarded to the pane verbatim.
-    Data {
-        data: String,
-    },
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
+    Data { data: String },
+    /// This viewer's geometry. Honoured only while this viewer owns the pane's size.
+    Resize { cols: u16, rows: u16 },
+    /// Make this viewer the one that sizes the pane, and take this geometry.
+    TakeSize { cols: u16, rows: u16 },
     /// Ctrl-C, distinct from `Data` so the UI can offer a button for it.
     Interrupt,
     /// Repaint me: the client believes its terminal no longer matches the pane.
@@ -44,10 +55,20 @@ enum WsRequest {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WsResponse {
-    /// Pane liveness, sent on connect and when it changes.
+    /// Pane liveness, sent on connect and when it changes: `attached`, `degraded`, or `ended`.
     Status {
         status: String,
         session: String,
+    },
+    /// The pane's geometry, and whether this viewer is the one setting it.
+    ///
+    /// A viewer that is not sizing the pane needs both halves: what the grid actually is, so it
+    /// can scale to fit rather than reflow, and that it is not the one deciding, so it can offer
+    /// to become so.
+    Size {
+        cols: u16,
+        rows: u16,
+        owned: bool,
     },
     Error {
         message: String,
@@ -80,6 +101,19 @@ pub async fn handle_ancillary_ws(socket: WebSocket, state: AppState, ancillary_i
         return;
     };
 
+    // Registering as a viewer is what keeps the mirror alive; the mirror is swept once the last
+    // viewer has been gone for a moment.
+    let Some(viewer) = state.panes.attach_viewer(&ancillary_id).await else {
+        send_json(
+            &mut sender,
+            &WsResponse::Error {
+                message: format!("Pane for {} went away while attaching", ancillary_id),
+            },
+        )
+        .await;
+        return;
+    };
+
     let session = state
         .panes
         .session_of(&ancillary_id)
@@ -91,25 +125,59 @@ pub async fn handle_ancillary_ws(socket: WebSocket, state: AppState, ancillary_i
         ancillary_id, session
     );
 
+    serve(
+        &mut sender,
+        &mut receiver,
+        &state,
+        &ancillary_id,
+        viewer,
+        &session,
+        &mirror,
+    )
+    .await;
+
+    state.panes.detach_viewer(&ancillary_id, viewer).await;
+    info!("Client detached from {}", ancillary_id);
+}
+
+/// The socket's whole life, so the caller can release the viewer on every exit path.
+async fn serve<S, R>(
+    sender: &mut S,
+    receiver: &mut R,
+    state: &AppState,
+    ancillary_id: &str,
+    viewer: ViewerId,
+    session: &str,
+    mirror: &toren_mirror::PaneMirror,
+) where
+    S: SinkExt<Message> + Unpin,
+    R: StreamExt<Item = Result<Message, axum::Error>> + Unpin,
+{
     // Taken together, so nothing is missed or repeated. The backfill opens with a paint of the
     // pane's screen, so a client attaching long after the pane started still lands on it exactly.
     let (backfill, mut live) = mirror.attach().await;
     let mut epoch = backfill.epoch;
     let mut state_changes = mirror.state();
 
+    let opening = state_changes.borrow().as_str().to_string();
     send_json(
-        &mut sender,
+        sender,
         &WsResponse::Status {
-            status: if mirror.has_ended() {
-                "ended"
-            } else {
-                "attached"
-            }
-            .to_string(),
-            session: session.clone(),
+            status: opening,
+            session: session.to_string(),
         },
     )
     .await;
+
+    // Followed rather than asked for. A resize is debounced before it reaches the PTY, so asking
+    // straight after requesting one answers with the geometry it is about to replace — and tells
+    // the first viewer of an unowned pane that it does not own a size it is in the middle of
+    // being given.
+    let Some(mut geometry) = state.panes.geometry(ancillary_id).await else {
+        return;
+    };
+    let opening_geometry = *geometry.borrow_and_update();
+    report_size(opening_geometry, viewer, sender).await;
 
     if !backfill.bytes.is_empty()
         && sender
@@ -119,6 +187,9 @@ pub async fn handle_ancillary_ws(socket: WebSocket, state: AppState, ancillary_i
     {
         return;
     }
+
+    // This viewer's terminal answers queries like any other. Its answers stop here.
+    let mut typed = QueryFilter::inbound();
 
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -133,27 +204,29 @@ pub async fn handle_ancillary_ws(socket: WebSocket, state: AppState, ancillary_i
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<WsRequest>(&text) {
-                            Ok(WsRequest::Ping) => send_json(&mut sender, &WsResponse::Pong).await,
+                            Ok(WsRequest::Ping) => send_json(sender, &WsResponse::Pong).await,
                             Ok(WsRequest::Resync) => {
-                                epoch = resync(&state, &ancillary_id, epoch, &mut sender).await;
+                                epoch = resync(state, ancillary_id, epoch, sender).await;
                             }
                             Ok(request) => {
-                                if let Err(e) = apply(&state, &ancillary_id, request).await {
+                                if let Err(e) = apply(state, ancillary_id, viewer, &mut typed, request).await {
                                     warn!("{}: {}", ancillary_id, e);
-                                    send_json(&mut sender, &WsResponse::Error { message: e.to_string() }).await;
+                                    send_json(sender, &WsResponse::Error { message: e.to_string() }).await;
                                 }
                             }
                             Err(e) => {
                                 warn!("{}: unparseable control message: {}", ancillary_id, e);
-                                send_json(&mut sender, &WsResponse::Error { message: e.to_string() }).await;
+                                send_json(sender, &WsResponse::Error { message: e.to_string() }).await;
                             }
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         // For clients that send keystrokes as raw bytes.
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
-                        if let Err(e) = state.panes.send_input(&ancillary_id, &text).await {
-                            warn!("{}: failed to forward input: {}", ancillary_id, e);
+                        let text = typed.push_text(&String::from_utf8_lossy(&bytes));
+                        if !text.is_empty() {
+                            if let Err(e) = state.panes.send_input(ancillary_id, viewer, &text).await {
+                                warn!("{}: failed to forward input: {}", ancillary_id, e);
+                            }
                         }
                     }
                     Some(Ok(_)) => {}
@@ -179,7 +252,7 @@ pub async fn handle_ancillary_ws(socket: WebSocket, state: AppState, ancillary_i
                                 ancillary_id,
                                 mirror.bytes_behind(&sent)
                             );
-                            epoch = resync(&state, &ancillary_id, epoch, &mut sender).await;
+                            epoch = resync(state, ancillary_id, epoch, sender).await;
                             continue;
                         }
                         epoch = sent.epoch;
@@ -191,10 +264,14 @@ pub async fn handle_ancillary_ws(socket: WebSocket, state: AppState, ancillary_i
                         // The bytes that would fix the client's screen are the ones it just lost,
                         // so describe the screen instead of streaming into a corrupted one.
                         warn!("{}: client lagged, {} chunks skipped", ancillary_id, skipped);
-                        epoch = resync(&state, &ancillary_id, epoch, &mut sender).await;
+                        epoch = resync(state, ancillary_id, epoch, sender).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
+            }
+            Ok(()) = geometry.changed() => {
+                let current = *geometry.borrow_and_update();
+                report_size(current, viewer, sender).await;
             }
             _ = keepalive.tick() => {
                 if last_heard.elapsed() > CLIENT_TIMEOUT {
@@ -205,9 +282,19 @@ pub async fn handle_ancillary_ws(socket: WebSocket, state: AppState, ancillary_i
                     break;
                 }
             }
-            // The pane died or was replaced; the client would otherwise wait forever.
             Ok(()) = state_changes.changed() => {
-                if !state_changes.borrow().is_ended() {
+                let current = state_changes.borrow_and_update().clone();
+                send_json(
+                    sender,
+                    &WsResponse::Status {
+                        status: current.as_str().to_string(),
+                        session: session.to_string(),
+                    },
+                )
+                .await;
+                // A mirror that cannot follow its pane is not a pane that is over: the screen
+                // stops moving, the socket stays, and it starts again when the mirror does.
+                if !current.is_ended() {
                     continue;
                 }
                 // A pane is marked ended after the status line it ends with is queued, so both
@@ -222,20 +309,10 @@ pub async fn handle_ancillary_ws(socket: WebSocket, state: AppState, ancillary_i
                         break;
                     }
                 }
-                send_json(
-                    &mut sender,
-                    &WsResponse::Status {
-                        status: "ended".to_string(),
-                        session: session.clone(),
-                    },
-                )
-                .await;
                 break;
             }
         }
     }
-
-    info!("Client detached from {}", ancillary_id);
 }
 
 /// Pane bytes as the browser reads them: the epoch they belong to, then the bytes themselves.
@@ -244,6 +321,21 @@ fn frame(epoch: u32, bytes: &[u8]) -> Vec<u8> {
     framed.extend_from_slice(&epoch.to_be_bytes());
     framed.extend_from_slice(bytes);
     framed
+}
+
+async fn report_size<S>(geometry: Geometry, viewer: ViewerId, sender: &mut S)
+where
+    S: SinkExt<Message> + Unpin,
+{
+    send_json(
+        sender,
+        &WsResponse::Size {
+            cols: geometry.cols,
+            rows: geometry.rows,
+            owned: geometry.owned_by(viewer),
+        },
+    )
+    .await;
 }
 
 /// Repaint the pane and adopt the epoch that paint opens, so everything already queued behind it
@@ -269,11 +361,39 @@ where
     }
 }
 
-async fn apply(state: &AppState, ancillary_id: &str, request: WsRequest) -> anyhow::Result<()> {
+async fn apply(
+    state: &AppState,
+    ancillary_id: &str,
+    viewer: ViewerId,
+    typed: &mut QueryFilter,
+    request: WsRequest,
+) -> anyhow::Result<()> {
     match request {
-        WsRequest::Data { data } => state.panes.send_input(ancillary_id, &data).await,
-        WsRequest::Interrupt => state.panes.send_input(ancillary_id, INTERRUPT).await,
-        WsRequest::Resize { cols, rows } => state.panes.resize(ancillary_id, cols, rows).await,
+        WsRequest::Data { data } => {
+            let data = typed.push_text(&data);
+            if data.is_empty() {
+                return Ok(());
+            }
+            state.panes.send_input(ancillary_id, viewer, &data).await
+        }
+        // Not filtered: this is a button, not a keystroke, so it cannot be a leaked reply.
+        WsRequest::Interrupt => {
+            state
+                .panes
+                .send_input(ancillary_id, viewer, INTERRUPT)
+                .await
+        }
+        WsRequest::Resize { cols, rows } => state
+            .panes
+            .resize(ancillary_id, viewer, cols, rows)
+            .await
+            .map(|_| ()),
+        WsRequest::TakeSize { cols, rows } => {
+            state
+                .panes
+                .take_size(ancillary_id, viewer, cols, rows)
+                .await
+        }
         // Answered by the caller, which owns the socket's epoch and its replies.
         WsRequest::Resync | WsRequest::Ping => Ok(()),
     }

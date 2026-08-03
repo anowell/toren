@@ -112,3 +112,32 @@ export function fitTerminal(term: Terminal, host: HTMLElement): Geometry | null 
 	}
 	return geometry;
 }
+
+/**
+ * How much a fixed grid has to shrink to fit inside `box`.
+ *
+ * For a viewer that is *not* the one sizing the pane. One PTY has one geometry, and the app
+ * inside it has drawn a screen for that geometry; re-laying it out to this tab's shape would mean
+ * writing a size the owner would immediately write back, and rendering something the app never
+ * composed in between. So the grid stays exactly as the pane has it and the pixels are scaled to
+ * fit around it.
+ *
+ * Never above 1: enlarging a rendered grid blurs it, and a pane smaller than the tab showing it
+ * is better letterboxed and crisp. Taking the pane's size is a click away when the shape is what
+ * the viewer actually wants.
+ */
+export function scaleToFit(grid: Box, box: Box): number {
+	if (!(grid.width > 0) || !(grid.height > 0)) return 1;
+	if (!(box.width > 0) || !(box.height > 0)) return 1;
+	return Math.min(1, box.width / grid.width, box.height / grid.height);
+}
+
+/** The pixel box a grid of `geometry` occupies at the terminal's current cell size. */
+export function gridBox(term: Terminal, geometry: Geometry): Box | null {
+	const cell = cellSize(term);
+	if (!cell) return null;
+	return {
+		width: geometry.cols * cell.width + SCROLLBAR_WIDTH,
+		height: geometry.rows * cell.height,
+	};
+}

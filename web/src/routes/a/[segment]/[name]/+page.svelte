@@ -30,7 +30,7 @@ import type {
 let showMobilePanel = false;
 
 /** Typed structurally so biome doesn't see the import as type-only. */
-let terminal: { resync(): void } | null = null;
+let terminal: { resync(): void; takeSize(): void } | null = null;
 let paneStatus = 'connecting';
 let wsError: string | null = null;
 // Bumped whenever the pane behind an unchanged window name has been replaced — a resume, another
@@ -139,13 +139,38 @@ function handleTerminalStatus(event: CustomEvent<{ status: string; session?: str
 	else stopAttachingTimer();
 }
 
+/**
+ * Who is sizing this pane, and what its grid is.
+ *
+ * A tab that is not the one sizing it renders the pane's own grid scaled to fit, so the app
+ * inside is never asked to lay itself out for two windows at once. Typing here takes the size
+ * back; the banner is for taking it without typing.
+ */
+let sizeOwned = true;
+let paneGrid: { cols: number; rows: number } | null = null;
+
+function handleTerminalSizing(event: CustomEvent<{ owned: boolean; cols: number; rows: number }>) {
+	sizeOwned = event.detail.owned;
+	paneGrid = { cols: event.detail.cols, rows: event.detail.rows };
+}
+
 function handleTerminalError(event: CustomEvent<{ message: string }>) {
 	wsError = event.detail.message;
 	stopAttachingTimer();
 }
 
+// The daemon pushes every pane-state change it sees, whether or not this tab has that pane open.
+// Without it, a process killed in an unwatched window kept reading "running" in the session list
+// until something else happened to refresh the workspace.
+let stopFollowingLifecycle: (() => void) | null = null;
+$: if ($torenStore.authenticated && !stopFollowingLifecycle) {
+	stopFollowingLifecycle = torenStore.followLifecycle($torenStore.shipUrl);
+}
+
 onDestroy(() => {
 	stopAttachingTimer();
+	stopFollowingLifecycle?.();
+	stopFollowingLifecycle = null;
 	terminal = null;
 });
 
@@ -661,6 +686,26 @@ $: paneUnreachable = paneStatus === 'unreachable';
 					<button class="banner-btn" on:click={dropToShell}>Drop to shell</button>
 					<button class="banner-btn" on:click={() => dismissWindow(selectedWindow)} disabled={dismissing !== null}>Dismiss</button>
 				</div>
+			{:else if paneStatus === 'degraded'}
+				<!--
+					The daemon has lost its grip on a pane that is still running. What is on screen is
+					the last thing it saw, not the end of anything, and it starts moving again by
+					itself — so this says "stale", never "exited".
+				-->
+				<div class="terminal-banner">
+					This pane is still running; the view of it is stale.
+					<button class="banner-btn" on:click={() => terminal?.resync()}>Resync</button>
+				</div>
+			{:else if !sizeOwned && paneGrid}
+				<!--
+					One PTY, one geometry. Another viewer — a terminal, or another tab — is the one it
+					is laid out for, so this one shows that layout scaled rather than reflowing a
+					screen its app never composed.
+				-->
+				<div class="terminal-banner">
+					Sized {paneGrid.cols}×{paneGrid.rows} by another viewer.
+					<button class="banner-btn" on:click={() => terminal?.takeSize()}>Resize to this window</button>
+				</div>
 			{:else if attachingSlowly}
 				<!-- Attaching is normally too quick to see; a wait long enough to notice is not. -->
 				<div class="terminal-banner">Attaching…</div>
@@ -671,6 +716,7 @@ $: paneUnreachable = paneStatus === 'unreachable';
 				{attachNonce}
 				held={paneEnded}
 				on:status={handleTerminalStatus}
+				on:sizing={handleTerminalSizing}
 				on:error={handleTerminalError}
 				on:held={handleHeld}
 			/>

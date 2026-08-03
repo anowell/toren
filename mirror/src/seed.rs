@@ -12,6 +12,8 @@
 use anyhow::{Context, Result};
 use rmux_sdk::{Pane, PaneId, Rmux};
 
+use crate::filter::QueryFilter;
+
 /// Every mode flag rmux answers for a pane, in one round trip.
 const MODE_FORMAT: &str = "#{alternate_on}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\
     \t#{scroll_region_upper}\t#{scroll_region_lower}\t#{wrap_flag}\t#{origin_flag}\
@@ -90,7 +92,10 @@ pub async fn screen_paint(rmux: &Rmux, pane: &Pane, pane_id: PaneId) -> Result<V
         .escape_ansi(true)
         .await
         .with_context(|| format!("Failed to capture pane {}", pane_id))?;
-    Ok(paint(&modes, &screen.stdout))
+    // Through the same filter the live stream goes through. A paint is assembled here rather
+    // than replayed, so it should carry no queries — but "should" is what the unfiltered seed
+    // path was relying on, and the filter is a single authority or it is nothing.
+    Ok(QueryFilter::new().push(&paint(&modes, &screen.stdout)))
 }
 
 async fn read_modes(rmux: &Rmux, pane_id: PaneId) -> Result<PaneModes> {

@@ -258,6 +258,9 @@ export function defaultWindowName(sessions: SessionInfo[]): string | null {
 	return (shell ?? sessions[0]).window;
 }
 
+/** How long the lifecycle stream waits before reconnecting. */
+const LIFECYCLE_RETRY_MS = 2000;
+
 // Create the store with a custom store that includes helper methods
 function createTorenStore() {
 	const initialState: TorenState = {
@@ -475,6 +478,55 @@ function createTorenStore() {
 				const data = await response.json().catch(() => ({}));
 				throw new Error(data.error || 'Failed to close window');
 			}
+		},
+		/**
+		 * Follow the daemon's pane-state stream, refreshing whatever workspace an event belongs to.
+		 *
+		 * Window liveness used to be observed only by whichever pane a browser had open, so a
+		 * process killed in a pane nobody was looking at went on reading "running" in the list
+		 * until somebody clicked into it. The daemon now watches every pane it knows about and
+		 * pushes what changes; this turns that into the one thing the UI needs, which is to
+		 * re-read the workspace the change happened in.
+		 *
+		 * Returns a function that closes the socket. Reconnects on its own, because a stream that
+		 * gives up is a list that silently goes stale again.
+		 */
+		followLifecycle(shipUrl: string): () => void {
+			let socket: WebSocket | null = null;
+			let retry: ReturnType<typeof setTimeout> | null = null;
+			let closed = false;
+
+			const open = () => {
+				if (closed) return;
+				socket = new WebSocket(`${shipUrl.replace(/^http/, 'ws')}/ws/lifecycle`);
+				socket.onmessage = (event) => {
+					let update: { session?: string } | null = null;
+					try {
+						update = JSON.parse(event.data);
+					} catch {
+						return;
+					}
+					const session = update?.session;
+					if (!session) return;
+					// The event names an rmux session; the workspace is whichever one lives in it.
+					const workspace = get({ subscribe }).workspaces.find((w) => w.session === session);
+					if (workspace) {
+						void this.refreshWorkspace(shipUrl, workspace.segment, workspace.name);
+					}
+				};
+				socket.onclose = () => {
+					socket = null;
+					if (closed) return;
+					retry = setTimeout(open, LIFECYCLE_RETRY_MS);
+				};
+			};
+
+			open();
+			return () => {
+				closed = true;
+				if (retry) clearTimeout(retry);
+				socket?.close();
+			};
 		},
 		async stopWorkspace(shipUrl: string, segment: string, name: string): Promise<void> {
 			const seg = encodeURIComponent(segment);

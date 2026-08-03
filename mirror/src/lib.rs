@@ -17,6 +17,15 @@
 //! Panes are addressed by [`PaneId`] throughout. Window and pane indices shift as windows come and
 //! go, so nothing here holds one: every targeted call re-resolves the window index from the pane's
 //! own window id.
+//!
+//! Two things a mirror is careful to be, because N viewers where there was one breaks both:
+//!
+//! * **The only party to a terminal query** ([`QueryFilter`]). Questions the pane asks are dropped
+//!   on the way out, because rmux has already answered them; answers a viewer's terminal gives are
+//!   dropped on the way in, because nothing upstream is waiting for them.
+//! * **Honest about not knowing** ([`MirrorState::Degraded`]). A mirror that cannot follow its
+//!   pane says the screen is stale, never that the process is over — those are different facts and
+//!   only one of them is a mirror's to report.
 
 mod buffer;
 mod filter;
@@ -25,10 +34,11 @@ mod pane;
 mod seed;
 
 pub use buffer::{Backfill, Frame, MirrorState, PaneMirror, LAG_BUDGET_BYTES};
-pub use filter::QueryFilter;
+pub use filter::{Direction, QueryFilter};
 pub use held::{held_status_line, PaneRole};
 pub use pane::{
-    connect, find_window_pane, liveness, transport_is_dead, MirroredPane, PaneLiveness,
+    connect, find_window_pane, liveness, transport_is_dead, wait_until_exited, MirroredPane,
+    PaneLiveness,
 };
 pub use seed::{paint, screen_paint, PaneModes};
 

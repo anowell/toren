@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { type Box, contentBox, MIN_COLS, MIN_ROWS, proposeGeometry } from './fit';
+import { type Box, contentBox, MIN_COLS, MIN_ROWS, proposeGeometry, scaleToFit } from './fit';
 
 const CELL = { width: 8, height: 17 };
 
@@ -74,5 +74,22 @@ describe('contentBox', () => {
 
 	it('never reports a negative box', () => {
 		expect(contentBox(inset({ width: 10, height: 10 }, 40))).toEqual({ width: 0, height: 0 });
+	});
+});
+
+describe('scaleToFit', () => {
+	it('shrinks by whichever axis runs out first', () => {
+		expect(scaleToFit({ width: 800, height: 400 }, { width: 200, height: 400 })).toBeCloseTo(0.25);
+		expect(scaleToFit({ width: 800, height: 400 }, { width: 800, height: 100 })).toBeCloseTo(0.25);
+	});
+
+	it('never enlarges a grid smaller than its box', () => {
+		// Letterboxed and crisp beats stretched and blurry; taking the pane's size is a click away.
+		expect(scaleToFit({ width: 400, height: 200 }, { width: 1600, height: 900 })).toBe(1);
+	});
+
+	it('leaves the grid alone when either side cannot be measured', () => {
+		expect(scaleToFit({ width: 0, height: 200 }, { width: 800, height: 400 })).toBe(1);
+		expect(scaleToFit({ width: 400, height: 200 }, { width: 800, height: 0 })).toBe(1);
 	});
 });

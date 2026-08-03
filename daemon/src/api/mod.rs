@@ -14,7 +14,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::ancillary::AncillaryManager;
 use crate::security::SecurityContext;
-use crate::services::pane_runner::PaneRunner;
+use crate::services::pane_runner::{window_key, PaneRunner};
 use crate::services::Services;
 use toren_lib::{
     AgentSpec, CollectOptions, Config, Place, PlaceRegistry, SegmentManager, Sets, WorkspaceManager,
@@ -49,7 +49,7 @@ pub async fn serve(
     ancillary_manager: AncillaryManager,
     segment_manager: SegmentManager,
     workspace_manager: Option<WorkspaceManager>,
-    pane_runner: PaneRunner,
+    pane_runner: Arc<PaneRunner>,
 ) -> Result<()> {
     let state = AppState {
         config: Arc::new(config),
@@ -59,13 +59,14 @@ pub async fn serve(
         ancillaries: Arc::new(ancillary_manager),
         segments: Arc::new(std::sync::RwLock::new(segment_manager)),
         workspaces: workspace_manager.map(Arc::new),
-        panes: Arc::new(pane_runner),
+        panes: pane_runner,
     };
 
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/pair", post(pair_device))
         .route("/ws", get(ws_handler))
+        .route("/ws/lifecycle", get(lifecycle_ws_handler))
         .route("/ws/workspaces/:segment/:name", get(workspace_ws_handler))
         .route(
             "/ws/workspaces/:segment/:name/:window",
@@ -157,6 +158,41 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
     ws.on_upgrade(|socket| ws_handler::handle_websocket(socket, state))
 }
 
+/// Every pane-state change the daemon observes, pushed.
+///
+/// What a window list needs to stop lying. Liveness used to be observed only by a mirror's pump,
+/// so a pane nobody had open — which is most of them — could have its process killed and go on
+/// reading "running" until somebody clicked into it. The daemon now watches every pane it knows
+/// about whether or not it is showing one, and this is where that comes out.
+async fn lifecycle_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|mut socket| async move {
+        let mut events = state.panes.lifecycle();
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    let Ok(json) = serde_json::to_string(&event) else {
+                        continue;
+                    };
+                    if socket
+                        .send(axum::extract::ws::Message::Text(json))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                // A subscriber this far behind has missed state it cannot reconstruct from the
+                // stream; it re-reads the workspace instead, which is what a reload does anyway.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
+}
+
 // ==================== Workspace terminal mirror ====================
 
 /// Attach a browser terminal to a workspace's default window: the agent if one exists, else its
@@ -191,14 +227,6 @@ fn default_window(session: &str) -> String {
         .into_iter()
         .find(|w| w.starts_with(toren_lib::rmux::SHELL_WINDOW))
         .unwrap_or_else(|| toren_lib::rmux::SHELL_WINDOW.to_string())
-}
-
-/// A mirror tracking key scoped to one window of one session.
-///
-/// Per-window so a workspace can mirror its agent and several shells at once without them
-/// clobbering each other's recorders.
-fn window_key(session: &str, window: &str) -> String {
-    format!("{}:{}", session, window)
 }
 
 /// Point a per-window mirror at the pane running right now, returning its tracking key.
@@ -425,6 +453,11 @@ async fn workspace_get(
     // Looking at one workspace is also when a finished agent session gets its ending written
     // down, since nothing watches the pane for it.
     toren_lib::sessions::settle_saved(&mut place, &state.rhai_plugins);
+
+    // …and when the daemon starts watching every pane in it, not just the one being shown. From
+    // here on this workspace's window list is kept current by pushes over `/ws/lifecycle` rather
+    // than by whatever happens to refresh it next.
+    state.panes.watch_session(&place.session_name()).await;
 
     // One workspace at a time: this is the daemon's write-through point, so the list endpoints
     // (and `breq list`) render metadata this refreshed rather than paying for it themselves.

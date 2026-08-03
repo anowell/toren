@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::{info, Level};
-use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -26,9 +25,13 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Terminal for whoever is watching, rolling JSON file for whoever asks later.
+    // Terminal for whoever is watching, rolling JSON file for whoever asks later. `RUST_LOG`
+    // overrides the terminal level, which is the only way to see the mirror's own reasoning —
+    // which pane refused a resize, which viewer owns a size, why a mirror went degraded.
+    let terminal = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(Level::INFO.to_string()));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(LevelFilter::from_level(Level::INFO)))
+        .with(tracing_subscriber::fmt::layer().with_filter(terminal))
         .with(toren_lib::logging::file_layer("toren-daemon"))
         .init();
 
