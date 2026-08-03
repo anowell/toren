@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - Rust toolchain (`rustup`)
-- Node.js and pnpm (for web UI)
+- [bun](https://bun.sh) (for the web UI)
 - jj (Jujutsu VCS)
 
 ## Setup
@@ -11,7 +11,7 @@
 ```bash
 git clone <repo> && cd toren
 cargo build
-cd web && pnpm install
+cd web && bun install
 ```
 
 ## Development Commands
@@ -27,6 +27,10 @@ just web
 cargo run --bin breq -- <args>
 # Or after building:
 just cli <args>
+
+# Everything CI would run: cargo check/clippy, svelte-check, biome
+just check
+just test
 ```
 
 ## Project Structure

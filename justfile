@@ -43,18 +43,18 @@ health:
 check:
     cargo check
     cargo clippy -- -D warnings
-    cd web && pnpm check
-    cd web && pnpm lint
+    cd web && bun run check
+    cd web && bun run lint
 
 # Run tests
 test:
     cargo test
-    cd web && pnpm test
+    cd web && bun run test
 
 # Format code
 fmt:
     cargo fmt
-    cd web && pnpm format
+    cd web && bun run format
 
 # Clean build artifacts
 clean:
