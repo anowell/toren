@@ -2,8 +2,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use rmux_sdk::{
-    Pane, PaneExitState, PaneId, PaneOutputChunk, PaneOutputStart, PaneProcessState,
-    PaneStateEvent, PaneStateEventsOptions, Rmux, SessionName, TerminalSizeSpec,
+    Pane, PaneExitState, PaneId, PaneOutputChunk, PaneOutputStart, PaneStateEvent,
+    PaneStateEventsOptions, Rmux, SessionName, TerminalSizeSpec,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,11 +100,15 @@ pub enum PaneLiveness {
 /// One pane as rmux's own inventory describes it: which window it is in, and whether its process
 /// is still running.
 ///
-/// Read over the socket through [`Pane::info`] rather than through `Rmux::cmd`, which forks the
-/// rmux binary (rmux-sdk `handles/rmux.rs`). At one mirror this is a detail; at fifteen, asking
-/// twice a second each, it was several process spawns per second on the daemon's critical path.
+/// Read through `Rmux::cmd` with [`FACTS_FORMAT`] rather than through [`Pane::info`], although
+/// the fork costs more than the socket round trip: the info snapshot's wire format carries
+/// `#{pane_start_command}`, a field the pane's own argv can break a line in. An agent handed a
+/// multi-line prompt vanishes from that snapshot entirely, and a pane that cannot be parsed is
+/// indistinguishable from a pane that is gone — which ended live mirrors. Liveness is pushed
+/// (`state_events`), so this read runs on attach and on rare fallbacks, not on a clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneFacts {
+    id: PaneId,
     window_index: u32,
     /// The pane's grid, which is what a viewer that does not size it renders at.
     size: (u16, u16),
@@ -118,9 +122,9 @@ struct PaneFacts {
 /// The name is how the window was created and the only thing callers know up front; the id it
 /// resolves to is what everything afterwards uses, because indices move and ids do not.
 ///
-/// This is the one lookup with no socket equivalent in the SDK — a window can only be addressed
-/// by index, and only `list-panes` reports the name alongside — so it forks. It runs once per
-/// attach rather than on any repeating clock, which is what makes that acceptable.
+/// No socket equivalent in the SDK — a window can only be addressed by index, and only
+/// `list-panes` reports the name alongside — so it forks. It runs once per attach rather than on
+/// any repeating clock, which is what makes that acceptable.
 pub async fn find_window_pane(rmux: &Rmux, session: &str, window: &str) -> Result<PaneId> {
     let name = session_name(session)?;
     let run = rmux
@@ -161,12 +165,13 @@ fn parse_pane_id(field: &str) -> Option<PaneId> {
 
 /// Whether a pane's process is still running, without mirroring it.
 pub async fn liveness(rmux: &Rmux, session: &str, pane_id: PaneId) -> Result<PaneLiveness> {
-    let pane = pane_handle(rmux, session_name(session)?, pane_id).await?;
-    Ok(match followed(&pane, pane_id).await? {
-        Followed::Running => PaneLiveness::Running,
-        Followed::Exited(exit) => PaneLiveness::Exited(exit),
-        Followed::Gone | Followed::Indeterminate => PaneLiveness::Unknown,
-    })
+    Ok(
+        match followed(rmux, &session_name(session)?, pane_id).await? {
+            Followed::Running => PaneLiveness::Running,
+            Followed::Exited(exit) => PaneLiveness::Exited(exit),
+            Followed::Gone | Followed::Indeterminate => PaneLiveness::Unknown,
+        },
+    )
 }
 
 /// One pane, followed by id: its bytes fan out through [`MirroredPane::mirror`], and input,
@@ -235,6 +240,8 @@ impl MirroredPane {
         // pump's requests.
         let (exit_tx, exit_rx) = watch::channel(None);
         let watcher = tokio::spawn(watch_lifecycle(
+            rmux.clone(),
+            session.clone(),
             pane.clone(),
             pane_id,
             exit_tx,
@@ -242,6 +249,7 @@ impl MirroredPane {
         ));
         let pump = tokio::spawn(pump(
             rmux.clone(),
+            session.clone(),
             pane.clone(),
             pane_id,
             mirror.clone(),
@@ -390,21 +398,23 @@ impl MirroredPane {
 
     /// The pane's grid as rmux has it, which is what a passive viewer scales itself to.
     ///
-    /// Read off the pane's info rather than a `snapshot()`: a snapshot is the whole cell grid,
+    /// Read off the pane's facts rather than a `snapshot()`: a snapshot is the whole cell grid,
     /// tens of kilobytes, and this wants two numbers out of it.
     pub async fn size(&self) -> Result<(u16, u16)> {
-        facts(&self.pane, self.pane_id)
+        facts(&self.rmux, &self.session, self.pane_id)
             .await?
             .map(|facts| facts.size)
             .ok_or_else(|| anyhow!("rmux pane {} is gone", self.pane_id))
     }
 
     pub async fn liveness(&self) -> Result<PaneLiveness> {
-        Ok(match followed(&self.pane, self.pane_id).await? {
-            Followed::Running => PaneLiveness::Running,
-            Followed::Exited(exit) => PaneLiveness::Exited(exit),
-            Followed::Gone | Followed::Indeterminate => PaneLiveness::Unknown,
-        })
+        Ok(
+            match followed(&self.rmux, &self.session, self.pane_id).await? {
+                Followed::Running => PaneLiveness::Running,
+                Followed::Exited(exit) => PaneLiveness::Exited(exit),
+                Followed::Gone | Followed::Indeterminate => PaneLiveness::Unknown,
+            },
+        )
     }
 
     /// Put every attached client back on the pane's real screen, returning the epoch the paint
@@ -423,7 +433,7 @@ impl MirroredPane {
     /// Resolved on every call and never cached: rmux renumbers windows as they come and go, and
     /// there is no way to address one by id, so a remembered index eventually resizes a stranger.
     async fn window_index(&self) -> Result<u32> {
-        facts(&self.pane, self.pane_id)
+        facts(&self.rmux, &self.session, self.pane_id)
             .await?
             .map(|facts| facts.window_index)
             .ok_or_else(|| anyhow!("rmux pane {} is gone", self.pane_id))
@@ -438,19 +448,21 @@ struct Terminal {
 
 /// Follow one pane's process state until it reaches a terminal one, then say so once.
 async fn watch_lifecycle(
+    rmux: Arc<Rmux>,
+    session: SessionName,
     pane: Pane,
     pane_id: PaneId,
     exit: watch::Sender<Option<Terminal>>,
     mut stopped: watch::Receiver<bool>,
 ) {
     tokio::select! {
-        _ = await_terminal(&pane, pane_id) => {}
+        _ = await_terminal(&rmux, &session, &pane, pane_id) => {}
         _ = stopped.changed() => return,
     }
     // The watch says *that* the process is gone, not what it left behind; the status comes from
-    // the pane's own info, which is one socket round trip.
+    // the pane's own facts, asked for once.
     let _ = exit.send(Some(Terminal {
-        exit: exited(&pane, pane_id).await,
+        exit: exited(&rmux, &session, pane_id).await,
     }));
 }
 
@@ -460,8 +472,9 @@ async fn watch_lifecycle(
 /// is most panes most of the time, and exactly the ones whose deaths used to go unnoticed until
 /// somebody opened them.
 pub async fn wait_until_exited(rmux: &Rmux, session: &str, pane_id: PaneId) -> Result<()> {
-    let pane = pane_handle(rmux, session_name(session)?, pane_id).await?;
-    await_terminal(&pane, pane_id).await;
+    let session = session_name(session)?;
+    let pane = pane_handle(rmux, session.clone(), pane_id).await?;
+    await_terminal(rmux, &session, &pane, pane_id).await;
     Ok(())
 }
 
@@ -476,7 +489,7 @@ pub async fn wait_until_exited(rmux: &Rmux, session: &str, pane_id: PaneId) -> R
 /// `Closed` when the process goes — including `DiedKept`, the held pane whose process died while
 /// the pane stayed. That last case is why this is not `Pane::wait_for_exit`, which polls
 /// `info()` on a clock of its own and carries a timeout.
-async fn await_terminal(pane: &Pane, pane_id: PaneId) {
+async fn await_terminal(rmux: &Rmux, session: &SessionName, pane: &Pane, pane_id: PaneId) {
     // Subscribe first, then ask. The stream only reports what happens after it opens, so a pane
     // that was already over before anyone looked — a browser reloading onto an agent that finished
     // while the tab was shut — would wait for an event that had already been and gone. Asking
@@ -489,7 +502,7 @@ async fn await_terminal(pane: &Pane, pane_id: PaneId) {
         })
         .await;
 
-    match followed(pane, pane_id).await {
+    match followed(rmux, session, pane_id).await {
         Ok(Followed::Exited(_) | Followed::Gone) => return,
         Ok(_) => {}
         Err(e) => debug!("Failed to read pane {} liveness: {}", pane_id, e),
@@ -512,7 +525,7 @@ async fn await_terminal(pane: &Pane, pane_id: PaneId) {
 
     const POLL: Duration = Duration::from_secs(2);
     loop {
-        match followed(pane, pane_id).await {
+        match followed(rmux, session, pane_id).await {
             Ok(Followed::Exited(_) | Followed::Gone) => return,
             Ok(_) => {}
             Err(e) => debug!("Failed to read pane {} liveness: {}", pane_id, e),
@@ -530,6 +543,7 @@ async fn await_terminal(pane: &Pane, pane_id: PaneId) {
 /// internal await could not be raced against the stop signal safely.
 async fn pump(
     rmux: Arc<Rmux>,
+    session: SessionName,
     pane: Pane,
     pane_id: PaneId,
     mirror: Arc<PaneMirror>,
@@ -557,7 +571,7 @@ async fn pump(
                 // per connection, and a mirror that lost the race for a slot is looking at a
                 // live pane it cannot currently read — so ask what the pane is actually doing
                 // before telling anyone it is over.
-                match followed(&pane, pane_id).await {
+                match followed(&rmux, &session, pane_id).await {
                     Ok(Followed::Exited(state)) => break Some(Terminal { exit: Some(state) }),
                     Ok(Followed::Gone) => break Some(Terminal { exit: None }),
                     Ok(Followed::Running | Followed::Indeterminate) | Err(_) => {}
@@ -581,6 +595,7 @@ async fn pump(
         mirror.mark_live();
         match follow(
             &rmux,
+            &session,
             stream,
             &pane,
             pane_id,
@@ -617,8 +632,10 @@ enum Following {
 }
 
 /// Read one subscription for as long as it lasts.
+#[allow(clippy::too_many_arguments)]
 async fn follow(
     rmux: &Rmux,
+    session: &SessionName,
     mut stream: rmux_sdk::PaneOutputStream,
     pane: &Pane,
     pane_id: PaneId,
@@ -640,7 +657,7 @@ async fn follow(
             Ok(chunks) => chunks,
             Err(e) => {
                 debug!("Pane {} output stream ended: {}", pane_id, e);
-                return match followed(pane, pane_id).await {
+                return match followed(rmux, session, pane_id).await {
                     Ok(Followed::Exited(state)) => Following::Ended(Terminal { exit: Some(state) }),
                     Ok(Followed::Gone) => Following::Ended(Terminal { exit: None }),
                     _ => Following::Interrupted,
@@ -672,7 +689,7 @@ async fn follow(
             }
         }
         if eof {
-            return match exited(pane, pane_id).await {
+            return match exited(rmux, session, pane_id).await {
                 exit @ Some(_) => Following::Ended(Terminal { exit }),
                 None => Following::Ended(Terminal { exit: None }),
             };
@@ -709,8 +726,8 @@ enum Followed {
     Indeterminate,
 }
 
-async fn followed(pane: &Pane, pane_id: PaneId) -> Result<Followed> {
-    let Some(facts) = facts(pane, pane_id).await? else {
+async fn followed(rmux: &Rmux, session: &SessionName, pane_id: PaneId) -> Result<Followed> {
+    let Some(facts) = facts(rmux, session, pane_id).await? else {
         return Ok(Followed::Gone);
     };
     Ok(match facts.dead {
@@ -720,26 +737,63 @@ async fn followed(pane: &Pane, pane_id: PaneId) -> Result<Followed> {
     })
 }
 
-/// The pane's window and process state, over the socket.
-async fn facts(pane: &Pane, pane_id: PaneId) -> Result<Option<PaneFacts>> {
-    let snapshot = pane.info().await?;
-    let Some(info) = snapshot.pane(pane_id) else {
+/// Only fields rmux cannot break a line in — see [`PaneFacts`] for why `#{pane_start_command}`,
+/// and with it [`Pane::info`], is off limits.
+const FACTS_FORMAT: &str = "#{window_index}\t#{pane_id}\t#{pane_dead}\
+                            \t#{pane_dead_status}\t#{pane_dead_signal}\
+                            \t#{pane_width}\t#{pane_height}";
+
+/// The pane's window and process state, as `list-panes` reports them.
+async fn facts(rmux: &Rmux, session: &SessionName, pane_id: PaneId) -> Result<Option<PaneFacts>> {
+    let run = rmux
+        .cmd([
+            "list-panes",
+            "-t",
+            session.as_str(),
+            "-s",
+            "-F",
+            FACTS_FORMAT,
+        ])
+        .await
+        .with_context(|| format!("Failed to list panes in rmux session '{}'", session))?;
+    // A session rmux cannot find has no panes: the pane is gone, not unreadable.
+    if run.exit != Some(0) {
         return Ok(None);
-    };
-    let dead = match info.process {
-        PaneProcessState::Running { .. } => Some(false),
-        PaneProcessState::Exited => Some(true),
+    }
+    Ok(String::from_utf8_lossy(&run.stdout)
+        .lines()
+        .filter_map(parse_facts)
+        .find(|facts| facts.id == pane_id))
+}
+
+/// One `FACTS_FORMAT` line. Anything that does not parse is the tail of some pane's multi-line
+/// argv, not a pane, and is dropped — the same judgement as [`parse_window_pane`].
+fn parse_facts(line: &str) -> Option<PaneFacts> {
+    let mut fields = line.split('\t');
+    let window_index = fields.next()?.trim().parse().ok()?;
+    let id = parse_pane_id(fields.next()?)?;
+    let dead = match fields.next()?.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
         _ => None,
     };
-    Ok(Some(PaneFacts {
-        window_index: snapshot
-            .window(info.window_id)
-            .map(|window| window.index)
-            .unwrap_or(0),
-        size: (info.size.cols, info.size.rows),
+    let code = fields.next()?.trim().parse().ok();
+    let signal = fields.next()?.trim().parse().ok();
+    let cols = fields.next()?.trim().parse().ok()?;
+    let rows = fields.next()?.trim().parse().ok()?;
+    // A signal beats a code: a process killed by one has no exit status of its own to report.
+    let exit = match (code, signal) {
+        (_, Some(signal)) => PaneExitState::from_signal(signal),
+        (Some(code), None) => PaneExitState::from_code(code),
+        (None, None) => PaneExitState::default(),
+    };
+    Some(PaneFacts {
+        id,
+        window_index,
+        size: (cols, rows),
         dead,
-        exit: info.exit_state.clone().unwrap_or_default(),
-    }))
+        exit,
+    })
 }
 
 async fn reseed(rmux: &Rmux, pane: &Pane, pane_id: PaneId, mirror: &PaneMirror) {
@@ -752,8 +806,8 @@ async fn reseed(rmux: &Rmux, pane: &Pane, pane_id: PaneId, mirror: &PaneMirror) 
 }
 
 /// The pane's exit status, which rmux only fills in once the process is actually gone.
-async fn exited(pane: &Pane, pane_id: PaneId) -> Option<PaneExitState> {
-    match followed(pane, pane_id).await {
+async fn exited(rmux: &Rmux, session: &SessionName, pane_id: PaneId) -> Option<PaneExitState> {
+    match followed(rmux, session, pane_id).await {
         Ok(Followed::Exited(exit)) => Some(exit),
         Ok(_) => None,
         Err(e) => {
@@ -803,5 +857,36 @@ mod tests {
         assert!(parse_window_pane("").is_none());
         assert!(parse_window_pane("agent\tnot-a-pane-id").is_none());
         assert!(parse_window_pane("agent\t7").is_none());
+    }
+
+    #[test]
+    fn a_live_pane_reads_as_not_dead() {
+        let facts = parse_facts("2\t%7\t0\t\t\t80\t24").unwrap();
+        assert_eq!(facts.id, PaneId::new(7));
+        assert_eq!(facts.window_index, 2);
+        assert_eq!(facts.dead, Some(false));
+        assert_eq!(facts.size, (80, 24));
+    }
+
+    #[test]
+    fn a_dead_pane_carries_the_status_it_died_with() {
+        let facts = parse_facts("1\t%3\t1\t7\t\t80\t24").unwrap();
+        assert_eq!(facts.dead, Some(true));
+        assert_eq!(facts.exit, PaneExitState::from_code(7));
+
+        let signalled = parse_facts("1\t%3\t1\t\t9\t80\t24").unwrap();
+        assert_eq!(signalled.exit, PaneExitState::from_signal(9));
+    }
+
+    /// Why facts come from `FACTS_FORMAT` and not `Pane::info`: an agent handed a multi-line
+    /// prompt splits its own listing row wherever the prompt breaks. Those fragments must be
+    /// dropped, not read as a pane — and above all must not make a live pane look gone, which
+    /// is what froze every mirror of a `breq do <task>` agent (tor-qze).
+    #[test]
+    fn the_tail_of_a_multi_line_argv_is_not_a_pane() {
+        assert!(parse_facts("").is_none());
+        assert!(parse_facts("and an approved justifyViolations").is_none());
+        assert!(parse_facts("2\t%7\t0\t\t\t80").is_none());
+        assert!(parse_facts("2\tnot-an-id\t0\t\t\t80\t24").is_none());
     }
 }

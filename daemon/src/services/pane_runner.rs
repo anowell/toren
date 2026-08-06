@@ -24,8 +24,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use toren_mirror::{
-    connect, find_window_pane, transport_is_dead, MirroredPane, PaneLiveness, PaneMirror, PaneRole,
-    Rmux,
+    connect, find_window_pane, MirroredPane, PaneLiveness, PaneMirror, PaneRole, Rmux,
 };
 use tracing::{debug, info, warn};
 
@@ -192,10 +191,11 @@ impl PaneRunner {
 
     /// Connect to the rmux daemon, starting one if needed.
     ///
-    /// Deferred so a machine without rmux still boots the toren daemon. Not a `OnceCell`: the
-    /// SDK's client dies for good when any request on it is cancelled mid-flight (an HTTP handler
-    /// dropped by a disconnecting browser is enough), and it does not survive an rmux-server
-    /// restart either — so a client found dead is thrown away and the next call reconnects.
+    /// Deferred so a machine without rmux still boots the toren daemon. Everything the runner
+    /// asks through this client — window resolution, pane facts — travels as a forked `rmux`
+    /// command rather than over the client's transport, so a transport killed by a cancelled
+    /// request (an HTTP handler dropped by a disconnecting browser is enough) costs nothing;
+    /// mirrors ride connections of their own.
     async fn rmux(&self) -> Result<Arc<Rmux>> {
         let mut slot = self.rmux.lock().await;
         if let Some(client) = slot.as_ref() {
@@ -204,26 +204,6 @@ impl PaneRunner {
         let client = connect().await?;
         *slot = Some(client.clone());
         Ok(client)
-    }
-
-    /// Forget `client` if it is still the shared one, so the next call reconnects.
-    async fn forget(&self, client: &Arc<Rmux>) {
-        let mut slot = self.rmux.lock().await;
-        if slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, client)) {
-            info!("rmux client transport is gone; reconnecting on next use");
-            *slot = None;
-        }
-    }
-
-    /// Pass an SDK result through, discarding the shared client when the error says its transport
-    /// is dead — the one failure a retry on the same client can never recover from.
-    async fn healing<T>(&self, client: &Arc<Rmux>, result: Result<T>) -> Result<T> {
-        if let Err(e) = &result {
-            if transport_is_dead(e) {
-                self.forget(client).await;
-            }
-        }
-        result
     }
 
     /// Every pane-state change the daemon observes, for surfaces that would otherwise poll.
@@ -248,10 +228,9 @@ impl PaneRunner {
             return;
         }
         let Ok(rmux) = self.rmux().await else { return };
-        let found = self
-            .healing(&rmux, find_window_pane(&rmux, session, window).await)
-            .await;
-        let Ok(pane_id) = found else { return };
+        let Ok(pane_id) = find_window_pane(&rmux, session, window).await else {
+            return;
+        };
 
         let mut watched = self.watched.write().await;
         if watched.contains_key(key) {
@@ -392,9 +371,7 @@ impl PaneRunner {
         }
 
         let rmux = self.rmux().await?;
-        let live = self
-            .healing(&rmux, find_window_pane(&rmux, session, window).await)
-            .await?;
+        let live = find_window_pane(&rmux, session, window).await?;
 
         self.watch(session, window).await;
 
@@ -418,9 +395,7 @@ impl PaneRunner {
     /// subscription budget this module's header describes.
     async fn track(&self, key: &str, session: &str, window: &str) -> Result<()> {
         let rmux = self.rmux().await?;
-        let pane_id = self
-            .healing(&rmux, find_window_pane(&rmux, session, window).await)
-            .await?;
+        let pane_id = find_window_pane(&rmux, session, window).await?;
         let pane = Arc::new(MirroredPane::attach(session, pane_id, role_of(window)).await?);
         let size = pane.size().await.unwrap_or_default();
 
@@ -716,14 +691,10 @@ impl PaneRunner {
         let Ok(rmux) = self.rmux().await else {
             return PaneLiveness::Unknown;
         };
-        let found = self
-            .healing(&rmux, find_window_pane(&rmux, session, window).await)
-            .await;
-        let Ok(pane_id) = found else {
+        let Ok(pane_id) = find_window_pane(&rmux, session, window).await else {
             return PaneLiveness::Unknown;
         };
-        let liveness = self
-            .healing(&rmux, toren_mirror::liveness(&rmux, session, pane_id).await)
+        let liveness = toren_mirror::liveness(&rmux, session, pane_id)
             .await
             .unwrap_or(PaneLiveness::Unknown);
 
@@ -1495,27 +1466,16 @@ mod tests {
             .expect("the shared client survives every dropped mirror");
 
         // Now poison the shared client the way anything outside this crate can — by cancelling a
-        // request mid-flight — and check the runner heals. The subject is a window opened behind
-        // the runner's back, so nothing is watching it: a watched window is answered from what
-        // the watcher last saw and never touches the shared transport at all.
+        // request mid-flight. Everything the runner asks through the client forks the rmux
+        // binary rather than riding the transport, so even a dead client answers. The subject is
+        // a window opened behind the runner's back, so nothing is watching it: a watched window
+        // is answered from what the watcher last saw and would prove nothing.
         let unwatched = rmux_conv::open_shell(&session, &workspace).unwrap();
         poison(&client, &session).await;
-        assert!(
-            toren_mirror::liveness(&client, &session, pane_id)
-                .await
-                .is_err(),
-            "the poisoned client is genuinely dead"
-        );
-        runner.status(&session, &unwatched).await;
-        let replaced = runner.rmux().await.unwrap();
-        assert!(
-            !Arc::ptr_eq(&client, &replaced),
-            "a client found dead must be thrown away rather than kept and retried"
-        );
         assert_eq!(
-            runner.status(&session, rmux_conv::AGENT_WINDOW).await,
+            runner.status(&session, &unwatched).await,
             PaneLiveness::Running,
-            "the call after a dead client runs on a fresh connection"
+            "a dead transport must not cost a status answer"
         );
 
         runner.stop_agent(&session, &session).await.unwrap();
