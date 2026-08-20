@@ -1929,13 +1929,15 @@ dependencies = [
 
 [[package]]
 name = "rmux-ipc"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fe2a5f34a162de78371c722283439bd08954b5cda2d5d186e89ec620b26c4cf"
+checksum = "31f63795a405962308478f28ae2551d8e3f73ac8827c6f838f7b8083085ba2a6"
 dependencies = [
+ "getrandom 0.3.4",
  "libc",
  "rmux-os",
  "rustix",
+ "sha2",
  "tokio",
  "tracing",
  "windows-sys 0.61.2",
@@ -1943,9 +1945,9 @@ dependencies = [
 
 [[package]]
 name = "rmux-os"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f0ee0a472017edc4dc318b6209fe3e9a9bc30bd4326c44571549866269b9392"
+checksum = "2d7017db3e6cfb59857df098ece53d22e31bdf8cd10c63dadb50ae1a140e1ce2"
 dependencies = [
  "libc",
  "rmux-types",
@@ -1955,9 +1957,9 @@ dependencies = [
 
 [[package]]
 name = "rmux-proto"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3abad36a0a3601ec97c31ec5937a7199436bb7ec1333b25342c7bda1b4f5492"
+checksum = "bf07fafa60cc2b10f6630d400acb85b472dc1d981866c5396d21cc03f6176489"
 dependencies = [
  "bincode",
  "rmux-types",
@@ -1968,9 +1970,9 @@ dependencies = [
 
 [[package]]
 name = "rmux-sdk"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa9222cf685fb3dd858b9a7e5a6eecc1ab226af0de7de972fc2c6e5183602245"
+checksum = "e0684ac39de5e707a3dfe6e21ef14299e9540097ed27d5de33300ab8eca50df3"
 dependencies = [
  "libc",
  "rmux-ipc",
@@ -1986,9 +1988,9 @@ dependencies = [
 
 [[package]]
 name = "rmux-types"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9bd39cffc10c08bb0e67eb4f85297ba4483f57607f4ae108be87e1ee0dba423"
+checksum = "3c591db0342827ab26e271262d3ecad75c72b6299e865ee45b2a15d9db85f3db"
 dependencies = [
  "serde",
 ]
@@ -2180,6 +2182,17 @@ name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",

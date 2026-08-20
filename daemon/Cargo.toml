@@ -11,7 +11,7 @@ toren-lib = { path = "../lib" }
 toren-mirror = { path = "../mirror" }
 
 # Terminal multiplexer backing the agent panes the web UI mirrors
-rmux-sdk = "0.9"
+rmux-sdk = "0.10"
 
 tokio.workspace = true
 serde.workspace = true

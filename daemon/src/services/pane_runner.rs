@@ -1415,9 +1415,9 @@ mod tests {
         rmux_conv::kill_session(&session).unwrap();
     }
 
-    /// Dropping a mirror must not take the runner's shared client down with it. The SDK kills a
-    /// whole client when a request future is dropped mid-flight, and a firehose pane keeps the
-    /// pump's requests in flight almost continuously. Needs rmux installed.
+    /// Dropping a mirror must not take the runner's shared client down with it. A firehose pane
+    /// keeps the pump's requests in flight almost continuously, so a dropped mirror cancels
+    /// mid-flight requests constantly. Needs rmux installed.
     #[tokio::test]
     async fn dropping_a_mirror_leaves_the_shared_client_usable() {
         if !rmux_conv::is_available() {
@@ -1465,50 +1465,42 @@ mod tests {
             .await
             .expect("the shared client survives every dropped mirror");
 
-        // Now poison the shared client the way anything outside this crate can — by cancelling a
-        // request mid-flight. Everything the runner asks through the client forks the rmux
-        // binary rather than riding the transport, so even a dead client answers. The subject is
-        // a window opened behind the runner's back, so nothing is watching it: a watched window
-        // is answered from what the watcher last saw and would prove nothing.
+        // Now cancel requests mid-flight the way anything outside this crate can — a browser
+        // closing an HTTP connection drops the handler mid-await. The actor still drains and
+        // validates each abandoned response, so the ordered queue stays aligned and the client
+        // keeps answering. The subject is a window opened behind the runner's back, so nothing
+        // is watching it: a watched window is answered from what the watcher last saw and would
+        // prove nothing.
         let unwatched = rmux_conv::open_shell(&session, &workspace).unwrap();
-        poison(&client, &session).await;
+        cancel_requests_midflight(&client, &session).await;
+        find_window_pane(&client, &session, rmux_conv::AGENT_WINDOW)
+            .await
+            .expect("the shared client survives cancelled requests");
         assert_eq!(
             runner.status(&session, &unwatched).await,
             PaneLiveness::Running,
-            "a dead transport must not cost a status answer"
+            "cancelling requests must not cost a status answer"
         );
 
         runner.stop_agent(&session, &session).await.unwrap();
         rmux_conv::kill_session(&session).unwrap();
     }
 
-    /// Kill a client's transport by dropping a request future while its ordered response is
-    /// pending — the SDK aborts the whole client when that happens.
-    async fn poison(client: &Arc<Rmux>, session: &str) {
+    /// Drop request futures while their ordered responses are still pending, which is the one
+    /// way an outside caller can abandon an exchange the actor has already queued.
+    async fn cancel_requests_midflight(client: &Arc<Rmux>, session: &str) {
+        let mut cancelled = 0;
         for _ in 0..100 {
-            let cancelled = tokio::time::timeout(
+            let finished = tokio::time::timeout(
                 Duration::from_micros(50),
                 client.find_panes().session(session).all(),
             )
             .await;
-            if cancelled.is_ok() {
-                continue;
-            }
-            let probe: anyhow::Result<_> = client
-                .find_panes()
-                .session(session)
-                .all()
-                .await
-                .map_err(Into::into);
-            if probe
-                .as_ref()
-                .err()
-                .is_some_and(toren_mirror::transport_is_dead)
-            {
-                return;
+            if finished.is_err() {
+                cancelled += 1;
             }
         }
-        panic!("cancelling requests mid-flight never killed the client");
+        assert!(cancelled > 0, "no request was slow enough to cancel");
     }
 
     fn contains(haystack: &[u8], needle: &str) -> bool {

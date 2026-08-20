@@ -69,11 +69,9 @@ pub async fn connect() -> Result<Arc<Rmux>> {
 
 /// Whether an error means the client's transport is gone for good.
 ///
-/// The SDK's responses are ordered on one connection, so dropping any request future mid-flight
-/// aborts the whole client, and every later call on it fails with `BrokenPipe`. Nothing in this
-/// crate cancels a request, but anything can — a browser closing an HTTP connection drops the
-/// handler mid-await — so holders of a shared client use this to know when to throw it away and
-/// connect again.
+/// A client is one connection to the daemon, and nothing reopens it: once the daemon exits or the
+/// socket goes, every later call on that client fails with `BrokenPipe`. Holders of a shared
+/// client use this to know when to throw it away and connect again.
 pub fn transport_is_dead(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         matches!(
@@ -197,9 +195,9 @@ pub struct MirroredPane {
     token: String,
     /// When this mirror last wrote its own claim, so it need not keep writing it.
     claimed: tokio::sync::Mutex<Option<tokio::time::Instant>>,
-    /// Cooperative shutdown for both tasks. Aborting them instead would cancel whatever SDK
-    /// request was in flight, and a cancelled request kills the whole client (see
-    /// [`transport_is_dead`]); they only ever stop between completed requests.
+    /// Cooperative shutdown for both tasks, so they only ever stop between completed requests.
+    /// Aborting them instead would cancel whatever SDK request was in flight, leaving the pane's
+    /// state mid-edit — a claimed size never released, a resize half-applied.
     stop: watch::Sender<bool>,
 }
 

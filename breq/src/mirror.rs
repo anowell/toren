@@ -86,8 +86,8 @@ async fn mirror(place: &Place, mut pane: Pane, mut rerun: Rerun<'_>) -> Result<i
                 reconnected = false;
                 mirrored
             }
-            // A dead client stays dead (any request cancelled mid-flight kills it); one fresh
-            // connection is the fix, and a second failure on it is a real error.
+            // A dead client stays dead — nothing reopens its connection; one fresh connection is
+            // the fix, and a second failure on it is a real error.
             Err(e) if toren_mirror::transport_is_dead(&e) && !reconnected => {
                 rmux_client = toren_mirror::connect().await?;
                 reconnected = true;
