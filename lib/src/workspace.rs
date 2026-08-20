@@ -304,8 +304,9 @@ impl VcsBackend for JjBackend {
     }
 
     fn list_workspaces(&self, segment_path: &Path) -> Result<Vec<String>> {
+        // The default output is a display format, not an interface: it gained a column in 0.44.
         let output = Command::new("jj")
-            .args(["workspace", "list"])
+            .args(["workspace", "list", "-T", r#"name ++ "\n""#])
             .current_dir(segment_path)
             .output()
             .with_context(|| "Failed to execute jj workspace list")?;
@@ -316,13 +317,7 @@ impl VcsBackend for JjBackend {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let workspaces: Vec<String> = stdout
-            .lines()
-            .filter_map(|line| {
-                // jj workspace list output format: "workspace_name: commit_id"
-                line.split(':').next().map(|s| s.trim().to_string())
-            })
-            .collect();
+        let workspaces: Vec<String> = stdout.lines().map(|line| line.trim().to_string()).collect();
 
         Ok(workspaces)
     }
