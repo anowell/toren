@@ -1,5 +1,5 @@
 setup {
-    share src="runes.kdl"
+    share src=".runes"
     copy src="target"
     copy src="web/node_modules"
     // run "pnpm install" cwd="web"
