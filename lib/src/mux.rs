@@ -1,4 +1,4 @@
-//! rmux session conventions shared by `breq` and the toren daemon.
+//! Multiplexer session conventions shared by `breq` and the toren daemon.
 //!
 //! One workspace incarnation maps to one session ([`session_name`]) holding a `shell` window and
 //! an `agent` window. Both interfaces derive the same name from the workspace's state, so
@@ -13,9 +13,251 @@
 //! Byte streams go through the SDK instead, in `toren-mirror`, which both surfaces share.
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+
+/// Built-in multiplexer profile names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mux {
+    Rmux,
+    Tmux,
+    Zmx,
+    None,
+}
+
+impl Mux {
+    pub const KNOWN: [Mux; 4] = [Mux::Rmux, Mux::Tmux, Mux::Zmx, Mux::None];
+
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "rmux" => Ok(Self::Rmux),
+            "tmux" => Ok(Self::Tmux),
+            "zmx" => Ok(Self::Zmx),
+            "none" => Ok(Self::None),
+            _ => bail!(
+                "Unknown mux '{}'. Known muxes: {}",
+                name,
+                known_profile_names().join(", ")
+            ),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Rmux => "rmux",
+            Self::Tmux => "tmux",
+            Self::Zmx => "zmx",
+            Self::None => "none",
+        }
+    }
+
+    pub fn held_panes(self) -> bool {
+        matches!(self, Self::Rmux | Self::Tmux)
+    }
+}
+
+impl std::fmt::Display for Mux {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Mux {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::parse(s)
+    }
+}
+
+pub fn known_profile_names() -> Vec<&'static str> {
+    Mux::KNOWN.iter().map(|profile| profile.name()).collect()
+}
+
+/// The user-controlled surface for a mux profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxConfig {
+    pub name: Mux,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
+impl MuxConfig {
+    pub fn new(name: Mux) -> Self {
+        Self {
+            name,
+            command: None,
+            args: Vec::new(),
+        }
+    }
+
+    fn command(&self) -> String {
+        self.command
+            .clone()
+            .or_else(|| {
+                (self.name == Mux::Rmux)
+                    .then(|| std::env::var("TOREN_RMUX_BIN").ok())
+                    .flatten()
+            })
+            .unwrap_or_else(|| self.name.name().to_string())
+    }
+}
+
+/// CLI-level mux overrides after deprecated spellings have been normalized.
+#[derive(Debug, Clone, Default)]
+pub struct MuxOverride {
+    pub mux: Option<Mux>,
+    pub no_mux: bool,
+    pub deprecated_no_rmux: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveMux {
+    pub config: MuxConfig,
+    pub source: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MuxStatus {
+    pub name: Mux,
+    pub source: String,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub available: bool,
+    pub held_panes: bool,
+}
+
+impl ActiveMux {
+    pub fn profile(&self) -> Mux {
+        self.config.name
+    }
+
+    pub fn command(&self) -> String {
+        self.config.command()
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.config.args
+    }
+
+    pub fn label(&self) -> String {
+        if self.config.args.is_empty() {
+            self.command()
+        } else {
+            format!("{} {}", self.command(), self.config.args.join(" "))
+        }
+    }
+}
+
+static ACTIVE_MUX: Mutex<Option<Option<ActiveMux>>> = Mutex::new(None);
+
+/// Resolve and store the active mux for this process.
+pub fn configure(configured: Option<&MuxConfig>, override_: MuxOverride) -> Result<()> {
+    let active = resolve(configured, override_)?;
+    *ACTIVE_MUX.lock().expect("active mux lock poisoned") = Some(active);
+    Ok(())
+}
+
+pub fn active() -> Option<ActiveMux> {
+    ACTIVE_MUX
+        .lock()
+        .expect("active mux lock poisoned")
+        .clone()
+        .unwrap_or_else(|| resolve(None, MuxOverride::default()).unwrap_or(None))
+}
+
+pub fn resolve(
+    configured: Option<&MuxConfig>,
+    override_: MuxOverride,
+) -> Result<Option<ActiveMux>> {
+    if override_.no_mux {
+        return Ok(None);
+    }
+    if override_.deprecated_no_rmux {
+        return Ok(None);
+    }
+    if std::env::var("TOREN_NO_RMUX").is_ok_and(|v| v != "0") {
+        return Ok(None);
+    }
+    if let Ok(name) = std::env::var("TOREN_MUX") {
+        let profile = Mux::parse(&name)?;
+        return Ok((profile != Mux::None).then(|| ActiveMux {
+            config: MuxConfig::new(profile),
+            source: "TOREN_MUX".into(),
+        }));
+    }
+    if let Some(profile) = override_.mux {
+        return Ok((profile != Mux::None).then(|| ActiveMux {
+            config: MuxConfig::new(profile),
+            source: "--mux".into(),
+        }));
+    }
+    if let Some(config) = configured {
+        return Ok((config.name != Mux::None).then(|| ActiveMux {
+            config: config.clone(),
+            source: "config".into(),
+        }));
+    }
+
+    Ok(Some(ActiveMux {
+        config: MuxConfig::new(Mux::Rmux),
+        source: "legacy default".into(),
+    }))
+}
+
+pub fn status(configured: Option<&MuxConfig>, override_: MuxOverride) -> Result<MuxStatus> {
+    if override_.no_mux {
+        return Ok(disabled_status("--no-mux"));
+    }
+    if override_.deprecated_no_rmux {
+        return Ok(disabled_status("--no-rmux"));
+    }
+    if std::env::var("TOREN_NO_RMUX").is_ok_and(|v| v != "0") {
+        return Ok(disabled_status("TOREN_NO_RMUX"));
+    }
+    if let Ok(name) = std::env::var("TOREN_MUX") {
+        return status_for(MuxConfig::new(Mux::parse(&name)?), "TOREN_MUX");
+    }
+    if let Some(profile) = override_.mux {
+        return status_for(MuxConfig::new(profile), "--mux");
+    }
+    if let Some(config) = configured {
+        return status_for(config.clone(), "config");
+    }
+    status_for(MuxConfig::new(Mux::Rmux), "legacy default")
+}
+
+fn disabled_status(source: &str) -> MuxStatus {
+    MuxStatus {
+        name: Mux::None,
+        source: source.into(),
+        command: None,
+        args: Vec::new(),
+        available: false,
+        held_panes: false,
+    }
+}
+
+fn status_for(config: MuxConfig, source: &str) -> Result<MuxStatus> {
+    if config.name == Mux::None {
+        return Ok(disabled_status(source));
+    }
+    let command = config.command();
+    Ok(MuxStatus {
+        name: config.name,
+        source: source.into(),
+        available: which::which(&command).is_ok(),
+        held_panes: config.name.held_panes(),
+        command: Some(command),
+        args: config.args,
+    })
+}
 
 /// Window running the coding agent.
 pub const AGENT_WINDOW: &str = "agent";
@@ -24,16 +266,23 @@ pub const SHELL_WINDOW: &str = "shell";
 /// Window running a one-shot command — `breq sh <ws> -- <cmd>` and its web equivalent.
 pub const COMMAND_WINDOW: &str = "cmd";
 
-fn rmux_bin() -> String {
-    std::env::var("TOREN_RMUX_BIN").unwrap_or_else(|_| "rmux".to_string())
+fn command_config() -> Result<ActiveMux> {
+    let active = active().context("No mux is active")?;
+    if active.profile() != Mux::Rmux {
+        bail!(
+            "mux '{}' is known but not implemented in this build",
+            active.profile()
+        );
+    }
+    Ok(active)
 }
 
-/// Whether rmux is usable here. `TOREN_NO_RMUX=1` forces the direct-exec path everywhere.
+/// Whether the active mux command is present on PATH.
 pub fn is_available() -> bool {
-    if std::env::var("TOREN_NO_RMUX").is_ok_and(|v| v != "0") {
+    let Some(active) = active() else {
         return false;
-    }
-    which::which(rmux_bin()).is_ok()
+    };
+    which::which(active.command()).is_ok()
 }
 
 /// `toren-<segment>-<workspace>-<uid>`, e.g. `toren-toren-one-k3m9xz`.
@@ -119,22 +368,25 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new(rmux_bin())
+    let active = command_config()?;
+    let command = active.command();
+    let output = Command::new(&command)
+        .args(active.args())
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .with_context(|| format!("Failed to run {}", rmux_bin()))?;
+        .with_context(|| format!("Failed to run {}", active.label()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("rmux failed: {}", stderr.trim());
+        bail!("{} failed: {}", command, stderr.trim());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Whether a session with this name currently exists.
 pub fn session_exists(session: &str) -> bool {
-    rmux(["has-session", "-t", session]).is_ok()
+    rmux(["has-session", "-t", &session_target(session)]).is_ok()
 }
 
 /// Create the session and its `shell` window if absent, exporting `env` into it. Idempotent.
@@ -165,11 +417,23 @@ pub fn ensure_session(session: &str, cwd: &Path, env: &[(String, String)]) -> Re
     .with_context(|| format!("Failed to create rmux session '{}'", session))?;
 
     // Shells close on exit; agent and command windows opt back into remain-on-exit per window.
-    rmux(["set-option", "-t", session, "remain-on-exit", "off"])
-        .with_context(|| format!("Failed to configure rmux session '{}'", session))?;
+    rmux([
+        "set-option",
+        "-t",
+        &session_target(session),
+        "remain-on-exit",
+        "off",
+    ])
+    .with_context(|| format!("Failed to configure rmux session '{}'", session))?;
 
     for (key, value) in env {
-        let _ = rmux(["set-environment", "-t", session, key, value]);
+        let _ = rmux([
+            "set-environment",
+            "-t",
+            &session_target(session),
+            key,
+            value,
+        ]);
     }
 
     Ok(())
@@ -185,6 +449,16 @@ pub fn ensure_session(session: &str, cwd: &Path, env: &[(String, String)]) -> Re
 /// every shell has been exited. `argv` reaches the process unmodified — no shell — so prompts need
 /// no escaping.
 pub fn run_in_window(session: &str, window: &str, cwd: &Path, argv: &[String]) -> Result<()> {
+    run_in_window_with_hold(session, window, cwd, argv, None)
+}
+
+fn run_in_window_with_hold(
+    session: &str,
+    window: &str,
+    cwd: &Path,
+    argv: &[String],
+    hold: Option<bool>,
+) -> Result<()> {
     if argv.is_empty() {
         bail!("Cannot spawn an empty command in rmux window '{}'", window);
     }
@@ -209,7 +483,7 @@ pub fn run_in_window(session: &str, window: &str, cwd: &Path, argv: &[String]) -
     let mut args = vec![
         "new-window".to_string(),
         "-t".to_string(),
-        session.to_string(),
+        session_target(session),
         "-n".to_string(),
         window.to_string(),
         "-c".to_string(),
@@ -217,6 +491,17 @@ pub fn run_in_window(session: &str, window: &str, cwd: &Path, argv: &[String]) -
         "--".to_string(),
     ];
     args.extend(argv.iter().cloned());
+    if let Some(hold) = hold {
+        args.extend([
+            ";".to_string(),
+            "set-option".to_string(),
+            "-w".to_string(),
+            "-t".to_string(),
+            window_target(session, window),
+            "remain-on-exit".to_string(),
+            if hold { "on" } else { "off" }.to_string(),
+        ]);
+    }
 
     let spawned = rmux(args)
         .with_context(|| format!("Failed to spawn '{}' in rmux session '{}'", window, session));
@@ -269,9 +554,7 @@ pub fn set_hold(session: &str, window: &str, hold: bool) -> Result<()> {
 /// resume. Continuing an agent is a separate act — `breq do --resume`, or `<ENTER>` on the held
 /// pane — starting a fresh process from the agent's session id.
 pub fn spawn_agent(session: &str, cwd: &Path, argv: &[String]) -> Result<()> {
-    run_in_window(session, AGENT_WINDOW, cwd, argv)?;
-    let _ = set_hold(session, AGENT_WINDOW, true);
-    Ok(())
+    run_in_window_with_hold(session, AGENT_WINDOW, cwd, argv, Some(true))
 }
 
 /// Run a one-shot command in a window of its own, returning that window's name.
@@ -281,8 +564,7 @@ pub fn spawn_agent(session: &str, cwd: &Path, argv: &[String]) -> Result<()> {
 /// process.
 pub fn spawn_command(session: &str, cwd: &Path, argv: &[String], hold: bool) -> Result<String> {
     let window = next_window(session, COMMAND_WINDOW);
-    run_in_window(session, &window, cwd, argv)?;
-    let _ = set_hold(session, &window, hold);
+    run_in_window_with_hold(session, &window, cwd, argv, Some(hold))?;
     Ok(window)
 }
 
@@ -321,7 +603,13 @@ pub fn respawn_window(session: &str, window: &str, cwd: &Path) -> Result<()> {
 
 /// Window names in the session, in index order.
 pub fn list_windows(session: &str) -> Result<Vec<String>> {
-    let out = rmux(["list-windows", "-t", session, "-F", "#{window_name}"])?;
+    let out = rmux([
+        "list-windows",
+        "-t",
+        &session_target(session),
+        "-F",
+        "#{window_name}",
+    ])?;
     Ok(out
         .lines()
         .map(|l| l.trim().to_string())
@@ -450,25 +738,6 @@ pub fn busy_panes(session: &str) -> Vec<PaneState> {
 /// Shells close when you `exit` them (they don't remain-on-exit), so the primary `shell` window
 /// may be gone entirely rather than merely dead — recreate it in that case, and revive it in the
 /// rare case its pane is dead but the window lingers.
-pub fn ensure_shell(session: &str, cwd: &Path) -> Result<()> {
-    let cwd = cwd.to_string_lossy().into_owned();
-
-    if !window_exists(session, SHELL_WINDOW) {
-        rmux(["new-window", "-t", session, "-n", SHELL_WINDOW, "-c", &cwd])
-            .with_context(|| format!("Failed to open the shell in rmux session '{}'", session))?;
-        return Ok(());
-    }
-
-    let shell_is_dead = list_panes(session)
-        .unwrap_or_default()
-        .iter()
-        .any(|p| p.window == SHELL_WINDOW && p.dead);
-    if shell_is_dead {
-        respawn_shell(session, SHELL_WINDOW, Path::new(&cwd))?;
-    }
-    Ok(())
-}
-
 /// Restart a plain shell in an existing window, keeping the window's scrollback.
 ///
 /// For a held shell window whose process has exited: `<ENTER>` on the held pane puts a live shell
@@ -527,7 +796,16 @@ pub fn next_shell_window(session: &str) -> String {
 pub fn open_shell(session: &str, cwd: &Path) -> Result<String> {
     let window = next_shell_window(session);
     let cwd = cwd.to_string_lossy().into_owned();
-    rmux(["new-window", "-t", session, "-n", &window, "-c", &cwd]).with_context(|| {
+    rmux([
+        "new-window",
+        "-t",
+        &session_target(session),
+        "-n",
+        &window,
+        "-c",
+        &cwd,
+    ])
+    .with_context(|| {
         format!(
             "Failed to open a shell window in rmux session '{}'",
             session
@@ -547,19 +825,17 @@ pub fn kill_session(session: &str) -> Result<()> {
     if !session_exists(session) {
         return Ok(());
     }
-    rmux(["kill-session", "-t", session])
+    rmux(["kill-session", "-t", &session_target(session)])
         .with_context(|| format!("Failed to kill rmux session '{}'", session))?;
     Ok(())
 }
 
-/// Kill just the agent window, leaving the session (and its shell) alive.
-pub fn kill_agent(session: &str) -> Result<()> {
-    let _ = rmux(["kill-window", "-t", &window_target(session, AGENT_WINDOW)]);
-    Ok(())
+fn session_target(session: &str) -> String {
+    format!("={}", session)
 }
 
 fn window_target(session: &str, window: &str) -> String {
-    format!("{}:{}", session, window)
+    format!("={}:{}", session, window)
 }
 
 #[cfg(test)]
@@ -603,8 +879,38 @@ mod tests {
     fn window_target_joins_with_colon() {
         assert_eq!(
             window_target("toren-two-one", AGENT_WINDOW),
-            "toren-two-one:agent"
+            "=toren-two-one:agent"
         );
+    }
+
+    #[test]
+    fn resolver_prefers_disable_over_env_and_cli() {
+        let selected = resolve(
+            Some(&MuxConfig::new(Mux::Rmux)),
+            MuxOverride {
+                mux: Some(Mux::Tmux),
+                no_mux: true,
+                deprecated_no_rmux: false,
+            },
+        )
+        .unwrap();
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn resolver_uses_config_after_cli() {
+        let config = MuxConfig {
+            name: Mux::Rmux,
+            command: Some("rmux-dev".into()),
+            args: vec!["-L".into(), "toren".into()],
+        };
+        let selected = resolve(Some(&config), MuxOverride::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.profile(), Mux::Rmux);
+        assert_eq!(selected.command(), "rmux-dev");
+        assert_eq!(selected.args(), ["-L".to_string(), "toren".to_string()]);
+        assert_eq!(selected.source, "config");
     }
 
     /// The sequence `breq do` performs before it mirrors the agent's pane. Needs rmux installed.
@@ -643,7 +949,7 @@ mod tests {
         assert_eq!(windows.iter().filter(|w| *w == AGENT_WINDOW).count(), 1);
 
         // The shell window survives the agent, keeping the session reattachable.
-        kill_agent(&session).unwrap();
+        kill_window(&session, AGENT_WINDOW).unwrap();
         assert!(session_exists(&session));
         assert_eq!(list_windows(&session).unwrap(), vec![SHELL_WINDOW]);
 
@@ -717,7 +1023,7 @@ mod tests {
         assert!(busy[0].pid > 0, "busy pane should report a pid for --kill");
 
         // A dead agent is not live work.
-        kill_agent(&session).unwrap();
+        kill_window(&session, AGENT_WINDOW).unwrap();
         assert!(!agent_is_running(&session));
         assert!(busy_panes(&session).is_empty());
 
@@ -768,8 +1074,7 @@ mod tests {
         // has nowhere else to get it from.
         assert_eq!(agent_pane(&session).and_then(|p| p.exit), Some(3));
 
-        // ensure_shell brings back a shell to attach to after the user exited theirs.
-        ensure_shell(&session, dir.path()).unwrap();
+        open_shell(&session, dir.path()).unwrap();
         assert!(window_exists(&session, SHELL_WINDOW));
         assert!(!shell_is_dead(&session), "the recreated shell is live");
 

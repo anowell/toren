@@ -82,9 +82,9 @@ impl Place {
     }
 
     /// The rmux session this incarnation owns. Sessions matching the workspace but not the
-    /// uid belong to a dead incarnation — see [`crate::rmux::stale_sessions`].
+    /// uid belong to a dead incarnation — see [`crate::mux::stale_sessions`].
     pub fn session_name(&self) -> String {
-        crate::rmux::session_name(&self.segment, &self.name, self.uid().as_deref())
+        crate::mux::session_name(&self.segment, &self.name, self.uid().as_deref())
     }
 
     /// The commit the workspace was forked from, if setup recorded one.

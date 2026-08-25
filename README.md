@@ -87,7 +87,7 @@ breq do --resume                   # Resume the workspace's most recent agent se
 breq do --resume=<session-id>      # ...or a specific one (`breq get <ws> agent.sessions` lists them)
 runes show tor-123 | breq do       # Prompt from stdin
 breq do -w <workspace> --force     # Replace an agent already running there
-breq do -p <prompt> --no-rmux      # Skip rmux; exec the agent directly
+breq do -p <prompt> --no-mux       # Skip the mux; exec the agent directly
 
 # Create and tear down places
 breq setup [workspace]             # Create a workspace (no task, no agent)
@@ -204,4 +204,3 @@ All string arguments support `{{ ... }}` template variables.
 - [Toren Daemon](daemon/README.md) - REST + WebSocket API for programmatic workspace and agent management
 - [Station](station/README.md) - Reverse proxy management for per-workspace local domains
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Technical design
-

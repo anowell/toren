@@ -219,14 +219,14 @@ async fn workspace_window_ws_handler(
 /// The window a bare workspace attach lands on: the agent if it exists, else the first live
 /// shell, else the `shell` slot (which may be dead — the mirror handler reports that cleanly).
 fn default_window(session: &str) -> String {
-    if toren_lib::rmux::window_exists(session, toren_lib::rmux::AGENT_WINDOW) {
-        return toren_lib::rmux::AGENT_WINDOW.to_string();
+    if toren_lib::mux::window_exists(session, toren_lib::mux::AGENT_WINDOW) {
+        return toren_lib::mux::AGENT_WINDOW.to_string();
     }
-    toren_lib::rmux::list_windows(session)
+    toren_lib::mux::list_windows(session)
         .unwrap_or_default()
         .into_iter()
-        .find(|w| w.starts_with(toren_lib::rmux::SHELL_WINDOW))
-        .unwrap_or_else(|| toren_lib::rmux::SHELL_WINDOW.to_string())
+        .find(|w| w.starts_with(toren_lib::mux::SHELL_WINDOW))
+        .unwrap_or_else(|| toren_lib::mux::SHELL_WINDOW.to_string())
 }
 
 /// Point a per-window mirror at the pane running right now, returning its tracking key.
@@ -520,12 +520,12 @@ async fn workspace_start(
     })?;
 
     let session = place.session_name();
-    let agent_key = window_key(&session, toren_lib::rmux::AGENT_WINDOW);
+    let agent_key = window_key(&session, toren_lib::mux::AGENT_WINDOW);
 
     // The pane is shared with any attached terminal — a second spawn would fight the first.
     if state
         .panes
-        .status(&session, toren_lib::rmux::AGENT_WINDOW)
+        .status(&session, toren_lib::mux::AGENT_WINDOW)
         .await
         == toren_mirror::PaneLiveness::Running
     {
@@ -617,7 +617,7 @@ async fn workspace_start(
     Ok(Json(json!({
         "success": true,
         "session": session,
-        "window": toren_lib::rmux::AGENT_WINDOW,
+        "window": toren_lib::mux::AGENT_WINDOW,
         "agent_session": session_id,
     })))
 }
@@ -722,7 +722,7 @@ async fn workspace_workflow(
         )
     })?;
 
-    if !toren_lib::rmux::is_available() {
+    if !toren_lib::mux::is_available() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "rmux is not installed, so there is no pane to run the verb in"})),
@@ -808,7 +808,7 @@ async fn workspace_close_window(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Dismissing the agent's pane is the last chance to read what its session ended as.
-    if window == toren_lib::rmux::AGENT_WINDOW {
+    if window == toren_lib::mux::AGENT_WINDOW {
         toren_lib::sessions::settle_saved(&mut place, &state.rhai_plugins);
     }
 
@@ -832,7 +832,7 @@ async fn workspace_stop(
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
     let session = place.session_name();
-    let agent_key = window_key(&session, toren_lib::rmux::AGENT_WINDOW);
+    let agent_key = window_key(&session, toren_lib::mux::AGENT_WINDOW);
 
     // Works off the place's session rather than what this process tracks, so a `breq do` agent
     // is equally stoppable. Idempotent: stopping an already-stopped agent still reports success.

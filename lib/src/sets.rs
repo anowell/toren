@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::config::Config;
+use crate::mux::{self as rmux, PaneStatus};
 use crate::place::Place;
 use crate::plugins::{PluginContext, PluginManager};
-use crate::rmux::{self, PaneStatus};
 use crate::state::Cache;
 use crate::workspace::{CommitInfo, WorkspaceManager};
 

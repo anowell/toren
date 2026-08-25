@@ -12,16 +12,16 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use crate::config::{toren_root, Config};
+use crate::mux as rmux;
 use crate::place::PlaceRegistry;
 use crate::plugins::{PluginContext, PluginManager};
-use crate::rmux;
 use crate::scripts;
 use crate::state;
 
 /// What one check found and, if fixing, what it did about it.
 #[derive(Debug, Default)]
 pub struct CheckReport {
-    pub name: &'static str,
+    pub name: String,
     /// One line per problem found.
     pub findings: Vec<String>,
     /// One line per repair applied.
@@ -31,9 +31,9 @@ pub struct CheckReport {
 }
 
 impl CheckReport {
-    fn new(name: &'static str) -> Self {
+    fn new(name: impl Into<String>) -> Self {
         Self {
-            name,
+            name: name.into(),
             ..Default::default()
         }
     }
@@ -46,12 +46,37 @@ impl CheckReport {
 /// Run every check. With `fix`, apply repairs; without, only report.
 pub fn run(config: &Config, plugins: &PluginManager, fix: bool) -> Result<Vec<CheckReport>> {
     Ok(vec![
+        check_mux(config)?,
         check_legacy_assignments(config, plugins, fix)?,
         check_shipped_scripts(fix)?,
         check_stale_sessions(config, fix)?,
         check_toren_excluded(config, fix)?,
         check_retired_history()?,
     ])
+}
+
+fn check_mux(config: &Config) -> Result<CheckReport> {
+    let status = crate::mux::status(config.mux.as_ref(), crate::mux::MuxOverride::default())?;
+    let args = if status.args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", status.args.join(" "))
+    };
+    let mut report = CheckReport::new(format!("mux: {} ({})", status.name, status.source));
+
+    if status.name != crate::mux::Mux::None && !status.available {
+        let command = status.command.as_deref().unwrap_or(status.name.name());
+        report
+            .findings
+            .push(format!("{}{} is not available on PATH", command, args));
+    }
+    if status.name != crate::mux::Mux::None && !status.held_panes {
+        report
+            .findings
+            .push("this mux cannot report held-pane exit status".into());
+    }
+
+    Ok(report)
 }
 
 /// `~/.toren/completion_history.jsonl` — the destroy record the rolling log replaced.

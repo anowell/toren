@@ -28,7 +28,7 @@ use toren_mirror::{
 };
 use tracing::{debug, info, warn};
 
-use toren_lib::rmux as rmux_conv;
+use toren_lib::mux as rmux_conv;
 
 /// How long a mirror outlives its last viewer.
 ///

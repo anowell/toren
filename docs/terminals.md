@@ -99,8 +99,9 @@ somewhere else. Watch it (`breq sh <ws> --window agent`), or pass `--force` to r
 deliberately. `--window` mirrors any window of the session by name, which is also how you get back
 to a shell or a command you left running.
 
-`breq do --no-rmux` (or `TOREN_NO_RMUX=1`) restores the old behaviour of exec'ing the agent
-directly. If `rmux` isn't installed at all, that's the automatic fallback — you just don't get
+`breq do --no-mux` (or `TOREN_MUX=none`) execs the agent directly. `--no-rmux` and
+`TOREN_NO_RMUX=1` are still accepted as deprecated aliases for one release. If the configured mux
+command isn't installed at all, `breq` falls back to direct exec — you just don't get
 detach-survival or browser attach.
 
 ## What a mirror is responsible for

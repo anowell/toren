@@ -19,9 +19,9 @@
 
 use anyhow::Result;
 
+use crate::mux as rmux;
 use crate::place::Place;
 use crate::plugins::{Family, PluginManager};
-use crate::rmux;
 use crate::state::{AgentSession, TaskLink};
 
 /// Record the session an agent start is about to open, closing out whatever preceded it.

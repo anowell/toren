@@ -16,6 +16,15 @@ For most users, `breq init` in a repo is sufficient — it creates `toren.kdl` f
 ## Full Reference
 
 ```kdl
+mux "rmux" {
+    // Built-in profile: "rmux", "tmux", "zmx", or "none".
+    // command defaults to the profile name and is resolved on PATH.
+    command "rmux"
+
+    // Optional arguments prepended to every invocation.
+    args "-L" "toren"
+}
+
 ancillaries {
     // Segment globs: directories matching these patterns are available as segments.
     // Each segment is a repo that breq can create ancillary workspaces for.
@@ -66,6 +75,19 @@ aliases {
 ```
 
 ## Sections
+
+### `mux`
+
+Selects the multiplexer profile toren uses for persistent workspace windows. The only configurable
+surface is the profile name, an optional command, and optional leading arguments; spawn, attach,
+hold behavior, and capability differences come from the built-in profile.
+
+Known profiles are `rmux`, `tmux`, `zmx`, and `none`. `zmx` is experimental. `none` disables
+terminal persistence; breq execs commands directly and daemon views are facts/status only.
+
+Environment and CLI overrides use this precedence: `--no-mux`, then `TOREN_MUX`, then `--mux`, then
+config. The deprecated `--no-rmux`, `TOREN_NO_RMUX`, and `TOREN_RMUX_BIN` aliases are still read
+for one release.
 
 ### `ancillaries`
 

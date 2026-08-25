@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let config = Config::load_from(cli.config.as_deref())?;
+    toren_lib::mux::configure(config.mux.as_ref(), toren_lib::MuxOverride::default())?;
     info!("Loaded configuration from: {}", config.config_path);
 
     // Initialize security context

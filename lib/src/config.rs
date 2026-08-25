@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+use crate::mux::{Mux, MuxConfig};
 use crate::workspace_setup::{kdl_value_as_i64, kdl_value_as_str};
 
 /// The global config file.
@@ -56,6 +57,9 @@ pub struct Config {
 
     #[serde(default)]
     pub delivery: DeliveryConfig,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mux: Option<MuxConfig>,
 
     #[serde(default = "crate::alias::default_aliases")]
     pub aliases: HashMap<String, String>,
@@ -243,6 +247,7 @@ fn unknown_toml_settings(content: &str) -> Result<Vec<String>> {
             "proxy" => Some(Some(&["domain"])),
             "tasks" => Some(Some(&["sources", "default_source"])),
             "delivery" => Some(Some(&["source"])),
+            "mux" => Some(Some(&["name", "command", "args"])),
             "aliases" => Some(None),
             _ => None,
         }
@@ -476,6 +481,17 @@ impl Config {
                         }
                     }
                 }
+                "mux" => {
+                    let mut mux = MuxConfig::new(Mux::parse(&node_string(node)?)?);
+                    for child in child_nodes(node) {
+                        match child.name().value() {
+                            "command" => mux.command = Some(node_string(child)?),
+                            "args" => mux.args = node_strings(child)?,
+                            other => warn_unknown(section, other),
+                        }
+                    }
+                    config.mux = Some(mux);
+                }
                 // Alias names are the user's, so every child node is a setting here.
                 "aliases" => {
                     for child in child_nodes(node) {
@@ -545,6 +561,24 @@ impl Config {
                 "delivery",
                 vec![setting("source", [source.as_str().into()])],
             ));
+        }
+
+        if let Some(mux) = &self.mux {
+            let mut node = KdlNode::new("mux");
+            node.push(mux.name.name());
+            let mut children = Vec::new();
+            if let Some(command) = &mux.command {
+                children.push(setting("command", [command.as_str().into()]));
+            }
+            if !mux.args.is_empty() {
+                children.push(setting("args", mux.args.iter().map(|s| s.as_str().into())));
+            }
+            if !children.is_empty() {
+                let mut doc = KdlDocument::new();
+                *doc.nodes_mut() = children;
+                node.set_children(doc);
+            }
+            doc.nodes_mut().push(node);
         }
 
         if !self.aliases.is_empty() {
@@ -647,6 +681,7 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             tasks: TasksConfig::default(),
             delivery: DeliveryConfig::default(),
+            mux: Some(MuxConfig::new(Mux::Rmux)),
             aliases: crate::alias::default_aliases(),
         }
     }
@@ -757,6 +792,11 @@ server {
     port 9000
 }
 
+mux "rmux" {
+    command "rmux-dev"
+    args "-L" "toren"
+}
+
 ancillaries {
     segments "~/proj/*" "~/myrepo"
     workspace_root "~/work"
@@ -785,6 +825,15 @@ aliases {
 
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 9000);
+        assert_eq!(config.mux.as_ref().unwrap().name, Mux::Rmux);
+        assert_eq!(
+            config.mux.as_ref().unwrap().command.as_deref(),
+            Some("rmux-dev")
+        );
+        assert_eq!(
+            config.mux.as_ref().unwrap().args,
+            vec!["-L".to_string(), "toren".to_string()]
+        );
         assert_eq!(config.ancillaries.segments, vec!["~/proj/*", "~/myrepo"]);
         assert_eq!(config.ancillaries.workspace_root, PathBuf::from("~/work"));
         assert_eq!(config.ancillaries.max_per_segment, 5);
@@ -811,6 +860,7 @@ aliases {
         assert_eq!(config.server.port, 8787);
         assert_eq!(config.ancillaries.max_per_segment, 10);
         assert_eq!(config.proxy.domain, "lvh.me");
+        assert_eq!(config.mux.as_ref().unwrap().name, Mux::Rmux);
         assert_eq!(config.ancillaries.segments.len(), 2);
     }
 
@@ -835,8 +885,20 @@ aliases {
         assert_eq!(parsed.ancillaries.agent, config.ancillaries.agent);
         assert_eq!(parsed.tasks.sources, config.tasks.sources);
         assert_eq!(parsed.delivery.source, config.delivery.source);
+        assert_eq!(parsed.mux, config.mux);
         assert_eq!(parsed.aliases, config.aliases);
         assert_eq!(parsed.server.port, config.server.port);
+    }
+
+    #[test]
+    fn mux_profile_name_is_closed() {
+        let err = Config::parse_kdl(r#"mux "screen""#).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Known muxes: rmux, tmux, zmx, none"),
+            "{}",
+            err
+        );
     }
 
     #[test]

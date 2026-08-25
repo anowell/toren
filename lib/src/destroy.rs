@@ -8,10 +8,10 @@
 use anyhow::Result;
 use tracing::{info, warn};
 
+use crate::mux as rmux;
 use crate::place::Place;
 use crate::plugins::PluginManager;
 use crate::process;
-use crate::rmux;
 use crate::workspace::{CleanupMode, WorkspaceManager};
 
 /// How to tear a place down.

@@ -274,7 +274,7 @@ pub fn detail(place: &Place, sets: &Sets, plugins: &PluginManager, vcs_log: Opti
     let (agents, shells): (Vec<_>, Vec<_>) = sets
         .sessions
         .iter()
-        .partition(|s| s.window == toren_lib::rmux::AGENT_WINDOW);
+        .partition(|s| s.window == toren_lib::mux::AGENT_WINDOW);
 
     // The window name, not rmux's pane id: the id names an incarnation and changes every time a
     // window's process is replaced, while the name is stable and is what `breq sh --window` takes.

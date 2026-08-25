@@ -11,6 +11,15 @@ server {
     port 8787
 }
 
+mux "rmux" {
+    // Built-in profile: rmux, tmux, zmx, or none. command defaults to the profile name.
+    // zmx is experimental and not offered by first-run setup yet.
+    command "rmux"
+
+    // Optional arguments prepended to every invocation, e.g. private sockets.
+    // args "-L" "toren"
+}
+
 ancillaries {
     // Segments are the repos breq manages workspaces for. Globs expand; literal paths are
     // taken as-is. With none configured, breq infers the segment from the current repo.

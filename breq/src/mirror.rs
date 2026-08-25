@@ -16,7 +16,7 @@ use std::io::{IsTerminal, Read, Write};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
-use toren_lib::rmux;
+use toren_lib::mux as rmux;
 use toren_lib::Place;
 use toren_mirror::{MirroredPane, PaneRole};
 

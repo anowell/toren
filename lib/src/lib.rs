@@ -5,11 +5,11 @@ pub mod destroy;
 pub mod doctor;
 pub mod fsutil;
 pub mod logging;
+pub mod mux;
 pub mod naming;
 pub mod place;
 pub mod plugins;
 pub mod process;
-pub mod rmux;
 pub mod scripts;
 pub mod segments;
 pub mod sessions;
@@ -25,6 +25,7 @@ pub use config::{
     AncillariesConfig, Config, DeliveryConfig, TasksConfig,
 };
 pub use destroy::{destroy, DestroyOptions, DestroyOutcome};
+pub use mux::{ActiveMux, Mux, MuxConfig, MuxOverride};
 pub use naming::{
     ancillary_id, ancillary_number, ancillary_segment, number_to_word, word_to_number,
 };
